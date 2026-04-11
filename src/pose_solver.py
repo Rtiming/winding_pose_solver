@@ -5,6 +5,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from .geometry import _rotation_matrix_from_xyz_offset_deg
 from .frame_math import (
     FrameBuildOptions,
     FrameRecord,
@@ -21,6 +22,7 @@ def solve_tool_poses(
     *,
     build_options: FrameBuildOptions,
     target_frame_origin_mm: tuple[float, float, float] | np.ndarray,
+    target_frame_rotation_xyz_deg: tuple[float, float, float] | np.ndarray,
     verify_solution: bool,
     verification_row_ids: list[int] | None,
     verification_tolerance: float,
@@ -35,7 +37,10 @@ def solve_tool_poses(
     print(format_issue_report(dataset.records))
 
     # 目标坐标系 A 固定在 Frame 2 中。
-    target_in_frame2 = build_target_frame_in_frame2(target_frame_origin_mm)
+    target_in_frame2 = build_target_frame_in_frame2(
+        target_frame_origin_mm,
+        target_frame_rotation_xyz_deg,
+    )
 
     # 用行号保存工具位姿矩阵，后面做验证时会复用。
     tool_transforms_by_row_id: dict[int, np.ndarray] = {}
@@ -135,9 +140,16 @@ def solve_tool_poses(
     return result
 
 
-def build_target_frame_in_frame2(origin_mm: tuple[float, float, float] | np.ndarray) -> np.ndarray:
+def build_target_frame_in_frame2(
+    origin_mm: tuple[float, float, float] | np.ndarray,
+    rotation_xyz_deg: tuple[float, float, float] | np.ndarray,
+) -> np.ndarray:
     """构造目标坐标系 A 在 Frame 2 下的齐次变换矩阵。"""
     transform = np.eye(4)
+    transform[:3, :3] = np.asarray(
+        _rotation_matrix_from_xyz_offset_deg(rotation_xyz_deg),
+        dtype=float,
+    )
     transform[:3, 3] = np.asarray(origin_mm, dtype=float)
     return transform
 

@@ -16,6 +16,7 @@ class AppRuntimeSettings:
     validation_centerline_csv: Path
     tool_poses_frame2_csv: Path
     target_frame_origin_mm: tuple[float, float, float]
+    target_frame_rotation_xyz_deg: tuple[float, float, float]
     robot_name: str
     frame_name: str
     program_name: str
@@ -55,6 +56,7 @@ def run_pose_solver(settings: AppRuntimeSettings) -> None:
         settings.tool_poses_frame2_csv,
         build_options=settings.frame_build_options,
         target_frame_origin_mm=settings.target_frame_origin_mm,
+        target_frame_rotation_xyz_deg=settings.target_frame_rotation_xyz_deg,
         verify_solution=settings.enable_solver_verification,
         verification_row_ids=list(settings.verification_row_ids)
         if settings.verification_row_ids is not None

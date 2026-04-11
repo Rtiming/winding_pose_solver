@@ -57,7 +57,7 @@ def _build_optimizer_settings(
         enable_joint_continuity_constraint=motion_settings.enable_joint_continuity_constraint,
         max_joint_step_deg=hard_step_limits,
         preferred_joint_step_deg=preferred_step_limits,
-        wrist_phase_lock_threshold_deg=motion_settings.wrist_refinement_a5_threshold_deg,
+        wrist_phase_lock_threshold_deg=motion_settings.wrist_phase_lock_threshold_deg,
     )
 
 

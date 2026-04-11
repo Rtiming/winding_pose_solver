@@ -35,8 +35,6 @@ class FrameBuildOptions:
     zero_tolerance: float = 1e-9  # 判定零向量的阈值
     parallel_tolerance: float = 1e-6  # 切向与法向近平行时的阈值
     continuity_dot_threshold: float = 0.0  # 与上一有效行的连续性阈值
-    flip_process_y_axis: bool = False  # 是否整体翻转切向方向
-    flip_surface_normal: bool = False  # 是否整体翻转法向方向
 
 
 @dataclass
@@ -155,13 +153,6 @@ def build_frame_records(
 
         assert tangent is not None
         assert normal_hint is not None
-
-        if build_options.flip_process_y_axis:
-            tangent = -tangent
-
-        # 如果工艺方向定义需要反向，这里统一翻转。
-        if build_options.flip_surface_normal:
-            normal_hint = -normal_hint
 
         if previous_valid_record is not None:
             # 让当前切向和法向尽量与上一有效行保持同向，减少突然翻转。

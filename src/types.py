@@ -121,20 +121,23 @@ class _BridgeCandidate:
 
 @dataclass(frozen=True)
 class _PathSearchResult:
-    """一次完整 exact-pose 全局搜索的结果。
+    """一次完整 Frame-A 原点 Y/Z 轮廓搜索的结果。"""
 
-    这个结果同时记录：
-    1. 当前这套全局位姿偏置下的 pose rows；
-    2. 该 pose rows 经过多解 IK + 全局 DP 后得到的最优关节路径；
-    3. 便于比较不同偏置方案优劣的统计指标。
-    """
-
+    reference_pose_rows: tuple[dict[str, float], ...]
     pose_rows: tuple[dict[str, float], ...]
     ik_layers: tuple[_IKLayer, ...]
     selected_path: tuple[_IKCandidate, ...]
     total_cost: float
-    rotation_offset_deg: tuple[float, float, float]
+    frame_a_origin_yz_profile_mm: tuple[tuple[float, float], ...]
+    row_labels: tuple[str, ...]
+    inserted_flags: tuple[bool, ...]
+    invalid_row_count: int
+    ik_empty_row_count: int
     config_switches: int
     bridge_like_segments: int
     worst_joint_step_deg: float
     mean_joint_step_deg: float
+    offset_step_jitter_mm: float
+    offset_jerk_mm: float
+    max_abs_offset_mm: float
+    total_abs_offset_mm: float
