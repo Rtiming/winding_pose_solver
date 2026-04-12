@@ -4,7 +4,7 @@ from pathlib import Path
 
 from src.app_runner import AppRuntimeSettings
 from src.frame_math import FrameBuildOptions
-from src.robodk_program import RoboDKMotionSettings
+from src.motion_settings import RoboDKMotionSettings
 
 
 # ---------------------------------------------------------------------------

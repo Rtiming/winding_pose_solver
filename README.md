@@ -1,126 +1,106 @@
 # winding_pose_solver
 
-Pose solving, path selection, and RoboDK program generation for the winding path in the live RoboDK station.
+Winding path pose solving, RoboDK truth evaluation, and multi-mode requester/worker orchestration in one repository.
 
-## Current constraint model
+## What This Repository Supports
 
-The live RoboDK station is the runtime source of truth.
+This project now has two top-level runtime modes:
 
-The process frame `A` in `Frame 2` is defined by:
+- `单机模式`
+  - Runs on local Windows with RoboDK.
+  - Covers `pose solve -> IK collection -> path search / repair -> validation -> final RoboDK program generation`.
+- `联机模式`
+  - Still uses one repository, but splits runtime roles:
+  - `发送端 / requester`
+    - Runs on `master`.
+    - Generates candidate `Frame-A` Y/Z profiles, batches experiments, and summarizes failures.
+  - `接收端 / local worker`
+    - Runs on local Windows with RoboDK.
+    - Performs IK, continuity checks, exact evaluation, and optional final program generation.
 
-- Nominal origin: `TARGET_FRAME_A_ORIGIN_IN_FRAME2_MM = (1126.0, -400.0, 1200.0)`
-- Fixed calibrated orientation: `TARGET_FRAME_A_ROTATION_IN_FRAME2_XYZ_DEG = (-180.0, -14.0, -180.0)`
+The online flow is intentionally local-initiated:
 
-The optimizer is allowed to change only the origin of process frame `A` in `Frame 2` as a smooth per-point profile:
+1. Local builds a JSON request.
+2. Local sends it to `master` with `ssh/scp`.
+3. `master` proposes candidate batches.
+4. Local worker evaluates those candidates against the live RoboDK station.
+5. Results go back to `master` for sorting and summary.
+6. The best candidate is re-run locally for final RoboDK program generation when online final-generate is enabled.
 
-- `x_i = nominal_x`
-- `y_i = nominal_y + Δy_i`
-- `z_i = nominal_z + Δz_i`
+The final generation step is not a separate lightweight exporter. It reuses the same local RoboDK worker validation and program-materialization path that single-machine mode uses, so the final online output is checked against the same continuity and path-quality rules before a RoboDK program is kept.
 
-Important:
+No extra service, no open port, no split repo.
 
-- `X` is fixed.
-- The process-frame orientation definition is fixed and is not searched at runtime.
-- `Δy_i` and `Δz_i` are global path variables. They may differ at every point, but they must remain smooth.
-- Tool-local Y/Z compensation is not used.
-- Local repair is allowed only as a refinement of that global `Frame 2` Y/Z profile.
+## Mode Matrix
 
-## What the solver does now
+| Mode | Where it runs | Uses RoboDK | Main entry |
+| --- | --- | --- | --- |
+| Single-machine | Local Windows | Yes | `python main.py` |
+| Online requester | `master` | No | `python online_requester.py ...` |
+| Online worker | Local Windows | Yes | `python online_worker.py ...` |
+| Online controller | Local Windows | Only when it invokes worker | `python online_roundtrip.py ...` |
 
-### 1. Build nominal poses
+## Module Boundaries
 
-`src/pose_solver.py` generates the nominal tool poses from the centerline data and the fixed calibrated frame-`A` rotation.
+### Shared / server-safe modules
 
-### 2. Search valid Frame-2 Y/Z profiles
+These modules do not require RoboDK to import or run:
 
-`src/global_search.py` and `src/local_repair.py` search only over the allowed per-point `Frame 2` Y/Z origin offsets of frame `A`.
+- `src/frame_math.py`
+- `src/pose_solver.py`
+- `src/geometry.py`
+- `src/bridge_builder.py`
+- `src/motion_settings.py`
+- `src/pose_csv.py`
+- `src/collab_models.py`
+- `src/runtime_profiler.py`
+- `src/request_builder.py`
+- `src/remote_search_runner.py`
 
-The current flow is:
+### Local worker / RoboDK-bound runtime modules
 
-1. Evaluate the fixed-orientation zero-offset baseline.
-2. Run a global coarse search over uniform `Frame 2` Y/Z offsets.
-3. Run local window refinement on the per-point `Δy_i / Δz_i` profile around bad segments.
-4. Re-run full-path IK collection and dynamic-programming path selection after each accepted profile update.
+These modules depend on the live RoboDK station at runtime:
 
-Path comparison is ordered by:
+- `src/ik_collection.py`
+- `src/path_optimizer.py`
+- `src/global_search.py`
+- `src/local_repair.py`
+- `src/robodk_eval_worker.py`
+- `src/robodk_program.py`
 
-1. fewer invalid / IK-empty rows
-2. fewer config switches
-3. fewer bridge-like segments
-4. smaller worst joint step
-5. smaller mean joint step
-6. smoother offset profile
-7. smaller offset magnitude
-8. lower scalar DP cost
+## Entry Points
 
-### 3. Insert transition samples only when they are mathematically valid
+### Preferred local usage
 
-The old active fallback of joint interpolation plus `MoveJ` bridge points has been removed from the program-generation path.
+The recommended day-to-day workflow is now:
 
-If refinement still leaves a bad segment, the code may insert transition samples only by:
+1. Edit the small top-level run config block in `main.py`
+2. Set `RUN_MODE`, `ONLINE_ACTION`, request / run-id / host / env fields as needed
+3. Run:
 
-1. interpolating the neighboring process-frame/tool-pose reference rows
-2. interpolating the solved `Δy / Δz` profile across that interval
-3. rebuilding IK layers and re-running full-path selection
+```powershell
+python main.py
+```
 
-This means waypoint insertion is now:
+`main.py` is now the unified IDE-friendly entrypoint. It decides whether to:
 
-- valid inserted process-frame samples plus valid interpolated `Δy / Δz`
-- never a denser sampling of an already wrong joint-space jump
+- run single-machine program generation
+- run single-machine visualization
+- run online requester/worker roundtrip
+- run local worker-only evaluation
+- build an online request only
+- run online best-candidate final program generation as part of roundtrip
+- set up the server requester environment
 
-### 4. Fail explicitly if continuity still cannot be proven
+Detailed subprocess / SSH / conda logs can be written to a log file while the local terminal stays focused on key stage feedback.
 
-If the final path still contains a config switch or an over-threshold joint jump, the code raises an explicit error and does not export a misleading RoboDK program.
+### 1. Single-machine mode
 
-The failure report includes:
-
-- failing segment labels
-- `Δy / Δz` values around the failure
-- candidate-family counts
-- worst joint deltas
-- focused diagnostics for `372->373` and `380->381`
-
-## Current live-station behavior
-
-With the current live station:
-
-- The fixed calibrated orientation `(-180.0, -14.0, -180.0)` gives IK candidates at row `0` with zero offsets.
-- Runtime orientation search is gone.
-- Local orientation redistribution is gone.
-- Joint-interpolation bridge export is gone.
-- The solver now fails explicitly instead of exporting a path that only appears to run.
-
-Current known limitation:
-
-- On the present station and with the present constraints/search envelope, the code still finds one unresolved configuration switch in the same bad zone, currently reported at `381->382`.
-- `372->373` is explicitly reported and remains smooth in the current runs.
-- Because the remaining segment is not strictly acceptable, no final RoboDK program is exported.
-
-This explicit fail behavior is intentional and matches the project requirement to reject paths that violate the mathematical logic.
-
-## Key files
-
-- [main.py](main.py): project entry point and main business parameters
-- [app_settings.py](app_settings.py): advanced tuning settings
-- [src/pose_solver.py](src/pose_solver.py): nominal pose generation from the centerline
-- [src/global_search.py](src/global_search.py): fixed-orientation Frame-2 Y/Z profile evaluation and coarse search
-- [src/local_repair.py](src/local_repair.py): local profile refinement, inserted transition samples, diagnostics
-- [src/bridge_builder.py](src/bridge_builder.py): process-frame transition sample insertion helpers
-- [src/robodk_program.py](src/robodk_program.py): RoboDK-facing path validation and program generation
-
-## How to run
-
-Use the project conda environment:
+Local full solve and final program generation:
 
 ```powershell
 conda activate winding_pose_solver
 python main.py
-```
-
-Equivalent direct interpreter:
-
-```powershell
-C:\Users\22290\anaconda3\envs\winding_pose_solver\python.exe main.py
 ```
 
 Visualization only:
@@ -129,48 +109,175 @@ Visualization only:
 python main.py --visualize
 ```
 
-## RoboDK station requirements
+### 2. Online worker
 
-The live station must contain at least:
+Evaluate one request:
+
+```powershell
+python online_worker.py eval --request request.json --result result.json
+```
+
+Evaluate a batch:
+
+```powershell
+python online_worker.py eval-batch --request candidates.json --result results.json
+```
+
+### 3. Online requester
+
+Generate candidate batches on `master`:
+
+```bash
+python online_requester.py propose --request request.json --candidates candidates.json
+```
+
+Summarize evaluated results on `master`:
+
+```bash
+python online_requester.py summarize --results results.json --summary summary.json
+```
+
+### 4. Online controller
+
+Sync requester code and create the server conda environment:
+
+```powershell
+python online_roundtrip.py setup-server --host master --server-dir ~/apps/winding_pose_solver --env winding_pose_solver
+```
+
+Build a round-1 request from the current local project settings:
+
+```powershell
+python online_roundtrip.py build-request --request artifacts/online_runs/request.json --candidate-limit 4
+```
+
+Run one full requester/worker round:
+
+```powershell
+python online_roundtrip.py run-round --host master --request artifacts/online_runs/request.json --run-id smoke_round1
+```
+
+By default, `run-round` now also re-runs the best candidate locally and attempts final RoboDK program generation.
+Use `--skip-final-generate` only when you want search and evaluation without final program output.
+If final generation fails, the local terminal will still show the stage name and the paths to `request.json`, `candidates.json`, `results.json`, `summary.json`, and `final_generate_result.json` so you can inspect exactly where it stopped.
+
+If the current interpreter does not contain RoboDK, pass the worker interpreter explicitly:
+
+```powershell
+python online_roundtrip.py run-round --host master --request artifacts/online_runs/request.json --run-id smoke_round1 --local-python C:\Users\22290\anaconda3\envs\winding_pose_solver\python.exe
+```
+
+All online artifacts are stored under:
+
+- Local: `artifacts/online_runs/<run_id>/`
+- Server: `~/apps/winding_pose_solver/artifacts/online_runs/<run_id>/`
+
+## Dependencies
+
+Dependency files are now separated by mode:
+
+- `requirements.shared.txt`
+  - `numpy`
+  - `pandas`
+- `requirements.server.txt`
+  - requester-only dependencies
+  - intentionally does not include `robodk`
+  - intentionally does not include `matplotlib`
+- `requirements.local-worker.txt`
+  - shared dependencies
+  - `matplotlib`
+  - `robodk`
+
+Conda environment files:
+
+- `environment.server.yml`
+  - `python=3.12`
+  - installs `requirements.server.txt`
+- `environment.local-worker.yml`
+  - `python=3.10`
+  - installs `requirements.local-worker.txt`
+
+## RoboDK Station Requirements
+
+The live local station must contain at least:
 
 - robot: `KUKA`
 - frame: `Frame 2`
 
-The current implementation assumes the live station is already opened in RoboDK and that the RoboDK Python API is available in the selected environment.
+The worker and single-machine modes assume the station is already open in RoboDK and the selected Python interpreter can import `robodk`.
 
-## Outputs
+The requester mode on `master` does not require RoboDK and should stay that way.
 
-- `data/tool_poses_frame2.csv`
-  - nominal fixed-orientation tool poses from the centerline
-- `data/tool_poses_frame2_optimized.csv`
-  - written only when a fully validated final path exists
-  - includes:
-    - `row_label`
-    - `inserted_transition_point`
-    - `frame_a_origin_dy_mm`
-    - `frame_a_origin_dz_mm`
-    - final pose matrix columns
+## Current Constraint Model
 
-## Validation checklist
+The live RoboDK station remains the runtime truth source.
 
-When `python main.py` runs, verify that the log shows:
+The process frame `A` in `Frame 2` is defined by:
 
-- zero-offset baseline row `0` has IK candidates
-- no orientation-search acceptance messages
-- no orientation-redistribution messages
-- a focused report for `372->373` and `380->381`
-- either:
-  - a fully validated path with no remaining bad segments, or
-  - an explicit failure report and no exported misleading program
+- nominal origin: `TARGET_FRAME_A_ORIGIN_IN_FRAME2_MM = (1126.0, -400.0, 1200.0)`
+- fixed calibrated orientation: `TARGET_FRAME_A_ROTATION_IN_FRAME2_XYZ_DEG = (-180.0, -14.0, -180.0)`
 
-For tighter negative-case validation, reduce the Y/Z envelope temporarily and confirm the solver fails explicitly instead of exporting a program.
+The optimizer is allowed to search only the smooth per-point origin offsets of frame `A` in `Frame 2`:
 
-## What changed in this revision
+- `x_i = nominal_x`
+- `y_i = nominal_y + dy_i`
+- `z_i = nominal_z + dz_i`
 
-- Added a fixed calibrated process-frame rotation constant in `Frame 2`
-- Removed runtime rigid orientation search from the active solver path
-- Removed local orientation redistribution from the active solver path
-- Replaced the old adjustment variable with a per-point `Frame 2` Y/Z origin profile for frame `A`
-- Removed the active joint-space interpolation bridge fallback from program generation
-- Added explicit whole-path failure reporting
-- Updated validation output to report the real problematic zone instead of hiding it with joint interpolation
+Important constraints:
+
+- `X` stays fixed.
+- Process-frame orientation stays fixed.
+- `dy_i / dz_i` are global path variables.
+- Local repair may refine the `Frame 2` Y/Z profile but does not replace it with joint interpolation.
+
+## Current Observed Runtime Behavior
+
+As of local regression runs on `2026-04-12`:
+
+- `main.py` still fails explicitly instead of exporting a misleading program.
+- The current full-search baseline reports:
+  - `ik_empty_rows=57`
+  - `config_switches=496`
+  - `bridge_like_segments=496`
+- The current hard failure is dominated by IK-empty rows:
+  - `387, 388, 389, 390, 391, 392, 393, 394, 395, 396, 397, 398`
+- `online_worker.py eval` with the same full-search request matches the single-machine baseline.
+- A real requester/worker smoke round against `master` also ran through successfully:
+  - requester proposed candidates on `master`
+  - worker evaluated them locally with RoboDK
+  - requester summarized results on `master`
+  - the best smoke-round candidate reached `ik_empty_rows=59`
+
+So the architecture is now runnable and mode-separated, but the current live station still does not yield a final fully acceptable path.
+
+## What Changed In This Refactor
+
+- Added explicit shared motion-setting types in `src/motion_settings.py`
+- Added independent pose-CSV loading in `src/pose_csv.py`
+- Added JSON request/result schemas in `src/collab_models.py`
+- Added runtime section profiling in `src/runtime_profiler.py`
+- Added request construction in `src/request_builder.py`
+- Added local RoboDK evaluator worker in `src/robodk_eval_worker.py`
+- Added server requester in `src/remote_search_runner.py`
+- Added online entry points:
+  - `online_worker.py`
+  - `online_requester.py`
+  - `online_roundtrip.py`
+- Refactored `src/robodk_program.py` so single-machine mode reuses the worker evaluation flow instead of maintaining a separate search pipeline
+
+## Validation Checklist
+
+When checking this repository after changes, verify:
+
+- `python main.py` still runs the local full solve and fails explicitly if continuity cannot be proven
+- `python online_requester.py --help` works on `master` without RoboDK installed
+- `python online_worker.py --help` works locally
+- `python online_roundtrip.py setup-server ...` creates the `winding_pose_solver` environment on `master`
+- `python online_roundtrip.py run-round ...` produces:
+  - `request.json`
+  - `candidates.json`
+  - `results.json`
+  - `summary.json`
+  - `final_generate_request.json`
+  - `final_generate_result.json`
+- `online_worker.py eval` full-search metrics match `main.py` for the same request

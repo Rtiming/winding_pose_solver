@@ -4,8 +4,9 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .frame_math import FrameBuildOptions
+from .motion_settings import RoboDKMotionSettings
 from .pose_solver import solve_tool_poses
-from .robodk_program import RoboDKMotionSettings, create_program_from_csv
+from .robodk_program import create_program_from_csv
 from .visualization import plot_centerline_frames
 
 

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import csv
 import math
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
 
@@ -10,66 +9,11 @@ from src.geometry import (
     _build_pose,
     _normalize_angle_range,
     _normalize_step_limits,
-    _trim_joint_vector,
 )
-from src.global_search import _search_best_exact_pose_path
-from src.local_repair import (
-    _attempt_inserted_transition_repair,
-    _collect_problem_segments,
-    _format_failure_diagnostics,
-    _format_focus_segment_report,
-    _refine_path_with_frame_a_origin_profile,
-)
-from src.path_optimizer import _build_optimizer_settings
+from src.local_repair import _collect_problem_segments, _format_failure_diagnostics
+from src.motion_settings import RoboDKMotionSettings, motion_settings_to_dict, validate_motion_settings
+from src.pose_csv import REQUIRED_COLUMNS, load_pose_rows
 from src.types import _ProgramWaypoint
-
-
-REQUIRED_COLUMNS = (
-    "x_mm",
-    "y_mm",
-    "z_mm",
-    "r11",
-    "r12",
-    "r13",
-    "r21",
-    "r22",
-    "r23",
-    "r31",
-    "r32",
-    "r33",
-)
-
-
-@dataclass(frozen=True)
-class RoboDKMotionSettings:
-    move_type: str = "MoveJ"
-    linear_speed_mm_s: float = 200.0
-    joint_speed_deg_s: float = 30.0
-    linear_accel_mm_s2: float = 600.0
-    joint_accel_deg_s2: float = 120.0
-    rounding_mm: float = -1.0
-    hide_targets_after_generation: bool = True
-
-    enable_custom_smoothing_and_pose_selection: bool = True
-
-    a1_min_deg: float = -150.0
-    a1_max_deg: float = 30.0
-    a2_max_deg: float = 115.0
-    joint_constraint_tolerance_deg: float = 1e-6
-
-    enable_joint_continuity_constraint: bool = True
-    max_joint_step_deg: tuple[float, ...] = (5.0, 5.0, 5.0, 180.0, 100.0, 180.0)
-
-    bridge_trigger_joint_delta_deg: float = 20.0
-    bridge_step_deg: tuple[float, ...] = (2.0, 2.0, 2.0, 20.0, 10.0, 20.0)
-
-    frame_a_origin_yz_envelope_schedule_mm: tuple[float, ...] = (6.0,)
-    frame_a_origin_yz_step_schedule_mm: tuple[float, ...] = (4.0, 2.0, 1.0)
-    frame_a_origin_yz_window_radius: int = 8
-    frame_a_origin_yz_max_passes: int = 4
-    frame_a_origin_yz_insertion_counts: tuple[int, ...] = (4, 8)
-
-    wrist_phase_lock_threshold_deg: float = 12.0
 
 
 def create_program_from_csv(
@@ -82,147 +26,76 @@ def create_program_from_csv(
 ) -> object:
     settings = _validate_motion_settings(motion_settings)
     pose_rows = tuple(load_pose_rows(csv_path))
-    api = _import_robodk_api()
+    from src.collab_models import ProfileEvaluationRequest
+    from src.global_search import _extract_row_labels
+    from src.robodk_eval_worker import (
+        evaluate_request,
+        materialize_program,
+        open_live_station_context,
+    )
 
-    rdk = api["Robolink"]()
-    robot = _require_item(rdk, robot_name, api["ITEM_TYPE_ROBOT"], "Robot")
-    frame = _require_item(rdk, frame_name, api["ITEM_TYPE_FRAME"], "Reference frame")
-    _delete_stale_bridge_targets(rdk, api["ITEM_TYPE_TARGET"])
+    context = open_live_station_context(
+        robot_name=robot_name,
+        frame_name=frame_name,
+    )
+    _delete_stale_bridge_targets(context.rdk, context.api["ITEM_TYPE_TARGET"])
 
-    current_joints_list = robot.Joints().list()
-    joint_count = len(current_joints_list)
-    original_joints = _trim_joint_vector(current_joints_list, joint_count)
-    lower_limits_raw, upper_limits_raw, _ = robot.JointLimits()
-    lower_limits = _trim_joint_vector(lower_limits_raw.list(), joint_count)
-    upper_limits = _trim_joint_vector(upper_limits_raw.list(), joint_count)
-
-    robot.setPoseFrame(frame)
-    tool_pose = robot.PoseTool()
-    reference_pose = robot.PoseFrame()
-
+    search_result = None
+    program = None
+    program_waypoints: list[_ProgramWaypoint] = []
     a1_lower_deg, a1_upper_deg = _normalize_angle_range(settings.a1_min_deg, settings.a1_max_deg)
-    optimizer_settings = _build_optimizer_settings(joint_count, settings)
-
-    rdk.Render(False)
+    context.rdk.Render(False)
     try:
         if not settings.enable_custom_smoothing_and_pose_selection:
-            return _create_program_from_pose_rows_with_robodk_defaults(
+            program = _create_program_from_pose_rows_with_robodk_defaults(
                 pose_rows,
-                rdk=rdk,
-                robot=robot,
-                frame=frame,
-                mat_type=api["Mat"],
-                item_type_program=api["ITEM_TYPE_PROGRAM"],
-                item_type_target=api["ITEM_TYPE_TARGET"],
+                rdk=context.rdk,
+                robot=context.robot,
+                frame=context.frame,
+                mat_type=context.mat_type,
+                item_type_program=context.api["ITEM_TYPE_PROGRAM"],
+                item_type_target=context.api["ITEM_TYPE_TARGET"],
                 program_name=program_name,
                 frame_name=frame_name,
                 motion_settings=settings,
             )
-
-        search_result = _search_best_exact_pose_path(
-            pose_rows,
-            robot=robot,
-            mat_type=api["Mat"],
-            move_type=settings.move_type,
-            start_joints=original_joints,
-            tool_pose=tool_pose,
-            reference_pose=reference_pose,
-            joint_count=joint_count,
-            motion_settings=settings,
-            optimizer_settings=optimizer_settings,
-            a1_lower_deg=a1_lower_deg,
-            a1_upper_deg=a1_upper_deg,
-            a2_max_deg=settings.a2_max_deg,
-            joint_constraint_tolerance_deg=settings.joint_constraint_tolerance_deg,
-        )
-
-        search_result = _refine_path_with_frame_a_origin_profile(
-            search_result,
-            robot=robot,
-            mat_type=api["Mat"],
-            move_type=settings.move_type,
-            start_joints=original_joints,
-            tool_pose=tool_pose,
-            reference_pose=reference_pose,
-            joint_count=joint_count,
-            motion_settings=settings,
-            optimizer_settings=optimizer_settings,
-            lower_limits=lower_limits,
-            upper_limits=upper_limits,
-            a1_lower_deg=a1_lower_deg,
-            a1_upper_deg=a1_upper_deg,
-            a2_max_deg=settings.a2_max_deg,
-            joint_constraint_tolerance_deg=settings.joint_constraint_tolerance_deg,
-        )
-
-        if _collect_problem_segments(
-            search_result.selected_path,
-            bridge_trigger_joint_delta_deg=settings.bridge_trigger_joint_delta_deg,
-        ):
-            inserted_result = _attempt_inserted_transition_repair(
-                search_result,
-                robot=robot,
-                mat_type=api["Mat"],
-                move_type=settings.move_type,
-                start_joints=original_joints,
-                tool_pose=tool_pose,
-                reference_pose=reference_pose,
-                joint_count=joint_count,
-                motion_settings=settings,
-                optimizer_settings=optimizer_settings,
-                lower_limits=lower_limits,
-                upper_limits=upper_limits,
-                a1_lower_deg=a1_lower_deg,
-                a1_upper_deg=a1_upper_deg,
-                a2_max_deg=settings.a2_max_deg,
-                joint_constraint_tolerance_deg=settings.joint_constraint_tolerance_deg,
+        else:
+            request = ProfileEvaluationRequest(
+                request_id=f"{program_name}_full_search",
+                robot_name=robot_name,
+                frame_name=frame_name,
+                motion_settings=motion_settings_to_dict(settings),
+                reference_pose_rows=pose_rows,
+                frame_a_origin_yz_profile_mm=tuple((0.0, 0.0) for _ in pose_rows),
+                row_labels=_extract_row_labels(pose_rows),
+                inserted_flags=tuple(False for _ in pose_rows),
+                strategy="full_search",
+                start_joints=context.original_joints,
+                run_window_repair=True,
+                run_inserted_repair=True,
+                include_pose_rows_in_result=False,
+                create_program=False,
+                program_name=program_name,
+                optimized_csv_path=None,
+                metadata={"entrypoint": "single_machine"},
             )
-            if inserted_result is not None:
-                search_result = inserted_result
-
-        print(_format_focus_segment_report(search_result))
-        _ensure_final_path_is_valid_or_raise(
-            search_result,
-            settings=settings,
-        )
-
-        _write_optimized_pose_csv(csv_path, search_result)
-        program_waypoints = _build_program_waypoints(search_result, motion_settings=settings)
-
-        robot.setJoints(list(original_joints))
-        existing_program = rdk.Item(program_name, api["ITEM_TYPE_PROGRAM"])
-        if existing_program.Valid():
-            existing_program.Delete()
-
-        program = rdk.AddProgram(program_name, robot)
-        program.setRobot(robot)
-        if hasattr(program, "setPoseFrame"):
-            program.setPoseFrame(frame)
-        if hasattr(program, "setPoseTool"):
-            program.setPoseTool(robot.PoseTool())
-        _apply_motion_settings(program, settings)
-
-        for waypoint in program_waypoints:
-            existing_target = rdk.Item(waypoint.name, api["ITEM_TYPE_TARGET"])
-            if existing_target.Valid():
-                existing_target.Delete()
-
-            target = rdk.AddTarget(waypoint.name, frame, robot)
-            target.setRobot(robot)
-            _apply_selected_target(
-                target,
-                pose=waypoint.pose,
-                joints=waypoint.joints,
-                move_type=waypoint.move_type,
-            )
-            _append_move_instruction(program, target, waypoint.move_type)
+            result, search_result = evaluate_request(request, context)
+            print(result.focus_report)
+            _ensure_final_path_is_valid_or_raise(search_result, settings=settings)
+            _write_optimized_pose_csv(csv_path, search_result)
+            program_name_out = materialize_program(context, request, search_result, settings)
+            program = context.rdk.Item(program_name_out, context.api["ITEM_TYPE_PROGRAM"])
+            program_waypoints = _build_program_waypoints(search_result, motion_settings=settings)
     finally:
-        rdk.Render(True)
-        if original_joints:
-            robot.setJoints(list(original_joints))
+        context.rdk.Render(True)
+        if context.original_joints:
+            context.robot.setJoints(list(context.original_joints))
 
     if settings.hide_targets_after_generation and hasattr(program, "ShowTargets"):
         program.ShowTargets(False)
+
+    if search_result is None:
+        return program
 
     total_candidates = sum(len(layer.candidates) for layer in search_result.ik_layers)
     inserted_count = sum(1 for flag in search_result.inserted_flags if flag)
@@ -235,7 +108,10 @@ def create_program_from_csv(
         f"A2 < {settings.a2_max_deg:.1f} deg."
     )
     if settings.enable_joint_continuity_constraint:
-        continuity_limits = _normalize_step_limits(settings.max_joint_step_deg, joint_count)
+        continuity_limits = _normalize_step_limits(
+            settings.max_joint_step_deg,
+            context.joint_count,
+        )
         print(
             "Hard continuity constraints: "
             f"max joint step = {[round(value, 3) for value in continuity_limits]} deg."
@@ -309,61 +185,6 @@ def _create_program_from_pose_rows_with_robodk_defaults(
         f"{motion_settings.move_type} in frame '{frame_name}'."
     )
     return program
-
-
-def load_pose_rows(csv_path: str | Path) -> list[dict[str, float]]:
-    csv_path = Path(csv_path)
-    if not csv_path.is_file():
-        raise FileNotFoundError(f"CSV file not found: {csv_path}")
-
-    with csv_path.open("r", newline="", encoding="utf-8-sig") as handle:
-        reader = csv.DictReader(handle)
-        if reader.fieldnames is None:
-            raise ValueError(f"CSV file has no header row: {csv_path}")
-
-        missing_columns = [column for column in REQUIRED_COLUMNS if column not in reader.fieldnames]
-        if missing_columns:
-            raise ValueError(
-                "CSV file is missing required column(s): " + ", ".join(missing_columns)
-            )
-
-        pose_rows: list[dict[str, float]] = []
-        for line_number, row in enumerate(reader, start=2):
-            if _row_is_empty(row) or _row_is_marked_invalid(row):
-                continue
-
-            values: dict[str, float] = {}
-            for column in REQUIRED_COLUMNS:
-                raw_value = row.get(column, "")
-                try:
-                    numeric_value = float(raw_value)
-                except (TypeError, ValueError) as exc:
-                    raise ValueError(
-                        f"Invalid numeric value for '{column}' at CSV line {line_number}: {raw_value!r}"
-                    ) from exc
-
-                if not math.isfinite(numeric_value):
-                    raise ValueError(
-                        f"Non-finite value for '{column}' at CSV line {line_number}: {raw_value!r}"
-                    )
-
-                values[column] = numeric_value
-
-            for optional_column in ("source_row", "index"):
-                raw_value = row.get(optional_column, "")
-                if raw_value == "":
-                    continue
-                try:
-                    values[optional_column] = float(raw_value)
-                except (TypeError, ValueError):
-                    continue
-
-            pose_rows.append(values)
-
-    if not pose_rows:
-        raise ValueError(f"No valid pose rows found in CSV file: {csv_path}")
-
-    return pose_rows
 
 
 def _build_program_waypoints(
@@ -567,47 +388,7 @@ def _delete_stale_bridge_targets(rdk, item_type_target: int) -> None:
 
 
 def _validate_motion_settings(settings: RoboDKMotionSettings) -> RoboDKMotionSettings:
-    if settings.move_type not in {"MoveL", "MoveJ"}:
-        raise ValueError(f"Unsupported move type: {settings.move_type}")
-    if settings.linear_speed_mm_s <= 0.0:
-        raise ValueError("Linear speed must be positive.")
-    if settings.joint_speed_deg_s <= 0.0:
-        raise ValueError("Joint speed must be positive.")
-    if settings.linear_accel_mm_s2 <= 0.0:
-        raise ValueError("Linear acceleration must be positive.")
-    if settings.joint_accel_deg_s2 <= 0.0:
-        raise ValueError("Joint acceleration must be positive.")
-    if settings.rounding_mm < -1.0:
-        raise ValueError("Rounding must be -1 or greater.")
-    if not settings.enable_custom_smoothing_and_pose_selection:
-        return settings
-    if settings.a2_max_deg <= 0.0:
-        raise ValueError("A2 max constraint must be positive.")
-    if settings.joint_constraint_tolerance_deg < 0.0:
-        raise ValueError("Joint constraint tolerance must be non-negative.")
-    if not settings.max_joint_step_deg:
-        raise ValueError("Joint continuity step limits must not be empty.")
-    if any(limit <= 0.0 for limit in settings.max_joint_step_deg):
-        raise ValueError("Each joint continuity step limit must be positive.")
-    if settings.bridge_trigger_joint_delta_deg <= 0.0:
-        raise ValueError("Bridge trigger joint delta must be positive.")
-    if not settings.bridge_step_deg:
-        raise ValueError("Bridge step limits must not be empty.")
-    if any(limit <= 0.0 for limit in settings.bridge_step_deg):
-        raise ValueError("Each bridge-step reference limit must be positive.")
-    if any(envelope < 0.0 for envelope in settings.frame_a_origin_yz_envelope_schedule_mm):
-        raise ValueError("Each Frame-A origin Y/Z envelope must be non-negative.")
-    if any(step <= 0.0 for step in settings.frame_a_origin_yz_step_schedule_mm):
-        raise ValueError("Each Frame-A origin Y/Z search step must be positive.")
-    if settings.frame_a_origin_yz_window_radius < 0:
-        raise ValueError("Frame-A origin Y/Z window radius must be non-negative.")
-    if settings.frame_a_origin_yz_max_passes < 0:
-        raise ValueError("Frame-A origin Y/Z max passes must be non-negative.")
-    if any(count <= 0 for count in settings.frame_a_origin_yz_insertion_counts):
-        raise ValueError("Each insertion count must be positive.")
-    if settings.wrist_phase_lock_threshold_deg <= 0.0:
-        raise ValueError("Wrist phase-lock threshold must be positive.")
-    return settings
+    return validate_motion_settings(settings)
 
 
 def _apply_motion_settings(program, settings: RoboDKMotionSettings) -> None:
@@ -648,12 +429,3 @@ def _require_item(rdk, name: str, item_type: int, label: str):
     return item
 
 
-def _row_is_empty(row: dict[str, str | None]) -> bool:
-    return not any((value or "").strip() for value in row.values())
-
-
-def _row_is_marked_invalid(row: dict[str, str | None]) -> bool:
-    raw_valid = row.get("valid")
-    if raw_valid is None:
-        return False
-    return raw_valid.strip().lower() in {"0", "false", "no"}
