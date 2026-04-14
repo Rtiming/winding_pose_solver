@@ -1,4 +1,4 @@
-from src.robodk_eval_worker import main
+from src.robodk_runtime.eval_worker import main
 
 
 if __name__ == "__main__":

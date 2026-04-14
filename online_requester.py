@@ -1,4 +1,4 @@
-from src.remote_search_runner import main
+from src.runtime.remote_search import main
 
 
 if __name__ == "__main__":

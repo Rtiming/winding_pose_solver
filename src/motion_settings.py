@@ -1,88 +1,14 @@
-from __future__ import annotations
+"""Compatibility wrapper for the core package."""
 
-from dataclasses import asdict, dataclass
-from typing import Any
+from src.core import motion_settings as _impl
 
+globals().update(
+    {
+        name: getattr(_impl, name)
+        for name in dir(_impl)
+        if not name.startswith("__")
+    }
+)
 
-@dataclass(frozen=True)
-class RoboDKMotionSettings:
-    move_type: str = "MoveJ"
-    linear_speed_mm_s: float = 200.0
-    joint_speed_deg_s: float = 30.0
-    linear_accel_mm_s2: float = 600.0
-    joint_accel_deg_s2: float = 120.0
-    rounding_mm: float = -1.0
-    hide_targets_after_generation: bool = True
+__all__ = [name for name in globals() if not name.startswith("__")]
 
-    enable_custom_smoothing_and_pose_selection: bool = True
-
-    a1_min_deg: float = -150.0
-    a1_max_deg: float = 30.0
-    a2_max_deg: float = 115.0
-    joint_constraint_tolerance_deg: float = 1e-6
-
-    enable_joint_continuity_constraint: bool = True
-    max_joint_step_deg: tuple[float, ...] = (5.0, 5.0, 5.0, 180.0, 100.0, 180.0)
-
-    bridge_trigger_joint_delta_deg: float = 20.0
-    bridge_step_deg: tuple[float, ...] = (2.0, 2.0, 2.0, 20.0, 10.0, 20.0)
-
-    frame_a_origin_yz_envelope_schedule_mm: tuple[float, ...] = (6.0,)
-    frame_a_origin_yz_step_schedule_mm: tuple[float, ...] = (4.0, 2.0, 1.0)
-    frame_a_origin_yz_window_radius: int = 8
-    frame_a_origin_yz_max_passes: int = 4
-    frame_a_origin_yz_insertion_counts: tuple[int, ...] = (4, 8)
-
-    wrist_phase_lock_threshold_deg: float = 12.0
-
-
-def validate_motion_settings(settings: RoboDKMotionSettings) -> RoboDKMotionSettings:
-    if settings.move_type not in {"MoveL", "MoveJ"}:
-        raise ValueError(f"Unsupported move type: {settings.move_type}")
-    if settings.linear_speed_mm_s <= 0.0:
-        raise ValueError("Linear speed must be positive.")
-    if settings.joint_speed_deg_s <= 0.0:
-        raise ValueError("Joint speed must be positive.")
-    if settings.linear_accel_mm_s2 <= 0.0:
-        raise ValueError("Linear acceleration must be positive.")
-    if settings.joint_accel_deg_s2 <= 0.0:
-        raise ValueError("Joint acceleration must be positive.")
-    if settings.rounding_mm < -1.0:
-        raise ValueError("Rounding must be -1 or greater.")
-    if not settings.enable_custom_smoothing_and_pose_selection:
-        return settings
-    if settings.a2_max_deg <= 0.0:
-        raise ValueError("A2 max constraint must be positive.")
-    if settings.joint_constraint_tolerance_deg < 0.0:
-        raise ValueError("Joint constraint tolerance must be non-negative.")
-    if not settings.max_joint_step_deg:
-        raise ValueError("Joint continuity step limits must not be empty.")
-    if any(limit <= 0.0 for limit in settings.max_joint_step_deg):
-        raise ValueError("Each joint continuity step limit must be positive.")
-    if settings.bridge_trigger_joint_delta_deg <= 0.0:
-        raise ValueError("Bridge trigger joint delta must be positive.")
-    if not settings.bridge_step_deg:
-        raise ValueError("Bridge step limits must not be empty.")
-    if any(limit <= 0.0 for limit in settings.bridge_step_deg):
-        raise ValueError("Each bridge-step reference limit must be positive.")
-    if any(envelope < 0.0 for envelope in settings.frame_a_origin_yz_envelope_schedule_mm):
-        raise ValueError("Each Frame-A origin Y/Z envelope must be non-negative.")
-    if any(step <= 0.0 for step in settings.frame_a_origin_yz_step_schedule_mm):
-        raise ValueError("Each Frame-A origin Y/Z search step must be positive.")
-    if settings.frame_a_origin_yz_window_radius < 0:
-        raise ValueError("Frame-A origin Y/Z window radius must be non-negative.")
-    if settings.frame_a_origin_yz_max_passes < 0:
-        raise ValueError("Frame-A origin Y/Z max passes must be non-negative.")
-    if any(count <= 0 for count in settings.frame_a_origin_yz_insertion_counts):
-        raise ValueError("Each insertion count must be positive.")
-    if settings.wrist_phase_lock_threshold_deg <= 0.0:
-        raise ValueError("Wrist phase-lock threshold must be positive.")
-    return settings
-
-
-def build_motion_settings_from_dict(payload: dict[str, Any]) -> RoboDKMotionSettings:
-    return validate_motion_settings(RoboDKMotionSettings(**payload))
-
-
-def motion_settings_to_dict(settings: RoboDKMotionSettings) -> dict[str, Any]:
-    return asdict(settings)

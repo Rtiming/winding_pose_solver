@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from src.collab_models import (
+from src.core.collab_models import (
     EvaluationBatchRequest,
     EvaluationBatchResult,
     ProfileEvaluationRequest,
@@ -16,7 +16,7 @@ from src.collab_models import (
     load_json_file,
     write_json_file,
 )
-from src.request_builder import build_profile_evaluation_request, build_remote_search_request
+from src.runtime.request_builder import build_profile_evaluation_request, build_remote_search_request
 
 
 REPO_ROOT = Path(__file__).resolve().parent
@@ -278,6 +278,8 @@ def _build_final_generation_request(
 ) -> ProfileEvaluationRequest:
     final_metadata = dict(candidate_request.metadata)
     final_metadata["entrypoint"] = "online_roundtrip_final_generate"
+    # Final generation always runs the full repair pipeline regardless of whether
+    # the batch candidate was evaluated with repairs disabled.
     return ProfileEvaluationRequest(
         request_id=request_id,
         robot_name=candidate_request.robot_name,
@@ -289,13 +291,20 @@ def _build_final_generation_request(
         inserted_flags=tuple(candidate_request.inserted_flags),
         strategy=str(candidate_request.strategy),
         start_joints=candidate_request.start_joints,
-        run_window_repair=bool(candidate_request.run_window_repair),
-        run_inserted_repair=bool(candidate_request.run_inserted_repair),
+        run_window_repair=True,
+        run_inserted_repair=True,
         include_pose_rows_in_result=False,
         create_program=True,
         program_name=program_name or candidate_request.program_name,
         optimized_csv_path=optimized_csv_path or candidate_request.optimized_csv_path,
         metadata=final_metadata,
+    )
+
+
+def _can_run_server_side_ik_eval(batch_request: EvaluationBatchRequest) -> bool:
+    return all(
+        request.motion_settings.get("ik_backend") == "six_axis_ik" and not request.create_program
+        for request in batch_request.evaluations
     )
 
 
@@ -336,6 +345,7 @@ def setup_server(
             [
                 "scp",
                 str(REPO_ROOT / "online_requester.py"),
+                str(REPO_ROOT / "online_worker.py"),
                 str(REPO_ROOT / "requirements.shared.txt"),
                 str(REPO_ROOT / "requirements.server.txt"),
                 str(REPO_ROOT / "environment.server.yml"),
@@ -360,6 +370,7 @@ else
 fi
 conda activate "{env_name}"
 python online_requester.py --help >/tmp/wps_requester_help.txt
+python online_worker.py --help >/tmp/wps_worker_help.txt
 python - <<'PY'
 import importlib.util
 spec = importlib.util.find_spec("robodk")
@@ -391,6 +402,7 @@ def run_round(
     request_path: str | Path,
     run_id: str,
     local_python: str | None,
+    server_eval_when_possible: bool = False,
     generate_final_program: bool = True,
     final_program_name: str | None = None,
     optimized_csv_path: str | None = None,
@@ -473,34 +485,72 @@ python online_requester.py propose --request "{remote_request_path}" --candidate
         log_options=effective_log_options,
     )
 
-    worker_python = resolve_local_worker_python(local_python)
-    _run_stage(
-        "[roundtrip] Local RoboDK worker evaluating candidates...",
-        lambda: _run_local_command(
-            [
-                worker_python,
-                str(REPO_ROOT / "online_worker.py"),
-                "eval-batch",
-                "--request",
-                str(local_candidates_path),
-                "--result",
-                str(local_results_path),
-            ],
-            log_options=effective_log_options,
-            echo_output=effective_log_options.show_worker_output,
-        ),
-        log_options=effective_log_options,
+    candidate_batch = EvaluationBatchRequest.from_dict(load_json_file(local_candidates_path))
+    use_server_side_ik_eval = (
+        server_eval_when_possible and _can_run_server_side_ik_eval(candidate_batch)
     )
 
-    _run_stage(
-        "[roundtrip] Uploading evaluation results to server...",
-        lambda: _run_local_command(
-            ["scp", str(local_results_path), f"{host}:{remote_results_path_scp}"],
+    if use_server_side_ik_eval:
+        print(
+            "[roundtrip] Candidate batch is eligible for server-side SixAxisIK evaluation; "
+            "skipping the local RoboDK worker for this stage."
+        )
+        remote_eval_script = f"""
+set -e
+cd "{remote_shell_dir}"
+CONDA_BASE="$(conda info --base)"
+source "$CONDA_BASE/etc/profile.d/conda.sh"
+conda activate "{env_name}"
+python online_worker.py eval-batch --request "{remote_candidates_path}" --result "{remote_results_path}"
+"""
+        _run_stage(
+            "[roundtrip] Server evaluating candidates with offline SixAxisIK...",
+            lambda: _run_remote_bash(
+                host,
+                remote_eval_script,
+                log_options=effective_log_options,
+                echo_output=False,
+            ),
             log_options=effective_log_options,
-            echo_output=False,
-        ),
-        log_options=effective_log_options,
-    )
+        )
+        _run_stage(
+            "[roundtrip] Downloading evaluation results...",
+            lambda: _run_local_command(
+                ["scp", f"{host}:{remote_results_path_scp}", str(local_results_path)],
+                log_options=effective_log_options,
+                echo_output=False,
+            ),
+            log_options=effective_log_options,
+        )
+    else:
+        worker_python = resolve_local_worker_python(local_python)
+        _run_stage(
+            "[roundtrip] Local RoboDK worker evaluating candidates...",
+            lambda: _run_local_command(
+                [
+                    worker_python,
+                    str(REPO_ROOT / "online_worker.py"),
+                    "eval-batch",
+                    "--request",
+                    str(local_candidates_path),
+                    "--result",
+                    str(local_results_path),
+                ],
+                log_options=effective_log_options,
+                echo_output=effective_log_options.show_worker_output,
+            ),
+            log_options=effective_log_options,
+        )
+
+        _run_stage(
+            "[roundtrip] Uploading evaluation results to server...",
+            lambda: _run_local_command(
+                ["scp", str(local_results_path), f"{host}:{remote_results_path_scp}"],
+                log_options=effective_log_options,
+                echo_output=False,
+            ),
+            log_options=effective_log_options,
+        )
 
     remote_summarize_script = f"""
 set -e
@@ -712,6 +762,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     round_parser.add_argument("--log-file")
     round_parser.add_argument("--show-command-details", action="store_true")
     round_parser.add_argument("--quiet-worker-output", action="store_true")
+    round_parser.add_argument("--server-eval-when-possible", action="store_true")
     round_parser.add_argument("--skip-final-generate", action="store_true")
     return parser
 
@@ -750,6 +801,7 @@ def main(argv: list[str] | None = None) -> int:
                 request_path=args.request,
                 run_id=args.run_id,
                 local_python=args.local_python,
+                server_eval_when_possible=bool(args.server_eval_when_possible),
                 generate_final_program=not bool(args.skip_final_generate),
                 log_options=CommandLogOptions(
                     log_path=None if args.log_file is None else Path(args.log_file),

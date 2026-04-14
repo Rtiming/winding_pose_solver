@@ -7,8 +7,8 @@ from datetime import datetime
 from pathlib import Path
 
 from app_settings import build_app_runtime_settings
-from src.app_runner import run_robodk_program_generation, run_visualization
-from src.collab_models import load_json_file
+from src.runtime.app import run_robodk_program_generation, run_visualization
+from src.core.collab_models import load_json_file
 
 
 # ---------------------------------------------------------------------------
@@ -21,12 +21,17 @@ VALIDATION_CENTERLINE_CSV = Path("data/validation_centerline.csv")
 TOOL_POSES_FRAME2_CSV = Path("data/tool_poses_frame2.csv")
 
 TARGET_FRAME_A_ORIGIN_IN_FRAME2_MM = (1126.0, -400.0, 1200.0)
-TARGET_FRAME_A_ROTATION_IN_FRAME2_XYZ_DEG = (-180.0, -14.0, -180.0)
+TARGET_FRAME_A_ROTATION_IN_FRAME2_XYZ_DEG = (0, 0, -180.0)
 
 ENABLE_CUSTOM_SMOOTHING_AND_POSE_SELECTION = True
 ROBOT_NAME = "KUKA"
 FRAME_NAME = "Frame 2"
 PROGRAM_NAME = "Path_From_CSV"
+
+# IK 后端选择：
+#   "robodk"      — 使用 RoboDK 内置 IK 求解器（原有行为）
+#   "six_axis_ik" — 使用内置本地 POE 模型求解器（不需要 RoboDK 授权许可，多解枚举更全面）
+IK_BACKEND = "six_axis_ik"
 
 
 # ---------------------------------------------------------------------------
@@ -35,7 +40,7 @@ PROGRAM_NAME = "Path_From_CSV"
 # The script will choose the correct local / online flow automatically.
 # ---------------------------------------------------------------------------
 
-RUN_MODE = "online"  # "single" | "online"
+RUN_MODE = "single"  # "single" | "online"
 SINGLE_ACTION = "program"  # "program" | "visualize"
 
 ONLINE_ACTION = "roundtrip"  # "roundtrip" | "worker_eval" | "setup_server" | "build_request"
@@ -50,6 +55,7 @@ ONLINE_ROUND_INDEX = 1
 ONLINE_CANDIDATE_LIMIT = 4
 ONLINE_SKIP_POSE_SOLVER_WHEN_BUILDING_REQUEST = False
 ONLINE_AUTO_SETUP_SERVER = False
+ONLINE_SERVER_EVAL_WHEN_POSSIBLE = False
 ONLINE_FINAL_GENERATE_PROGRAM = True
 
 WRITE_DETAILED_LOG_FILE = True
@@ -67,6 +73,7 @@ APP_RUNTIME_SETTINGS = build_app_runtime_settings(
     robot_name=ROBOT_NAME,
     frame_name=FRAME_NAME,
     program_name=PROGRAM_NAME,
+    ik_backend=IK_BACKEND,
 )
 
 
@@ -283,6 +290,7 @@ def _run_online_mode(args: argparse.Namespace | None = None) -> dict[str, Path |
         request_path=prepared_request_path,
         run_id=run_id,
         local_python=ONLINE_LOCAL_PYTHON,
+        server_eval_when_possible=ONLINE_SERVER_EVAL_WHEN_POSSIBLE,
         generate_final_program=ONLINE_FINAL_GENERATE_PROGRAM,
         final_program_name=APP_RUNTIME_SETTINGS.program_name,
         optimized_csv_path=str(APP_RUNTIME_SETTINGS.tool_poses_frame2_csv),
