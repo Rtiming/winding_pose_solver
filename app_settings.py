@@ -2,9 +2,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from src.runtime.app import AppRuntimeSettings
 from src.core.frame_math import FrameBuildOptions
 from src.core.motion_settings import RoboDKMotionSettings
+from src.runtime.app import AppRuntimeSettings
 
 
 # ---------------------------------------------------------------------------
@@ -43,13 +43,13 @@ HIDE_TARGETS_AFTER_GENERATION = True
 # Hard joint constraints
 A1_MIN_DEG = -150.0
 A1_MAX_DEG = 30.0
-A2_MAX_DEG = 125.0  # raised from 115 to keep smooth elbow-down sub-family (J2≤124°) available
+A2_MAX_DEG = 115.0
 JOINT_CONSTRAINT_TOLERANCE_DEG = 1e-6
 
 # Continuity constraints
 ENABLE_JOINT_CONTINUITY_CONSTRAINT = True
 MAX_JOINT_STEP_DEG = (5.0, 5.0, 5.0, 180.0, 100.0, 180.0)
-BRIDGE_TRIGGER_JOINT_DELTA_DEG = 30.0  # raised from 20 so 29° wrist steps don't block inserted repair
+BRIDGE_TRIGGER_JOINT_DELTA_DEG = 30.0
 BRIDGE_STEP_DEG = (2.0, 2.0, 2.0, 20.0, 10.0, 20.0)
 
 # Frame-A origin optimization in Frame 2
@@ -60,6 +60,8 @@ FRAME_A_ORIGIN_YZ_WINDOW_RADIUS = 8
 FRAME_A_ORIGIN_YZ_MAX_PASSES = 4
 FRAME_A_ORIGIN_YZ_INSERTION_COUNTS = (4, 8)
 WRIST_PHASE_LOCK_THRESHOLD_DEG = 12.0
+LOCAL_PARALLEL_WORKERS = 0  # 0 = auto
+LOCAL_PARALLEL_MIN_BATCH_SIZE = 8
 
 
 def build_frame_options() -> FrameBuildOptions:
@@ -74,6 +76,8 @@ def build_motion_settings(
     *,
     enable_custom_smoothing_and_pose_selection: bool,
     ik_backend: str = "robodk",
+    local_parallel_workers: int = LOCAL_PARALLEL_WORKERS,
+    local_parallel_min_batch_size: int = LOCAL_PARALLEL_MIN_BATCH_SIZE,
 ) -> RoboDKMotionSettings:
     return RoboDKMotionSettings(
         move_type=ROBOT_MOVE_TYPE,
@@ -98,6 +102,8 @@ def build_motion_settings(
         frame_a_origin_yz_max_passes=FRAME_A_ORIGIN_YZ_MAX_PASSES,
         frame_a_origin_yz_insertion_counts=FRAME_A_ORIGIN_YZ_INSERTION_COUNTS,
         wrist_phase_lock_threshold_deg=WRIST_PHASE_LOCK_THRESHOLD_DEG,
+        local_parallel_workers=local_parallel_workers,
+        local_parallel_min_batch_size=local_parallel_min_batch_size,
         ik_backend=ik_backend,
     )
 
@@ -113,6 +119,8 @@ def build_app_runtime_settings(
     frame_name: str,
     program_name: str,
     ik_backend: str = "robodk",
+    local_parallel_workers: int = LOCAL_PARALLEL_WORKERS,
+    local_parallel_min_batch_size: int = LOCAL_PARALLEL_MIN_BATCH_SIZE,
 ) -> AppRuntimeSettings:
     return AppRuntimeSettings(
         validation_centerline_csv=Path(validation_centerline_csv),
@@ -128,6 +136,8 @@ def build_app_runtime_settings(
         motion_settings=build_motion_settings(
             enable_custom_smoothing_and_pose_selection=enable_custom_smoothing_and_pose_selection,
             ik_backend=ik_backend,
+            local_parallel_workers=local_parallel_workers,
+            local_parallel_min_batch_size=local_parallel_min_batch_size,
         ),
         enable_solver_verification=ENABLE_SOLVER_VERIFICATION,
         verification_row_ids=VERIFICATION_ROW_IDS,

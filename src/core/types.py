@@ -79,6 +79,7 @@ class _IKCandidate:
     config_flags: tuple[int, ...]
     joint_limit_penalty: float
     singularity_penalty: float
+    branch_id: tuple[int, ...] | None = None
 
 
 @dataclass(frozen=True)

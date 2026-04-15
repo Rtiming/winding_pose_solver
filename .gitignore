@@ -21,6 +21,7 @@ venv/
 tempCodeRunnerFile.py
 artifacts/online_runs/
 artifacts/run_logs/
+artifacts/tmp/
 
 # Data files (optional, depending on your workflow)
 # data/_*.csv

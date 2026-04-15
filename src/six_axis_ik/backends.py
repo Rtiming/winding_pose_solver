@@ -446,6 +446,73 @@ class PureAnalyticIKBackend:
         )
         return [variant_joints.copy() for variant_joints, _branch_index, _turn_offsets, _distance in variant_records]
 
+    def solve_all_joint_records(
+        self,
+        request: IKSolveAllRequest,
+    ) -> list[tuple[np.ndarray, int, np.ndarray]]:
+        from .numeric_solver import NumericIKSolver
+        from .kinematics import (
+            joint_distance_deg as _jd,
+            joints_within_limits,
+            rotation_error_deg,
+        )
+
+        seed_generator = AnalyticSeedGenerator(request.robot_model)
+        _, full_seeds = seed_generator.generate_seed_candidates(
+            request.target_frame_pose,
+            preferred_seed_joints_deg=request.seed_joints_deg,
+            periodic_dedup_tolerance_deg=request.periodic_dedup_tolerance_deg,
+        )
+
+        filter_lower = np.asarray(request.filter_lower_deg, dtype=float)
+        filter_upper = np.asarray(request.filter_upper_deg, dtype=float)
+        seed = None if request.seed_joints_deg is None else np.asarray(request.seed_joints_deg, dtype=float)
+
+        numeric = NumericIKSolver(request.robot_model)
+        branch_solutions: list[tuple[int, np.ndarray]] = []
+        seen_joints: list[np.ndarray] = []
+
+        for branch_index, seed_vec in enumerate(full_seeds):
+            fk = request.robot_model.fk_tcp_in_frame(seed_vec)
+            pos_err = float(np.linalg.norm(fk[:3, 3] - request.target_frame_pose[:3, 3]))
+            rot_err = rotation_error_deg(fk, request.target_frame_pose)
+
+            if pos_err > request.pose_position_tolerance_mm:
+                continue
+            if rot_err > request.pose_orientation_tolerance_deg:
+                continue
+            if any(_jd(seed_vec, seen) <= request.periodic_dedup_tolerance_deg for seen in seen_joints):
+                continue
+
+            seen_joints.append(seed_vec)
+            branch_solutions.append((branch_index, seed_vec))
+
+        variant_records: list[tuple[np.ndarray, int, np.ndarray, float | None]] = []
+        for branch_index, branch_joints in branch_solutions:
+            for variant_joints, turn_offsets in numeric.expand_solution_turn_variants(branch_joints):
+                if not joints_within_limits(variant_joints, filter_lower, filter_upper):
+                    continue
+                variant_records.append(
+                    (
+                        variant_joints,
+                        branch_index,
+                        turn_offsets,
+                        None if seed is None else _jd(variant_joints, seed),
+                    )
+                )
+
+        variant_records.sort(
+            key=lambda item: (
+                float("inf") if item[3] is None else item[3],
+                item[1],
+                tuple(item[2].tolist()),
+            )
+        )
+        return [
+            (variant_joints.copy(), int(branch_index), turn_offsets.copy())
+            for variant_joints, branch_index, turn_offsets, _distance in variant_records
+        ]
+
 
 def build_ik_backend(backend: IKBackend | str | None = None) -> IKBackend:
     """Resolve a backend instance from an injected object or a simple name."""

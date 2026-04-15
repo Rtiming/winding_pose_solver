@@ -58,6 +58,18 @@ class IKSolutionRecord:
     within_robot_limits: bool
     within_filter_limits: bool
 
+@dataclass(frozen=True)
+class IKJointVectorRecord:
+    """Lean joint-vector record used by branch-aware search code."""
+
+    joints_deg: np.ndarray
+    branch_index: int
+    turn_offsets: np.ndarray
+
+    @property
+    def branch_id(self) -> tuple[int, ...]:
+        return (int(self.branch_index),)
+
 
 @dataclass(frozen=True)
 class IKDiagnostics:
@@ -557,6 +569,110 @@ class SixAxisIKSolver:
 
         legacy_solution_set = self.ik_backend.solve_all(request)
         return [solution.joints_deg.copy() for solution in legacy_solution_set.filtered_solutions]
+
+    def solve_ik_all_joint_records(
+        self,
+        target_pose: Any,
+        *,
+        target_space: str = "frame",
+        seed_joints_deg: Optional[Sequence[float]] = None,
+        tool_pose: Any | None = None,
+        reference_pose: Any | None = None,
+        robot_lower_limits_deg: Sequence[float] | None = None,
+        robot_upper_limits_deg: Sequence[float] | None = None,
+        filter_lower_deg: Sequence[float] | None = None,
+        filter_upper_deg: Sequence[float] | None = None,
+        q2q3_seed_pairs_deg: Optional[Sequence[Sequence[float]]] = None,
+        wrist_seed_triplets_deg: Optional[Sequence[Sequence[float]]] = None,
+        rotation_weight_mm: float | None = None,
+        max_nfev: int | None = None,
+        arm_position_tolerance_mm: float | None = None,
+        pose_position_tolerance_mm: float | None = None,
+        pose_orientation_tolerance_deg: float | None = None,
+        periodic_dedup_tolerance_deg: float | None = None,
+    ) -> list[IKJointVectorRecord]:
+        effective_model = self._build_effective_robot_model(
+            tool_pose=tool_pose,
+            reference_pose=reference_pose,
+            robot_lower_limits_deg=robot_lower_limits_deg,
+            robot_upper_limits_deg=robot_upper_limits_deg,
+        )
+        target_frame_pose = self._target_pose_in_frame(effective_model, target_pose, target_space)
+
+        seed = None if seed_joints_deg is None else as_joint_vector(seed_joints_deg, "seed_joints_deg")
+        filter_lower = (
+            effective_model.joint_min_deg.copy()
+            if filter_lower_deg is None
+            else as_joint_vector(filter_lower_deg, "filter_lower_deg")
+        )
+        filter_upper = (
+            effective_model.joint_max_deg.copy()
+            if filter_upper_deg is None
+            else as_joint_vector(filter_upper_deg, "filter_upper_deg")
+        )
+        rotation_weight_value = self.rotation_weight_mm if rotation_weight_mm is None else float(rotation_weight_mm)
+        max_nfev_value = self.max_nfev if max_nfev is None else int(max_nfev)
+        arm_tolerance_value = (
+            self.arm_position_tolerance_mm
+            if arm_position_tolerance_mm is None
+            else float(arm_position_tolerance_mm)
+        )
+        pose_pos_tolerance_value = (
+            self.pose_position_tolerance_mm
+            if pose_position_tolerance_mm is None
+            else float(pose_position_tolerance_mm)
+        )
+        pose_ori_tolerance_value = (
+            self.pose_orientation_tolerance_deg
+            if pose_orientation_tolerance_deg is None
+            else float(pose_orientation_tolerance_deg)
+        )
+        periodic_tolerance_value = (
+            self.periodic_dedup_tolerance_deg
+            if periodic_dedup_tolerance_deg is None
+            else float(periodic_dedup_tolerance_deg)
+        )
+
+        request = IKSolveAllRequest(
+            robot_model=effective_model,
+            target_frame_pose=target_frame_pose,
+            seed_joints_deg=seed,
+            filter_lower_deg=filter_lower,
+            filter_upper_deg=filter_upper,
+            q2q3_seed_pairs_deg=(
+                self.q2q3_seed_pairs_deg if q2q3_seed_pairs_deg is None else q2q3_seed_pairs_deg
+            ),
+            wrist_seed_triplets_deg=(
+                self.wrist_seed_triplets_deg if wrist_seed_triplets_deg is None else wrist_seed_triplets_deg
+            ),
+            rotation_weight_mm=rotation_weight_value,
+            max_nfev=max_nfev_value,
+            arm_position_tolerance_mm=arm_tolerance_value,
+            pose_position_tolerance_mm=pose_pos_tolerance_value,
+            pose_orientation_tolerance_deg=pose_ori_tolerance_value,
+            periodic_dedup_tolerance_deg=periodic_tolerance_value,
+        )
+
+        solve_all_joint_records = getattr(self.ik_backend, "solve_all_joint_records", None)
+        if callable(solve_all_joint_records):
+            return [
+                IKJointVectorRecord(
+                    joints_deg=joints_deg.copy(),
+                    branch_index=int(branch_index),
+                    turn_offsets=turn_offsets.copy(),
+                )
+                for joints_deg, branch_index, turn_offsets in solve_all_joint_records(request)
+            ]
+
+        legacy_solution_set = self.ik_backend.solve_all(request)
+        return [
+            IKJointVectorRecord(
+                joints_deg=solution.joints_deg.copy(),
+                branch_index=int(solution.branch_index),
+                turn_offsets=solution.turn_offsets.copy(),
+            )
+            for solution in legacy_solution_set.filtered_solutions
+        ]
 
     def _solve_ik_all_legacy(
         self,

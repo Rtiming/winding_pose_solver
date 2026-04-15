@@ -16,12 +16,12 @@ The main run config lives at the top of `main.py`.
 Current important defaults:
 
 ```python
-TARGET_FRAME_A_ORIGIN_IN_FRAME2_MM = (1126.0, -400.0, 1200.0)
+TARGET_FRAME_A_ORIGIN_IN_FRAME2_MM = (1126.0, -650.0, 1130.0)
 TARGET_FRAME_A_ROTATION_IN_FRAME2_XYZ_DEG = (0, 0, -180.0)
 IK_BACKEND = "six_axis_ik"
 ```
 
-With this orientation, both IK backends currently solve the full `496/496` rows of `data/tool_poses_frame2.csv`.
+With this orientation and the current strict constraints (`A2_MAX_DEG = 115`), the local pipeline currently produces a valid continuous path (`config_switches=0`, `bridge_like_segments=0`).
 
 ## Repository Layout
 
@@ -47,7 +47,8 @@ src/
   - Shared math, CSV loading, schema models, pose solving, visualization, and backend-agnostic helpers.
 - `src/runtime/`
   - High-level local and online orchestration.
-  - Includes app flow, request building, requester-side search runner, and runtime profiling.
+  - Includes app flow, request building, requester-side search runner, runtime profiling, and run-log formatting helpers (`src/runtime/run_logging.py`).
+  - Includes origin sweep utilities (`src/runtime/origin_sweep.py`) used for parallel Y/Z search and adaptive iteration (`run_grid_sweep`, `run_adaptive_sweep`).
 - `src/robodk_runtime/`
   - RoboDK-station-bound logic.
   - Includes live evaluation against the open station and final RoboDK program creation.
@@ -107,6 +108,21 @@ T_frame2_tool(i) = T_frame2_A * inverse(T_tool_proc(i))
 
 So each row in the centerline defines a local process frame on the tool, and the code solves the tool pose needed to place that local frame onto the fixed target `A` in `Frame 2`.
 
+## Continuous Y/Z Optimization Workflow
+
+The path solver keeps orientation fixed and optimizes a continuous Frame-A origin Y/Z profile along the whole trajectory.
+
+- Global stage:
+  - Build IK candidates and run exact DP.
+  - Apply full-path continuous Y/Z refinement (LSQ-based) and re-evaluate with exact search.
+- Local stage:
+  - Run window repair and handover corridor refinement near problematic transitions.
+  - Keep strict hard constraints (`A1`, `A2`, joint continuity) and only accept exact improvements.
+- Optional outer search:
+  - Sweep `TARGET_FRAME_A_ORIGIN_IN_FRAME2_MM` over Y/Z with parallel workers to find a better basin, then run the exact pipeline.
+
+This means the system is not only selecting discrete IK points; it is also optimizing a trajectory-wide continuous Y/Z profile under the same strict constraints.
+
 ## Entry Points
 
 ### Single-machine
@@ -115,11 +131,30 @@ So each row in the centerline defines a local process frame on the tool, and the
 python main.py
 ```
 
-Visualization only:
+Default `single` action is now `solve` (compute path only, no RoboDK program import).
+This mode can run with `ik_backend="six_axis_ik"` without requiring RoboDK.
+
+Explicitly choose single-machine action:
+
+```powershell
+python main.py --mode single --single-action solve
+python main.py --mode single --single-action program
+```
+
+Visualization only (legacy shortcut still supported):
 
 ```powershell
 python main.py --visualize
 ```
+
+Single-run artifacts are written under `artifacts/local_runs/<run_id>/`:
+
+- `request.json`: exact evaluation request used for this run.
+- `eval_result.json`: full evaluation result payload.
+- `selected_joint_path.csv`: solved execution path (`j1..j6` joint angles + config flags).
+- `run_archive.json`: compact run archive with basic settings, status, and key metrics.
+
+`run_archive.json` is written for both success and runtime failure paths.
 
 ### Online requester
 
@@ -168,8 +203,32 @@ IK_BACKEND = "six_axis_ik"  # or "robodk"
 - Uses the embedded local solver in `src/six_axis_ik/`.
 - Supports offline evaluation when program creation is disabled.
 - Shares the same high-level search pipeline through `src/core/robot_interface.py`.
+- In single mode, RoboDK is only required when you choose `--single-action program`
+  (or when `ik_backend="robodk"`).
 
 ## Diagnostics Scripts
+
+### Parallel target-origin sweep
+
+Search for feasible Y/Z target-origin basins in parallel:
+
+```powershell
+python scripts/sweep_target_origin_yz.py --mode grid --x 1126 --y-values=-700,-650,-600 --z-values=1130,1180 --workers 4 --strategy exact_profile --skip-inserted-repair
+```
+
+Adaptive iteration around a seed point:
+
+```powershell
+python scripts/sweep_target_origin_yz.py --mode adaptive --x 1126 --start-y -650 --start-z 1130 --step-y 20 --step-z 20 --max-iters 6 --workers 4 --strategy full_search
+```
+
+The script writes ranked JSON results under `artifacts/tmp/` and is built on `src/runtime/origin_sweep.py` so the algorithm can be reused in tests and future optimization modules.
+
+Recent refactor notes for this sweep path:
+
+- `scripts/sweep_target_origin_yz.py` is now a thin CLI wrapper.
+- Core search logic lives in `src/runtime/origin_sweep.py`, which is easier to import directly in tests.
+- Parallel case execution now runs in worker batches and reuses per-process offline IK context to reduce process overhead without changing exact scoring/constraints.
 
 ### Backend parity
 
@@ -247,6 +306,7 @@ These commands are a good minimum regression set:
 python main.py --help
 python online_requester.py --help
 python online_worker.py --help
+python scripts/sweep_target_origin_yz.py --mode grid --x 1126 --y-values=-650 --z-values=1130 --workers 1 --strategy exact_profile --skip-inserted-repair
 python scripts/compare_ik_backends.py
 python scripts/diagnose_ik_window.py --start 395 --end 406 --padding 4
 ```

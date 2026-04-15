@@ -34,6 +34,8 @@ class RoboDKMotionSettings:
     frame_a_origin_yz_insertion_counts: tuple[int, ...] = (4, 8)
 
     wrist_phase_lock_threshold_deg: float = 12.0
+    local_parallel_workers: int = 0
+    local_parallel_min_batch_size: int = 8
 
     # Minimum meaningful joint delta for a config switch to be counted as a
     # continuity problem.  Config transitions with smaller joint steps (e.g. a
@@ -103,6 +105,10 @@ def validate_motion_settings(settings: RoboDKMotionSettings) -> RoboDKMotionSett
         raise ValueError("Each insertion count must be positive.")
     if settings.wrist_phase_lock_threshold_deg <= 0.0:
         raise ValueError("Wrist phase-lock threshold must be positive.")
+    if settings.local_parallel_workers < 0:
+        raise ValueError("Local parallel worker count must be non-negative.")
+    if settings.local_parallel_min_batch_size <= 0:
+        raise ValueError("Local parallel minimum batch size must be positive.")
     if settings.config_switch_min_joint_delta_deg < 0.0:
         raise ValueError("Config-switch minimum joint delta must be non-negative.")
     if settings.rear_switch_penalty < 0.0:

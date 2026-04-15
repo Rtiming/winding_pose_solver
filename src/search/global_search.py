@@ -8,6 +8,7 @@ from src.search.ik_collection import (
     _build_seed_joint_strategies,
     _collect_ik_candidates,
 )
+from src.search.parallel_profile_eval import maybe_parallel_evaluate_exact_profiles
 from src.search.path_optimizer import _optimize_joint_path, _summarize_selected_path
 from src.core.types import _IKCandidate, _IKLayer, _PathOptimizerSettings, _PathSearchResult
 
@@ -52,6 +53,21 @@ def _search_best_exact_pose_path(
     preview_flags = tuple(inserted_flags[index] for index in preview_indices)
     full_cache: dict[tuple[tuple[float, float], ...], _PathSearchResult] = {}
     preview_cache: dict[tuple[float, float], _PathSearchResult] = {}
+
+    def maybe_parallel_evaluate(
+        evaluation_reference_rows: Sequence[dict[str, float]],
+        evaluation_row_labels: Sequence[str],
+        evaluation_inserted_flags: Sequence[bool],
+        profiles: Sequence[Sequence[tuple[float, float]]],
+    ) -> tuple[_PathSearchResult, ...] | None:
+        return maybe_parallel_evaluate_exact_profiles(
+            reference_pose_rows=evaluation_reference_rows,
+            frame_a_origin_yz_profiles_mm=profiles,
+            row_labels=evaluation_row_labels,
+            inserted_flags=evaluation_inserted_flags,
+            motion_settings=motion_settings,
+            start_joints=start_joints,
+        )
 
     def evaluate_profile(
         frame_a_origin_yz_profile_mm: Sequence[tuple[float, float]],
@@ -136,19 +152,75 @@ def _search_best_exact_pose_path(
             if step_mm <= 0.0 or envelope_mm < 0.0 or step_mm > envelope_mm + 1e-9:
                 continue
 
-            preview_candidates = [
-                evaluate_uniform_preview(dy_mm, dz_mm)
-                for dy_mm, dz_mm in _iter_uniform_profile_offsets(
-                    max_abs_offset_mm=envelope_mm,
-                    step_mm=step_mm,
+            offsets = _iter_uniform_profile_offsets(
+                max_abs_offset_mm=envelope_mm,
+                step_mm=step_mm,
+            )
+            uncached_preview_offsets = [
+                (float(dy_mm), float(dz_mm))
+                for dy_mm, dz_mm in offsets
+                if (round(float(dy_mm), 6), round(float(dz_mm), 6)) not in preview_cache
+            ]
+            if uncached_preview_offsets:
+                parallel_preview_results = maybe_parallel_evaluate(
+                    preview_reference_rows,
+                    preview_labels,
+                    preview_flags,
+                    [
+                        tuple((dy_mm, dz_mm) for _ in preview_reference_rows)
+                        for dy_mm, dz_mm in uncached_preview_offsets
+                    ],
                 )
+                if parallel_preview_results is not None:
+                    for (dy_mm, dz_mm), preview_result in zip(
+                        uncached_preview_offsets,
+                        parallel_preview_results,
+                    ):
+                        preview_cache[
+                            (round(float(dy_mm), 6), round(float(dz_mm), 6))
+                        ] = preview_result
+                else:
+                    for dy_mm, dz_mm in uncached_preview_offsets:
+                        evaluate_uniform_preview(dy_mm, dz_mm)
+
+            preview_candidates = [
+                preview_cache[(round(float(dy_mm), 6), round(float(dz_mm), 6))]
+                for dy_mm, dz_mm in offsets
             ]
             preview_candidates.sort(key=_path_search_sort_key)
 
-            for preview_result in preview_candidates[: min(8, len(preview_candidates))]:
+            shortlisted_preview_results = preview_candidates[: min(8, len(preview_candidates))]
+            uncached_full_profiles: list[tuple[tuple[float, float], ...]] = []
+            uncached_full_profile_keys: list[tuple[tuple[float, float], ...]] = []
+            for preview_result in shortlisted_preview_results:
                 dy_mm, dz_mm = preview_result.frame_a_origin_yz_profile_mm[0]
                 profile = tuple((dy_mm, dz_mm) for _ in reference_pose_rows)
-                candidate_result = evaluate_profile(profile)
+                profile_key = _profile_cache_key(profile)
+                if profile_key not in full_cache:
+                    uncached_full_profiles.append(profile)
+                    uncached_full_profile_keys.append(profile_key)
+
+            if uncached_full_profiles:
+                parallel_full_results = maybe_parallel_evaluate(
+                    reference_pose_rows,
+                    row_labels,
+                    inserted_flags,
+                    uncached_full_profiles,
+                )
+                if parallel_full_results is not None:
+                    for profile_key, full_result in zip(
+                        uncached_full_profile_keys,
+                        parallel_full_results,
+                    ):
+                        full_cache[profile_key] = full_result
+                else:
+                    for profile in uncached_full_profiles:
+                        evaluate_profile(profile)
+
+            for preview_result in shortlisted_preview_results:
+                dy_mm, dz_mm = preview_result.frame_a_origin_yz_profile_mm[0]
+                profile = tuple((dy_mm, dz_mm) for _ in reference_pose_rows)
+                candidate_result = full_cache[_profile_cache_key(profile)]
                 if _path_search_sort_key(candidate_result) < _path_search_sort_key(best_result):
                     best_result = candidate_result
                     print(
@@ -190,6 +262,8 @@ def _evaluate_frame_a_origin_profile(
     lower_limits: Sequence[float],
     upper_limits: Sequence[float],
     bridge_trigger_joint_delta_deg: float,
+    reused_ik_layers: Sequence[_IKLayer] | None = None,
+    recompute_row_indices: Sequence[int] | None = None,
 ) -> _PathSearchResult:
     adjusted_pose_rows = _apply_frame_a_origin_yz_profile(
         reference_pose_rows,
@@ -210,14 +284,47 @@ def _evaluate_frame_a_origin_profile(
         seed_joints=seed_joints,
         lower_limits=lower_limits,
         upper_limits=upper_limits,
+        reused_ik_layers=reused_ik_layers,
+        recompute_row_indices=recompute_row_indices,
     )
+    return _finalize_frame_a_origin_profile_result(
+        reference_pose_rows=reference_pose_rows,
+        adjusted_pose_rows=adjusted_pose_rows,
+        ik_layers=ik_layers,
+        frame_a_origin_yz_profile_mm=frame_a_origin_yz_profile_mm,
+        row_labels=row_labels,
+        inserted_flags=inserted_flags,
+        robot=robot,
+        move_type=move_type,
+        start_joints=start_joints,
+        optimizer_settings=optimizer_settings,
+        bridge_trigger_joint_delta_deg=bridge_trigger_joint_delta_deg,
+    )
+
+
+def _finalize_frame_a_origin_profile_result(
+    *,
+    reference_pose_rows: Sequence[dict[str, float]],
+    adjusted_pose_rows: Sequence[dict[str, float]],
+    ik_layers: Sequence[_IKLayer],
+    frame_a_origin_yz_profile_mm: Sequence[tuple[float, float]],
+    row_labels: Sequence[str],
+    inserted_flags: Sequence[bool],
+    robot,
+    move_type: str,
+    start_joints: tuple[float, ...],
+    optimizer_settings: _PathOptimizerSettings,
+    bridge_trigger_joint_delta_deg: float,
+) -> _PathSearchResult:
+    ik_layers_tuple = tuple(ik_layers)
+    ik_empty_row_count = sum(1 for layer in ik_layers_tuple if not layer.candidates)
 
     selected_path: tuple[_IKCandidate, ...] = ()
     total_cost = math.inf
-    if ik_empty_row_count == 0 and ik_layers:
+    if ik_empty_row_count == 0 and ik_layers_tuple:
         try:
             selected_path_list, total_cost = _optimize_joint_path(
-                ik_layers,
+                ik_layers_tuple,
                 robot=robot,
                 move_type=move_type,
                 start_joints=start_joints,
@@ -253,8 +360,8 @@ def _evaluate_frame_a_origin_profile(
 
     return _PathSearchResult(
         reference_pose_rows=tuple(dict(row) for row in reference_pose_rows),
-        pose_rows=adjusted_pose_rows,
-        ik_layers=ik_layers,
+        pose_rows=tuple(adjusted_pose_rows),
+        ik_layers=ik_layers_tuple,
         selected_path=selected_path,
         total_cost=total_cost,
         frame_a_origin_yz_profile_mm=tuple(
@@ -306,12 +413,34 @@ def _build_ik_layers_with_diagnostics(
     seed_joints: Sequence[tuple[float, ...]],
     lower_limits: Sequence[float],
     upper_limits: Sequence[float],
+    reused_ik_layers: Sequence[_IKLayer] | None = None,
+    recompute_row_indices: Sequence[int] | None = None,
 ) -> tuple[tuple[_IKLayer, ...], int]:
     ik_layers: list[_IKLayer] = []
     ik_empty_row_count = 0
     lower_limits_tuple = tuple(float(value) for value in lower_limits)
     upper_limits_tuple = tuple(float(value) for value in upper_limits)
+    recompute_row_set = (
+        set(int(index) for index in recompute_row_indices)
+        if recompute_row_indices is not None
+        else None
+    )
+    can_reuse_layers = (
+        reused_ik_layers is not None and len(reused_ik_layers) == len(pose_rows)
+    )
     for pose_row in pose_rows:
+        row_index = len(ik_layers)
+        if (
+            can_reuse_layers
+            and recompute_row_set is not None
+            and row_index not in recompute_row_set
+        ):
+            reused_layer = reused_ik_layers[row_index]
+            if not reused_layer.candidates:
+                ik_empty_row_count += 1
+            ik_layers.append(reused_layer)
+            continue
+
         pose = _build_pose(pose_row, mat_type)
         candidates = _collect_ik_candidates(
             robot,

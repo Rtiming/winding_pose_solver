@@ -25,6 +25,12 @@ _ROBOT_SINGULARITY_PENALTY_CACHE: dict[
 ] = {}
 
 
+def _candidate_lineage_key(candidate: _IKCandidate) -> tuple[int, ...]:
+    if candidate.branch_id is None:
+        return candidate.config_flags
+    return (*candidate.config_flags, *candidate.branch_id)
+
+
 def _build_optimizer_settings(
     joint_count: int,
     motion_settings,
@@ -387,7 +393,7 @@ def _build_guided_config_path(
 def _group_candidates_by_config(
     candidates: Sequence[_IKCandidate],
 ) -> dict[tuple[int, ...], tuple[_IKCandidate, ...]]:
-    """按 `config_flags` 把同一层候选分组。"""
+    """按 branch-aware lineage key 把同一层候选分组。"""
 
     grouped: dict[tuple[int, ...], list[_IKCandidate]] = {}
     for candidate in candidates:
@@ -766,21 +772,32 @@ def _singularity_penalty(
                 optimizer_settings.wrist_singularity_penalty_weight * normalized * normalized
             )
 
-    from src.core.geometry import _translation_from_pose, _normalized_cross_measure, _subtract_vectors
-    joint_poses = robot.JointPoses(list(joints))
-    if len(joint_poses) >= 4:
-        shoulder = _translation_from_pose(joint_poses[1])
-        elbow = _translation_from_pose(joint_poses[2])
-        wrist = _translation_from_pose(joint_poses[3])
-        arm_measure = _normalized_cross_measure(
-            _subtract_vectors(elbow, shoulder),
-            _subtract_vectors(wrist, elbow),
-        )
-        if arm_measure < optimizer_settings.arm_singularity_threshold:
-            normalized = (
-                optimizer_settings.arm_singularity_threshold - arm_measure
-            ) / optimizer_settings.arm_singularity_threshold
-            penalty += optimizer_settings.arm_singularity_penalty_weight * normalized * normalized
+    geometry_metrics_fn = getattr(robot, "JointGeometryMetrics", None)
+    arm_measure: float | None = None
+    if callable(geometry_metrics_fn):
+        try:
+            arm_measure = float(geometry_metrics_fn(joints).arm_singularity_measure)
+        except Exception:
+            arm_measure = None
+
+    if arm_measure is None:
+        from src.core.geometry import _normalized_cross_measure, _subtract_vectors, _translation_from_pose
+
+        joint_poses = robot.JointPoses(list(joints))
+        if len(joint_poses) >= 4:
+            shoulder = _translation_from_pose(joint_poses[1])
+            elbow = _translation_from_pose(joint_poses[2])
+            wrist = _translation_from_pose(joint_poses[3])
+            arm_measure = _normalized_cross_measure(
+                _subtract_vectors(elbow, shoulder),
+                _subtract_vectors(wrist, elbow),
+            )
+
+    if arm_measure is not None and arm_measure < optimizer_settings.arm_singularity_threshold:
+        normalized = (
+            optimizer_settings.arm_singularity_threshold - arm_measure
+        ) / optimizer_settings.arm_singularity_threshold
+        penalty += optimizer_settings.arm_singularity_penalty_weight * normalized * normalized
 
     _ROBOT_SINGULARITY_PENALTY_CACHE[cache_key] = penalty
     return penalty

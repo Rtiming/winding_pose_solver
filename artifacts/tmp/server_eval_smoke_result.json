@@ -1,0 +1,355 @@
+{
+  "results": [
+    {
+      "request_id": "cli_six_small",
+      "status": "valid",
+      "timing_seconds": 0.1645522000035271,
+      "motion_settings": {
+        "move_type": "MoveJ",
+        "linear_speed_mm_s": 200.0,
+        "joint_speed_deg_s": 30.0,
+        "linear_accel_mm_s2": 600.0,
+        "joint_accel_deg_s2": 120.0,
+        "rounding_mm": -1.0,
+        "hide_targets_after_generation": true,
+        "enable_custom_smoothing_and_pose_selection": true,
+        "a1_min_deg": -150.0,
+        "a1_max_deg": 30.0,
+        "a2_max_deg": 115.0,
+        "joint_constraint_tolerance_deg": 1e-06,
+        "enable_joint_continuity_constraint": true,
+        "max_joint_step_deg": [
+          5.0,
+          5.0,
+          5.0,
+          180.0,
+          100.0,
+          180.0
+        ],
+        "bridge_trigger_joint_delta_deg": 20.0,
+        "bridge_step_deg": [
+          2.0,
+          2.0,
+          2.0,
+          20.0,
+          10.0,
+          20.0
+        ],
+        "frame_a_origin_yz_envelope_schedule_mm": [
+          6.0,
+          12.0
+        ],
+        "frame_a_origin_yz_step_schedule_mm": [
+          4.0,
+          2.0,
+          1.0
+        ],
+        "frame_a_origin_yz_window_radius": 8,
+        "frame_a_origin_yz_max_passes": 4,
+        "frame_a_origin_yz_insertion_counts": [
+          4,
+          8
+        ],
+        "wrist_phase_lock_threshold_deg": 12.0,
+        "ik_backend": "six_axis_ik"
+      },
+      "total_candidates": 96,
+      "invalid_row_count": 0,
+      "ik_empty_row_count": 0,
+      "config_switches": 0,
+      "bridge_like_segments": 0,
+      "worst_joint_step_deg": 1.3240015235829787,
+      "mean_joint_step_deg": 0.48619406545356886,
+      "total_cost": -170.35247737454748,
+      "row_labels": [
+        "0",
+        "1",
+        "2",
+        "3",
+        "4",
+        "5",
+        "6",
+        "7",
+        "8",
+        "9",
+        "10",
+        "11"
+      ],
+      "inserted_flags": [
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false
+      ],
+      "frame_a_origin_yz_profile_mm": [
+        [
+          0.0,
+          0.0
+        ],
+        [
+          0.0,
+          0.0
+        ],
+        [
+          0.0,
+          0.0
+        ],
+        [
+          0.0,
+          0.0
+        ],
+        [
+          0.0,
+          0.0
+        ],
+        [
+          0.0,
+          0.0
+        ],
+        [
+          0.0,
+          0.0
+        ],
+        [
+          0.0,
+          0.0
+        ],
+        [
+          0.0,
+          0.0
+        ],
+        [
+          0.0,
+          0.0
+        ],
+        [
+          0.0,
+          0.0
+        ],
+        [
+          0.0,
+          0.0
+        ]
+      ],
+      "selected_path": [
+        {
+          "joints": [
+            6.131197639770761,
+            19.526169592556368,
+            -1.2463339076905644,
+            87.96640836809047,
+            -58.47027466005983,
+            -87.64027431820294
+          ],
+          "config_flags": [
+            0,
+            1,
+            1
+          ]
+        },
+        {
+          "joints": [
+            6.066070320614813,
+            19.290812115050045,
+            -1.4286070658897838,
+            89.15239789046825,
+            -58.052216534231995,
+            -88.7180255576956
+          ],
+          "config_flags": [
+            0,
+            1,
+            1
+          ]
+        },
+        {
+          "joints": [
+            5.997431078535641,
+            19.055990265647758,
+            -1.6584414550315434,
+            90.47639941405123,
+            -57.629503934580676,
+            -89.91492558886931
+          ],
+          "config_flags": [
+            0,
+            1,
+            1
+          ]
+        },
+        {
+          "joints": [
+            5.9255153536939815,
+            18.83940877056239,
+            -1.901917673374983,
+            91.7981539082981,
+            -57.2296634698671,
+            -91.03629517307894
+          ],
+          "config_flags": [
+            0,
+            1,
+            1
+          ]
+        },
+        {
+          "joints": [
+            5.848774897676407,
+            18.649645499054326,
+            -2.075163464432896,
+            92.85723289750712,
+            -56.89477179930566,
+            -91.90515974556476
+          ],
+          "config_flags": [
+            0,
+            1,
+            1
+          ]
+        },
+        {
+          "joints": [
+            5.781160274594839,
+            18.50440054716467,
+            -2.2380268755412804,
+            93.7647373852073,
+            -56.70948232818648,
+            -92.79524579299168
+          ],
+          "config_flags": [
+            0,
+            1,
+            1
+          ]
+        },
+        {
+          "joints": [
+            5.7068548701821555,
+            18.35415744276986,
+            -2.391926778758622,
+            94.66505028458442,
+            -56.50399698675902,
+            -93.6492055029859
+          ],
+          "config_flags": [
+            0,
+            1,
+            1
+          ]
+        },
+        {
+          "joints": [
+            5.618934282690617,
+            18.180912354479155,
+            -2.5515536787447983,
+            95.65546209936241,
+            -56.22583298356385,
+            -94.5316932537861
+          ],
+          "config_flags": [
+            0,
+            1,
+            1
+          ]
+        },
+        {
+          "joints": [
+            5.521542147693339,
+            17.996774387735922,
+            -2.7586056078105763,
+            96.82163412640108,
+            -55.90652904071832,
+            -95.53120639669629
+          ],
+          "config_flags": [
+            0,
+            1,
+            1
+          ]
+        },
+        {
+          "joints": [
+            5.410401833504494,
+            17.799575565325814,
+            -2.984526044185081,
+            98.09833470345211,
+            -55.52806998301264,
+            -96.53824330688076
+          ],
+          "config_flags": [
+            0,
+            1,
+            1
+          ]
+        },
+        {
+          "joints": [
+            5.299180854120181,
+            17.62129181688646,
+            -3.2287745431857537,
+            99.3818979488633,
+            -55.1998924732706,
+            -97.56376242860404
+          ],
+          "config_flags": [
+            0,
+            1,
+            1
+          ]
+        },
+        {
+          "joints": [
+            5.1983193994929024,
+            17.479364872655886,
+            -3.4563166752735657,
+            100.51083795201652,
+            -54.97895123906809,
+            -98.50366390545936
+          ],
+          "config_flags": [
+            0,
+            1,
+            1
+          ]
+        }
+      ],
+      "failing_segments": [],
+      "ik_empty_rows": [],
+      "focus_report": "Focused segment report:\n  372->373: labels not present in current path.\n  380->381: labels not present in current path.",
+      "diagnostics": null,
+      "error_message": null,
+      "profiling": {
+        "ik_collection": {
+          "seconds": 0.130757,
+          "count": 12
+        },
+        "config_singularity": {
+          "seconds": 0.031639,
+          "count": 192
+        },
+        "window_repair": {
+          "seconds": 2.1e-05,
+          "count": 1
+        },
+        "inserted_repair": {
+          "seconds": 1.5e-05,
+          "count": 1
+        }
+      },
+      "metadata": {
+        "request_build_profile": {},
+        "tool_poses_frame2_csv": "data\\tool_poses_frame2.csv",
+        "validation_centerline_csv": "data\\validation_centerline.csv"
+      },
+      "pose_rows": null
+    }
+  ]
+}
