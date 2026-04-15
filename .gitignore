@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual environments
+venv/
+.env/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Temporary files
+*.tmp
+tempCodeRunnerFile.py
+artifacts/
+
+# Data files (optional, depending on your workflow)
+# data/_*.csv
+data/tool_poses_frame2.csv
+data/tool_poses_frame2_optimized.csv
+data/*.src
+
+# Claude
+.claude/
+
+# Codex
+.codex
+
+# OS
+.DS_Store
+Thumbs.db
