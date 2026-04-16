@@ -19,16 +19,19 @@ venv/
 # Temporary files
 *.tmp
 tempCodeRunnerFile.py
-artifacts/online_runs/
-artifacts/run_logs/
-artifacts/tmp/
+artifacts/
 
 # Data files (optional, depending on your workflow)
 # data/_*.csv
-# data/tool_poses_frame2.csv
+data/tool_poses_frame2.csv
+data/tool_poses_frame2_optimized.csv
+data/*.src
 
 # Claude
 .claude/
+
+# Codex
+.codex
 
 # OS
 .DS_Store

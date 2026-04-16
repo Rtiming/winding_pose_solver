@@ -58,8 +58,18 @@ class NumericIKBackend:
 
     name = "numeric"
 
+    def __init__(self) -> None:
+        self._cached_model: RobotModel | None = None
+        self._cached_solver: NumericIKSolver | None = None
+
+    def _solver_for_model(self, robot_model: RobotModel) -> NumericIKSolver:
+        if self._cached_model is not robot_model or self._cached_solver is None:
+            self._cached_model = robot_model
+            self._cached_solver = NumericIKSolver(robot_model)
+        return self._cached_solver
+
     def solve(self, request: IKSolveRequest) -> IKResult:
-        solver = NumericIKSolver(request.robot_model)
+        solver = self._solver_for_model(request.robot_model)
         return solver.solve_ik(
             request.target_frame_pose,
             q0_deg=request.seed_joints_deg,
@@ -69,7 +79,7 @@ class NumericIKBackend:
         )
 
     def solve_all(self, request: IKSolveAllRequest) -> LocalIKSolutionSet:
-        solver = NumericIKSolver(request.robot_model)
+        solver = self._solver_for_model(request.robot_model)
         return solver.solve_ik_all(
             target_frame_tcp_T=request.target_frame_pose,
             target_space="frame",
@@ -91,6 +101,25 @@ class AnalyticIKBackend:
     """解析 IK v1：只生成 analytic seeds，最终解仍走现有 numeric refinement。"""
 
     name = "analytic"
+
+    def __init__(self) -> None:
+        self._cached_model: RobotModel | None = None
+        self._cached_solver: NumericIKSolver | None = None
+        self._cached_seed_generator: AnalyticSeedGenerator | None = None
+
+    def _solver_and_seed_generator(
+        self,
+        robot_model: RobotModel,
+    ) -> tuple[NumericIKSolver, AnalyticSeedGenerator]:
+        if (
+            self._cached_model is not robot_model
+            or self._cached_solver is None
+            or self._cached_seed_generator is None
+        ):
+            self._cached_model = robot_model
+            self._cached_solver = NumericIKSolver(robot_model)
+            self._cached_seed_generator = AnalyticSeedGenerator(robot_model)
+        return self._cached_solver, self._cached_seed_generator
 
     def _build_candidate_seed_sets(
         self,
@@ -131,8 +160,7 @@ class AnalyticIKBackend:
         return merged_arm_candidates, merged_seed_candidates
 
     def solve(self, request: IKSolveRequest) -> IKResult:
-        solver = NumericIKSolver(request.robot_model)
-        seed_generator = AnalyticSeedGenerator(request.robot_model)
+        solver, seed_generator = self._solver_and_seed_generator(request.robot_model)
 
         _, candidate_seeds = self._build_candidate_seed_sets(
             solver,
@@ -188,8 +216,7 @@ class AnalyticIKBackend:
         )
 
     def solve_all(self, request: IKSolveAllRequest) -> LocalIKSolutionSet:
-        solver = NumericIKSolver(request.robot_model)
-        seed_generator = AnalyticSeedGenerator(request.robot_model)
+        solver, seed_generator = self._solver_and_seed_generator(request.robot_model)
 
         merged_arm_candidates, merged_seed_candidates = self._build_candidate_seed_sets(
             solver,
@@ -228,16 +255,33 @@ class PureAnalyticIKBackend:
 
     name = "pure_analytic"
 
+    def __init__(self) -> None:
+        self._cached_model: RobotModel | None = None
+        self._cached_numeric_solver: NumericIKSolver | None = None
+        self._cached_seed_generator: AnalyticSeedGenerator | None = None
+
+    def _solver_and_seed_generator(
+        self,
+        robot_model: RobotModel,
+    ) -> tuple[NumericIKSolver, AnalyticSeedGenerator]:
+        if (
+            self._cached_model is not robot_model
+            or self._cached_numeric_solver is None
+            or self._cached_seed_generator is None
+        ):
+            self._cached_model = robot_model
+            self._cached_numeric_solver = NumericIKSolver(robot_model)
+            self._cached_seed_generator = AnalyticSeedGenerator(robot_model)
+        return self._cached_numeric_solver, self._cached_seed_generator
+
     def solve(self, request: IKSolveRequest) -> IKResult:
-        from .numeric_solver import NumericIKSolver
-        seed_generator = AnalyticSeedGenerator(request.robot_model)
+        solver, seed_generator = self._solver_and_seed_generator(request.robot_model)
         _, full_seeds = seed_generator.generate_seed_candidates(
             request.target_frame_pose,
             preferred_seed_joints_deg=request.seed_joints_deg,
             periodic_dedup_tolerance_deg=config.LOCAL_IK_PERIODIC_DEDUP_TOLERANCE_DEG,
         )
         if not full_seeds:
-            solver = NumericIKSolver(request.robot_model)
             return solver.solve_ik(
                 request.target_frame_pose,
                 q0_deg=request.seed_joints_deg,
@@ -268,7 +312,6 @@ class PureAnalyticIKBackend:
         )
 
     def solve_all(self, request: IKSolveAllRequest) -> "LocalIKSolutionSet":
-        from .numeric_solver import NumericIKSolver
         from .kinematics import (
             LocalIKSolution,
             LocalIKSolutionSet,
@@ -277,7 +320,7 @@ class PureAnalyticIKBackend:
             rotation_error_deg,
         )
 
-        seed_generator = AnalyticSeedGenerator(request.robot_model)
+        numeric, seed_generator = self._solver_and_seed_generator(request.robot_model)
         _, full_seeds = seed_generator.generate_seed_candidates(
             request.target_frame_pose,
             preferred_seed_joints_deg=request.seed_joints_deg,
@@ -289,7 +332,6 @@ class PureAnalyticIKBackend:
         seed = None if request.seed_joints_deg is None else np.asarray(request.seed_joints_deg, dtype=float)
 
         # Validate each analytic seed via FK (no optimization needed)
-        numeric = NumericIKSolver(request.robot_model)
         branch_solutions: list[LocalIKSolution] = []
         seen_joints: list[np.ndarray] = []
 
@@ -386,14 +428,13 @@ class PureAnalyticIKBackend:
         )
 
     def solve_all_joint_vectors(self, request: IKSolveAllRequest) -> list[np.ndarray]:
-        from .numeric_solver import NumericIKSolver
         from .kinematics import (
             joint_distance_deg as _jd,
             joints_within_limits,
             rotation_error_deg,
         )
 
-        seed_generator = AnalyticSeedGenerator(request.robot_model)
+        numeric, seed_generator = self._solver_and_seed_generator(request.robot_model)
         _, full_seeds = seed_generator.generate_seed_candidates(
             request.target_frame_pose,
             preferred_seed_joints_deg=request.seed_joints_deg,
@@ -404,7 +445,6 @@ class PureAnalyticIKBackend:
         filter_upper = np.asarray(request.filter_upper_deg, dtype=float)
         seed = None if request.seed_joints_deg is None else np.asarray(request.seed_joints_deg, dtype=float)
 
-        numeric = NumericIKSolver(request.robot_model)
         branch_solutions: list[tuple[int, np.ndarray]] = []
         seen_joints: list[np.ndarray] = []
 
@@ -450,14 +490,13 @@ class PureAnalyticIKBackend:
         self,
         request: IKSolveAllRequest,
     ) -> list[tuple[np.ndarray, int, np.ndarray]]:
-        from .numeric_solver import NumericIKSolver
         from .kinematics import (
             joint_distance_deg as _jd,
             joints_within_limits,
             rotation_error_deg,
         )
 
-        seed_generator = AnalyticSeedGenerator(request.robot_model)
+        numeric, seed_generator = self._solver_and_seed_generator(request.robot_model)
         _, full_seeds = seed_generator.generate_seed_candidates(
             request.target_frame_pose,
             preferred_seed_joints_deg=request.seed_joints_deg,
@@ -468,7 +507,6 @@ class PureAnalyticIKBackend:
         filter_upper = np.asarray(request.filter_upper_deg, dtype=float)
         seed = None if request.seed_joints_deg is None else np.asarray(request.seed_joints_deg, dtype=float)
 
-        numeric = NumericIKSolver(request.robot_model)
         branch_solutions: list[tuple[int, np.ndarray]] = []
         seen_joints: list[np.ndarray] = []
 

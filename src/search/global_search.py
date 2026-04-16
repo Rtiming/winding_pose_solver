@@ -8,7 +8,6 @@ from src.search.ik_collection import (
     _build_seed_joint_strategies,
     _collect_ik_candidates,
 )
-from src.search.parallel_profile_eval import maybe_parallel_evaluate_exact_profiles
 from src.search.path_optimizer import _optimize_joint_path, _summarize_selected_path
 from src.core.types import _IKCandidate, _IKLayer, _PathOptimizerSettings, _PathSearchResult
 
@@ -47,196 +46,29 @@ def _search_best_exact_pose_path(
             joint_count=joint_count,
         )
 
-    preview_indices = _build_preview_indices(reference_pose_rows)
-    preview_reference_rows = tuple(reference_pose_rows[index] for index in preview_indices)
-    preview_labels = tuple(row_labels[index] for index in preview_indices)
-    preview_flags = tuple(inserted_flags[index] for index in preview_indices)
-    full_cache: dict[tuple[tuple[float, float], ...], _PathSearchResult] = {}
-    preview_cache: dict[tuple[float, float], _PathSearchResult] = {}
-
-    def maybe_parallel_evaluate(
-        evaluation_reference_rows: Sequence[dict[str, float]],
-        evaluation_row_labels: Sequence[str],
-        evaluation_inserted_flags: Sequence[bool],
-        profiles: Sequence[Sequence[tuple[float, float]]],
-    ) -> tuple[_PathSearchResult, ...] | None:
-        return maybe_parallel_evaluate_exact_profiles(
-            reference_pose_rows=evaluation_reference_rows,
-            frame_a_origin_yz_profiles_mm=profiles,
-            row_labels=evaluation_row_labels,
-            inserted_flags=evaluation_inserted_flags,
-            motion_settings=motion_settings,
-            start_joints=start_joints,
-        )
-
-    def evaluate_profile(
-        frame_a_origin_yz_profile_mm: Sequence[tuple[float, float]],
-    ) -> _PathSearchResult:
-        cache_key = _profile_cache_key(frame_a_origin_yz_profile_mm)
-        cached_result = full_cache.get(cache_key)
-        if cached_result is not None:
-            return cached_result
-
-        result = _evaluate_frame_a_origin_profile(
-            reference_pose_rows,
-            frame_a_origin_yz_profile_mm=frame_a_origin_yz_profile_mm,
-            row_labels=row_labels,
-            inserted_flags=inserted_flags,
-            robot=robot,
-            mat_type=mat_type,
-            move_type=move_type,
-            start_joints=start_joints,
-            tool_pose=tool_pose,
-            reference_pose=reference_pose,
-            joint_count=joint_count,
-            optimizer_settings=optimizer_settings,
-            a1_lower_deg=a1_lower_deg,
-            a1_upper_deg=a1_upper_deg,
-            a2_max_deg=a2_max_deg,
-            joint_constraint_tolerance_deg=joint_constraint_tolerance_deg,
-            seed_joints=search_seed_joints,
-            lower_limits=lower_limits,
-            upper_limits=upper_limits,
-            bridge_trigger_joint_delta_deg=motion_settings.bridge_trigger_joint_delta_deg,
-        )
-        full_cache[cache_key] = result
-        return result
-
-    def evaluate_uniform_preview(dy_mm: float, dz_mm: float) -> _PathSearchResult:
-        cache_key = (round(float(dy_mm), 6), round(float(dz_mm), 6))
-        cached_result = preview_cache.get(cache_key)
-        if cached_result is not None:
-            return cached_result
-
-        preview_profile = tuple((float(dy_mm), float(dz_mm)) for _ in preview_reference_rows)
-        result = _evaluate_frame_a_origin_profile(
-            preview_reference_rows,
-            frame_a_origin_yz_profile_mm=preview_profile,
-            row_labels=preview_labels,
-            inserted_flags=preview_flags,
-            robot=robot,
-            mat_type=mat_type,
-            move_type=move_type,
-            start_joints=start_joints,
-            tool_pose=tool_pose,
-            reference_pose=reference_pose,
-            joint_count=joint_count,
-            optimizer_settings=optimizer_settings,
-            a1_lower_deg=a1_lower_deg,
-            a1_upper_deg=a1_upper_deg,
-            a2_max_deg=a2_max_deg,
-            joint_constraint_tolerance_deg=joint_constraint_tolerance_deg,
-            seed_joints=search_seed_joints,
-            lower_limits=lower_limits,
-            upper_limits=upper_limits,
-            bridge_trigger_joint_delta_deg=motion_settings.bridge_trigger_joint_delta_deg,
-        )
-        preview_cache[cache_key] = result
-        return result
-
     zero_profile = tuple((0.0, 0.0) for _ in reference_pose_rows)
-    best_result = evaluate_profile(zero_profile)
-    row0_candidates = len(best_result.ik_layers[0].candidates) if best_result.ik_layers else 0
-    print(
-        "Baseline fixed-orientation profile [dy=0, dz=0] mm: "
-        f"row0_candidates={row0_candidates}, "
-        f"ik_empty_rows={best_result.ik_empty_row_count}, "
-        f"config_switches={best_result.config_switches}, "
-        f"worst_joint_step={best_result.worst_joint_step_deg:.3f} deg."
+    best_result = _evaluate_frame_a_origin_profile(
+        reference_pose_rows,
+        frame_a_origin_yz_profile_mm=zero_profile,
+        row_labels=row_labels,
+        inserted_flags=inserted_flags,
+        robot=robot,
+        mat_type=mat_type,
+        move_type=move_type,
+        start_joints=start_joints,
+        tool_pose=tool_pose,
+        reference_pose=reference_pose,
+        joint_count=joint_count,
+        optimizer_settings=optimizer_settings,
+        a1_lower_deg=a1_lower_deg,
+        a1_upper_deg=a1_upper_deg,
+        a2_max_deg=a2_max_deg,
+        joint_constraint_tolerance_deg=joint_constraint_tolerance_deg,
+        seed_joints=search_seed_joints,
+        lower_limits=lower_limits,
+        upper_limits=upper_limits,
+        bridge_trigger_joint_delta_deg=motion_settings.bridge_trigger_joint_delta_deg,
     )
-    if _path_search_goal_is_satisfied(best_result, optimizer_settings=optimizer_settings):
-        return best_result
-
-    for envelope_mm in motion_settings.frame_a_origin_yz_envelope_schedule_mm:
-        for step_mm in motion_settings.frame_a_origin_yz_step_schedule_mm:
-            if step_mm <= 0.0 or envelope_mm < 0.0 or step_mm > envelope_mm + 1e-9:
-                continue
-
-            offsets = _iter_uniform_profile_offsets(
-                max_abs_offset_mm=envelope_mm,
-                step_mm=step_mm,
-            )
-            uncached_preview_offsets = [
-                (float(dy_mm), float(dz_mm))
-                for dy_mm, dz_mm in offsets
-                if (round(float(dy_mm), 6), round(float(dz_mm), 6)) not in preview_cache
-            ]
-            if uncached_preview_offsets:
-                parallel_preview_results = maybe_parallel_evaluate(
-                    preview_reference_rows,
-                    preview_labels,
-                    preview_flags,
-                    [
-                        tuple((dy_mm, dz_mm) for _ in preview_reference_rows)
-                        for dy_mm, dz_mm in uncached_preview_offsets
-                    ],
-                )
-                if parallel_preview_results is not None:
-                    for (dy_mm, dz_mm), preview_result in zip(
-                        uncached_preview_offsets,
-                        parallel_preview_results,
-                    ):
-                        preview_cache[
-                            (round(float(dy_mm), 6), round(float(dz_mm), 6))
-                        ] = preview_result
-                else:
-                    for dy_mm, dz_mm in uncached_preview_offsets:
-                        evaluate_uniform_preview(dy_mm, dz_mm)
-
-            preview_candidates = [
-                preview_cache[(round(float(dy_mm), 6), round(float(dz_mm), 6))]
-                for dy_mm, dz_mm in offsets
-            ]
-            preview_candidates.sort(key=_path_search_sort_key)
-
-            shortlisted_preview_results = preview_candidates[: min(8, len(preview_candidates))]
-            uncached_full_profiles: list[tuple[tuple[float, float], ...]] = []
-            uncached_full_profile_keys: list[tuple[tuple[float, float], ...]] = []
-            for preview_result in shortlisted_preview_results:
-                dy_mm, dz_mm = preview_result.frame_a_origin_yz_profile_mm[0]
-                profile = tuple((dy_mm, dz_mm) for _ in reference_pose_rows)
-                profile_key = _profile_cache_key(profile)
-                if profile_key not in full_cache:
-                    uncached_full_profiles.append(profile)
-                    uncached_full_profile_keys.append(profile_key)
-
-            if uncached_full_profiles:
-                parallel_full_results = maybe_parallel_evaluate(
-                    reference_pose_rows,
-                    row_labels,
-                    inserted_flags,
-                    uncached_full_profiles,
-                )
-                if parallel_full_results is not None:
-                    for profile_key, full_result in zip(
-                        uncached_full_profile_keys,
-                        parallel_full_results,
-                    ):
-                        full_cache[profile_key] = full_result
-                else:
-                    for profile in uncached_full_profiles:
-                        evaluate_profile(profile)
-
-            for preview_result in shortlisted_preview_results:
-                dy_mm, dz_mm = preview_result.frame_a_origin_yz_profile_mm[0]
-                profile = tuple((dy_mm, dz_mm) for _ in reference_pose_rows)
-                candidate_result = full_cache[_profile_cache_key(profile)]
-                if _path_search_sort_key(candidate_result) < _path_search_sort_key(best_result):
-                    best_result = candidate_result
-                    print(
-                        "Accepted uniform Frame-2 profile candidate: "
-                        f"dy={dy_mm:.3f} mm, dz={dz_mm:.3f} mm, "
-                        f"ik_empty_rows={candidate_result.ik_empty_row_count}, "
-                        f"config_switches={candidate_result.config_switches}, "
-                        f"bridge_like_segments={candidate_result.bridge_like_segments}, "
-                        f"worst_joint_step={candidate_result.worst_joint_step_deg:.3f} deg."
-                    )
-                    if _path_search_goal_is_satisfied(
-                        best_result,
-                        optimizer_settings=optimizer_settings,
-                    ):
-                        return best_result
-
     return best_result
 
 
@@ -265,6 +97,21 @@ def _evaluate_frame_a_origin_profile(
     reused_ik_layers: Sequence[_IKLayer] | None = None,
     recompute_row_indices: Sequence[int] | None = None,
 ) -> _PathSearchResult:
+    frame_a_origin_yz_profile_mm = _close_terminal_profile_if_needed(
+        reference_pose_rows,
+        frame_a_origin_yz_profile_mm,
+    )
+    if (
+        recompute_row_indices is not None
+        and len(reference_pose_rows) >= 2
+        and _reference_path_has_terminal_start_copy(reference_pose_rows)
+    ):
+        recompute_set = {int(index) for index in recompute_row_indices}
+        terminal_index = len(reference_pose_rows) - 1
+        if 0 in recompute_set or terminal_index in recompute_set:
+            recompute_set.add(0)
+            recompute_set.add(terminal_index)
+        recompute_row_indices = tuple(sorted(recompute_set))
     adjusted_pose_rows = _apply_frame_a_origin_yz_profile(
         reference_pose_rows,
         frame_a_origin_yz_profile_mm=frame_a_origin_yz_profile_mm,
@@ -329,6 +176,9 @@ def _finalize_frame_a_origin_profile_result(
                 move_type=move_type,
                 start_joints=start_joints,
                 optimizer_settings=optimizer_settings,
+                require_terminal_match_start=_reference_path_has_terminal_start_copy(
+                    reference_pose_rows
+                ),
             )
             selected_path = tuple(selected_path_list)
         except RuntimeError:
@@ -380,6 +230,60 @@ def _finalize_frame_a_origin_profile_result(
         max_abs_offset_mm=max_abs_offset_mm,
         total_abs_offset_mm=total_abs_offset_mm,
     )
+
+
+def _close_terminal_profile_if_needed(
+    reference_pose_rows: Sequence[dict[str, float]],
+    frame_a_origin_yz_profile_mm: Sequence[tuple[float, float]],
+) -> tuple[tuple[float, float], ...]:
+    profile = tuple(
+        (float(dy_mm), float(dz_mm))
+        for dy_mm, dz_mm in frame_a_origin_yz_profile_mm
+    )
+    if len(profile) >= 2 and _reference_path_has_terminal_start_copy(reference_pose_rows):
+        profile = (*profile[:-1], profile[0])
+    return profile
+
+
+def _reference_path_has_terminal_start_copy(
+    reference_pose_rows: Sequence[dict[str, float]],
+) -> bool:
+    if len(reference_pose_rows) < 2:
+        return False
+    first_row = reference_pose_rows[0]
+    terminal_row = reference_pose_rows[-1]
+    if "source_row" not in first_row or "source_row" not in terminal_row:
+        return False
+    if int(float(first_row["source_row"])) != int(float(terminal_row["source_row"])):
+        return False
+    return _pose_rows_match(first_row, terminal_row)
+
+
+def _pose_rows_match(
+    first_row: dict[str, float],
+    second_row: dict[str, float],
+    *,
+    tolerance: float = 1e-6,
+) -> bool:
+    for column in (
+        "x_mm",
+        "y_mm",
+        "z_mm",
+        "r11",
+        "r12",
+        "r13",
+        "r21",
+        "r22",
+        "r23",
+        "r31",
+        "r32",
+        "r33",
+    ):
+        if column not in first_row or column not in second_row:
+            return False
+        if abs(float(first_row[column]) - float(second_row[column])) > tolerance:
+            return False
+    return True
 
 
 def _apply_frame_a_origin_yz_profile(
@@ -477,62 +381,6 @@ def _path_search_sort_key(result: _PathSearchResult) -> tuple[float, ...]:
         float(result.total_abs_offset_mm),
         float(result.total_cost),
     )
-
-
-def _path_search_goal_is_satisfied(
-    result: _PathSearchResult,
-    *,
-    optimizer_settings: _PathOptimizerSettings,
-) -> bool:
-    if result.invalid_row_count != 0 or result.ik_empty_row_count != 0:
-        return False
-    if result.config_switches != 0 or result.bridge_like_segments != 0:
-        return False
-    preferred_limit = max(optimizer_settings.preferred_joint_step_deg, default=0.0)
-    return result.worst_joint_step_deg <= preferred_limit + 1e-9
-
-
-def _iter_uniform_profile_offsets(
-    *,
-    max_abs_offset_mm: float,
-    step_mm: float,
-) -> tuple[tuple[float, float], ...]:
-    if step_mm <= 0.0 or max_abs_offset_mm < 0.0:
-        return ()
-
-    shell_limit = int(math.floor(max_abs_offset_mm / step_mm + 1e-9))
-    offsets: list[tuple[float, float]] = []
-    for dy_index in range(-shell_limit, shell_limit + 1):
-        for dz_index in range(-shell_limit, shell_limit + 1):
-            offset = (dy_index * step_mm, dz_index * step_mm)
-            if any(abs(value) > max_abs_offset_mm + 1e-9 for value in offset):
-                continue
-            offsets.append(offset)
-
-    offsets.sort(
-        key=lambda offset: (
-            0.0 if abs(offset[0]) <= 1e-9 and abs(offset[1]) <= 1e-9 else 1.0,
-            abs(offset[0]) + abs(offset[1]),
-            max(abs(offset[0]), abs(offset[1])),
-            offset,
-        )
-    )
-    return tuple(offsets)
-
-
-def _build_preview_indices(
-    pose_rows: Sequence[dict[str, float]],
-    *,
-    target_count: int = 24,
-) -> tuple[int, ...]:
-    if len(pose_rows) <= target_count:
-        return tuple(range(len(pose_rows)))
-
-    step = max(1, math.ceil((len(pose_rows) - 1) / max(1, target_count - 1)))
-    indices = list(range(0, len(pose_rows), step))
-    if indices[-1] != len(pose_rows) - 1:
-        indices.append(len(pose_rows) - 1)
-    return tuple(indices)
 
 
 def _extract_row_labels(pose_rows: Sequence[dict[str, float]]) -> tuple[str, ...]:

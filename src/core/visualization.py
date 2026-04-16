@@ -20,6 +20,7 @@ def plot_centerline_frames(
     csv_path: str | Path,
     *,
     build_options: FrameBuildOptions,
+    append_start_as_terminal: bool = False,
     step: int,
     vector_scale: float,
     show_tangent: bool,
@@ -38,6 +39,7 @@ def plot_centerline_frames(
         csv_path,
         require_boundaries=True,
         build_options=build_options,
+        append_start_as_terminal=append_start_as_terminal,
     )
     print(format_issue_report(dataset.records))
 

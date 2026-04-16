@@ -19,6 +19,7 @@ from scipy.spatial.transform import Rotation as R
 JOINT_COUNT = 6
 POSE_VECTOR_SIZE = 6
 ARM_JOINT_COUNT = 3
+_IDENTITY_3 = np.eye(3, dtype=float)
 
 
 def joint_distance_deg(q1_deg: Iterable[float], q2_deg: Iterable[float]) -> float:
@@ -130,6 +131,34 @@ def revolute_twist_transform(
     transform = np.eye(4, dtype=float)
     transform[:3, :3] = rotation_matrix
     transform[:3, 3] = translation_mm
+    return transform
+
+
+def _revolute_twist_transform_precomputed(
+    axis_skew: np.ndarray,
+    axis_skew_sq: np.ndarray,
+    linear_velocity: np.ndarray,
+    angle_deg: float,
+) -> np.ndarray:
+    """使用预计算的螺旋轴量生成旋转关节指数映射。"""
+    angle_rad = np.deg2rad(angle_deg)
+    sin_angle = np.sin(angle_rad)
+    one_minus_cos = 1.0 - np.cos(angle_rad)
+
+    rotation_matrix = (
+        _IDENTITY_3
+        + sin_angle * axis_skew
+        + one_minus_cos * axis_skew_sq
+    )
+    translation_matrix = (
+        _IDENTITY_3 * angle_rad
+        + one_minus_cos * axis_skew
+        + (angle_rad - sin_angle) * axis_skew_sq
+    )
+
+    transform = np.eye(4, dtype=float)
+    transform[:3, :3] = rotation_matrix
+    transform[:3, 3] = translation_matrix @ linear_velocity
     return transform
 
 
@@ -302,6 +331,9 @@ class RobotModel:
     frame_T_inv: np.ndarray = field(init=False, repr=False)
     home_wrist_center_base_mm: np.ndarray = field(init=False, repr=False)
     wrist_center_to_flange_in_flange_mm: np.ndarray = field(init=False, repr=False)
+    joint_axis_skews_base: tuple[np.ndarray, ...] = field(init=False, repr=False)
+    joint_axis_skew_squares_base: tuple[np.ndarray, ...] = field(init=False, repr=False)
+    joint_linear_velocities_base: tuple[np.ndarray, ...] = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         """构造完成后统一做参数校验和缓存。"""
@@ -328,6 +360,22 @@ class RobotModel:
 
         if np.any(np.abs(np.abs(self.joint_senses) - 1.0) > 1e-9):
             raise ValueError("Each joint sense must be either +1 or -1.")
+
+        self.joint_axis_skews_base = tuple(
+            skew_symmetric(axis_direction)
+            for axis_direction in self.joint_axis_directions_base
+        )
+        self.joint_axis_skew_squares_base = tuple(
+            axis_skew @ axis_skew
+            for axis_skew in self.joint_axis_skews_base
+        )
+        self.joint_linear_velocities_base = tuple(
+            -np.cross(axis_direction, axis_point)
+            for axis_direction, axis_point in zip(
+                self.joint_axis_directions_base,
+                self.joint_axis_points_base_mm,
+            )
+        )
 
         self.tool_T_inv = invert_transform(self.tool_T)
         self.frame_T_inv = invert_transform(self.frame_T)
@@ -360,9 +408,10 @@ class RobotModel:
         transform = np.eye(4, dtype=float)
         for index in range(JOINT_COUNT):
             effective_angle_deg = q[index] * self.joint_senses[index]
-            transform = transform @ revolute_twist_transform(
-                self.joint_axis_directions_base[index],
-                self.joint_axis_points_base_mm[index],
+            transform = transform @ _revolute_twist_transform_precomputed(
+                self.joint_axis_skews_base[index],
+                self.joint_axis_skew_squares_base[index],
+                self.joint_linear_velocities_base[index],
                 effective_angle_deg,
             )
         return transform @ self.home_flange_T
@@ -402,9 +451,10 @@ class RobotModel:
         transform = np.eye(4, dtype=float)
         for index in range(count):
             effective_angle_deg = q[index] * self.joint_senses[index]
-            transform = transform @ revolute_twist_transform(
-                self.joint_axis_directions_base[index],
-                self.joint_axis_points_base_mm[index],
+            transform = transform @ _revolute_twist_transform_precomputed(
+                self.joint_axis_skews_base[index],
+                self.joint_axis_skew_squares_base[index],
+                self.joint_linear_velocities_base[index],
                 effective_angle_deg,
             )
         return transform

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import math
 from collections import Counter
 from typing import Iterable
 
@@ -15,34 +14,6 @@ from src.core.collab_models import (
     load_json_file,
     write_json_file,
 )
-
-
-def _iter_uniform_profile_offsets(
-    *,
-    max_abs_offset_mm: float,
-    step_mm: float,
-) -> tuple[tuple[float, float], ...]:
-    if step_mm <= 0.0 or max_abs_offset_mm < 0.0:
-        return ()
-
-    shell_limit = int(math.floor(max_abs_offset_mm / step_mm + 1e-9))
-    offsets: list[tuple[float, float]] = []
-    for dy_index in range(-shell_limit, shell_limit + 1):
-        for dz_index in range(-shell_limit, shell_limit + 1):
-            offset = (dy_index * step_mm, dz_index * step_mm)
-            if any(abs(value) > max_abs_offset_mm + 1e-9 for value in offset):
-                continue
-            offsets.append(offset)
-
-    offsets.sort(
-        key=lambda offset: (
-            0.0 if abs(offset[0]) <= 1e-9 and abs(offset[1]) <= 1e-9 else 1.0,
-            abs(offset[0]) + abs(offset[1]),
-            max(abs(offset[0]), abs(offset[1])),
-            offset,
-        )
-    )
-    return tuple(offsets)
 
 
 def _result_sort_key(result: ProfileEvaluationResult) -> tuple[float, ...]:
@@ -88,6 +59,63 @@ def _clone_request(
     )
 
 
+def _max_abs_offset_mm(base_request: ProfileEvaluationRequest) -> float:
+    motion_settings = base_request.motion_settings
+    envelope_values = tuple(
+        float(value)
+        for value in motion_settings.get("frame_a_origin_yz_envelope_schedule_mm", (6.0,))
+    )
+    return max((value for value in envelope_values if value >= 0.0), default=0.0)
+
+
+def _clamp_profile(
+    profile: tuple[tuple[float, float], ...],
+    *,
+    max_abs_offset_mm: float,
+) -> tuple[tuple[float, float], ...]:
+    return tuple(
+        (
+            round(max(-max_abs_offset_mm, min(max_abs_offset_mm, float(dy_mm))), 6),
+            round(max(-max_abs_offset_mm, min(max_abs_offset_mm, float(dz_mm))), 6),
+        )
+        for dy_mm, dz_mm in profile
+    )
+
+
+def _candidate_sort_key(candidate: ProfileEvaluationRequest) -> tuple[float, ...]:
+    strategy = str(candidate.metadata.get("strategy", ""))
+    strategy_priority = {
+        "nominal": 0.0,
+        "local_window": 1.0,
+        "local_corridor_asym": 2.0,
+        "local_basis": 3.0,
+    }.get(strategy, 9.0)
+    return (
+        strategy_priority,
+        abs(float(candidate.metadata.get("dy_mm", 0.0)))
+        + abs(float(candidate.metadata.get("dz_mm", 0.0))),
+        abs(float(candidate.metadata.get("left_dy_mm", 0.0)))
+        + abs(float(candidate.metadata.get("left_dz_mm", 0.0)))
+        + abs(float(candidate.metadata.get("right_dy_mm", 0.0)))
+        + abs(float(candidate.metadata.get("right_dz_mm", 0.0))),
+        candidate.request_id,
+    )
+
+
+def _candidate_group_key(candidate: ProfileEvaluationRequest) -> str:
+    strategy = str(candidate.metadata.get("strategy", ""))
+    if strategy != "local_window":
+        return strategy or "other"
+
+    dy_mm = float(candidate.metadata.get("dy_mm", 0.0))
+    dz_mm = float(candidate.metadata.get("dz_mm", 0.0))
+    if abs(dy_mm) > 1e-9 and abs(dz_mm) <= 1e-9:
+        return "local_window_y"
+    if abs(dy_mm) <= 1e-9 and abs(dz_mm) > 1e-9:
+        return "local_window_z"
+    return "local_window_diag"
+
+
 def _choose_focus_segments(
     request: RemoteSearchRequest,
 ) -> tuple[int, ...]:
@@ -124,38 +152,17 @@ def _choose_focus_segments(
     return tuple(unique_segments[:4])
 
 
-def _build_uniform_candidates(request: RemoteSearchRequest) -> list[ProfileEvaluationRequest]:
-    motion_settings = request.base_request.motion_settings
+def _build_nominal_candidate(request: RemoteSearchRequest) -> ProfileEvaluationRequest:
     row_count = len(request.base_request.reference_pose_rows)
-    candidates: list[ProfileEvaluationRequest] = []
-    ordinal = 0
-
-    for envelope_mm in motion_settings.get("frame_a_origin_yz_envelope_schedule_mm", (6.0,)):
-        for step_mm in motion_settings.get("frame_a_origin_yz_step_schedule_mm", (4.0, 2.0, 1.0)):
-            if float(step_mm) <= 0.0 or float(envelope_mm) < 0.0:
-                continue
-            for dy_mm, dz_mm in _iter_uniform_profile_offsets(
-                max_abs_offset_mm=float(envelope_mm),
-                step_mm=float(step_mm),
-            ):
-                if abs(dy_mm) <= 1e-9 and abs(dz_mm) <= 1e-9:
-                    continue
-                ordinal += 1
-                candidates.append(
-                    _clone_request(
-                        request.base_request,
-                        request_id=f"round{request.round_index}_uniform_{ordinal:03d}",
-                        profile=tuple((dy_mm, dz_mm) for _ in range(row_count)),
-                        metadata={
-                            "strategy": "uniform",
-                            "dy_mm": dy_mm,
-                            "dz_mm": dz_mm,
-                            "envelope_mm": float(envelope_mm),
-                            "step_mm": float(step_mm),
-                        },
-                    )
-                )
-    return candidates
+    return _clone_request(
+        request.base_request,
+        request_id=f"round{request.round_index}_nominal",
+        profile=tuple((0.0, 0.0) for _ in range(row_count)),
+        metadata={
+            "strategy": "nominal",
+            "round_index": int(request.round_index),
+        },
+    )
 
 
 def _apply_local_window_delta(
@@ -165,7 +172,7 @@ def _apply_local_window_delta(
     window_radius: int,
     dy_mm: float,
     dz_mm: float,
-) -> tuple[tuple[float, float], ...]:
+    ) -> tuple[tuple[float, float], ...]:
     updated_profile = [list(offset) for offset in profile]
     center = min(len(updated_profile) - 1, segment_index + 1)
     for row_index in range(
@@ -176,6 +183,58 @@ def _apply_local_window_delta(
         weight = max(0.0, 1.0 - distance / max(1, window_radius + 1))
         updated_profile[row_index][0] += dy_mm * weight
         updated_profile[row_index][1] += dz_mm * weight
+    return tuple((round(offset[0], 6), round(offset[1], 6)) for offset in updated_profile)
+
+
+def _apply_asymmetric_corridor_delta(
+    profile: tuple[tuple[float, float], ...],
+    *,
+    segment_index: int,
+    window_radius: int,
+    left_dy_mm: float,
+    left_dz_mm: float,
+    right_dy_mm: float,
+    right_dz_mm: float,
+) -> tuple[tuple[float, float], ...]:
+    updated_profile = [list(offset) for offset in profile]
+    center = min(len(updated_profile) - 1, segment_index + 1)
+    corridor_start = max(0, center - window_radius)
+    corridor_end = min(len(updated_profile) - 1, center + window_radius)
+    for row_index in range(corridor_start, corridor_end + 1):
+        if row_index <= center:
+            distance = center - row_index
+            side_radius = max(1, center - corridor_start + 1)
+            weight = max(0.0, 1.0 - distance / side_radius)
+            updated_profile[row_index][0] += left_dy_mm * weight
+            updated_profile[row_index][1] += left_dz_mm * weight
+        else:
+            distance = row_index - center
+            side_radius = max(1, corridor_end - center + 1)
+            weight = max(0.0, 1.0 - distance / side_radius)
+            updated_profile[row_index][0] += right_dy_mm * weight
+            updated_profile[row_index][1] += right_dz_mm * weight
+    return tuple((round(offset[0], 6), round(offset[1], 6)) for offset in updated_profile)
+
+
+def _apply_two_node_basis_delta(
+    profile: tuple[tuple[float, float], ...],
+    *,
+    segment_index: int,
+    window_radius: int,
+    start_dy_mm: float,
+    start_dz_mm: float,
+    end_dy_mm: float,
+    end_dz_mm: float,
+) -> tuple[tuple[float, float], ...]:
+    updated_profile = [list(offset) for offset in profile]
+    center = min(len(updated_profile) - 1, segment_index + 1)
+    corridor_start = max(0, center - window_radius)
+    corridor_end = min(len(updated_profile) - 1, center + window_radius)
+    corridor_length = max(1, corridor_end - corridor_start)
+    for row_index in range(corridor_start, corridor_end + 1):
+        alpha = (row_index - corridor_start) / corridor_length
+        updated_profile[row_index][0] += ((1.0 - alpha) * start_dy_mm) + (alpha * end_dy_mm)
+        updated_profile[row_index][1] += ((1.0 - alpha) * start_dz_mm) + (alpha * end_dz_mm)
     return tuple((round(offset[0], 6), round(offset[1], 6)) for offset in updated_profile)
 
 
@@ -190,6 +249,7 @@ def _build_local_candidates(request: RemoteSearchRequest) -> list[ProfileEvaluat
     if not base_profile:
         base_profile = tuple((0.0, 0.0) for _ in request.base_request.reference_pose_rows)
 
+    max_abs_offset_mm = _max_abs_offset_mm(request.base_request)
     focus_segments = _choose_focus_segments(request)
     step_values = tuple(
         float(value)
@@ -219,6 +279,7 @@ def _build_local_candidates(request: RemoteSearchRequest) -> list[ProfileEvaluat
                     dy_mm=dy_mm,
                     dz_mm=dz_mm,
                 )
+                profile = _clamp_profile(profile, max_abs_offset_mm=max_abs_offset_mm)
                 if profile in seen_profiles:
                     continue
                 seen_profiles.add(profile)
@@ -243,33 +304,198 @@ def _build_local_candidates(request: RemoteSearchRequest) -> list[ProfileEvaluat
                         },
                     )
                 )
+
+            for left_dy_mm, left_dz_mm, right_dy_mm, right_dz_mm in (
+                (step_mm, 0.0, 0.0, 0.0),
+                (-step_mm, 0.0, 0.0, 0.0),
+                (0.0, step_mm, 0.0, 0.0),
+                (0.0, -step_mm, 0.0, 0.0),
+                (0.0, 0.0, step_mm, 0.0),
+                (0.0, 0.0, -step_mm, 0.0),
+                (0.0, 0.0, 0.0, step_mm),
+                (0.0, 0.0, 0.0, -step_mm),
+                (step_mm, 0.0, -step_mm, 0.0),
+                (-step_mm, 0.0, step_mm, 0.0),
+                (0.0, step_mm, 0.0, -step_mm),
+                (0.0, -step_mm, 0.0, step_mm),
+            ):
+                profile = _apply_asymmetric_corridor_delta(
+                    base_profile,
+                    segment_index=segment_index,
+                    window_radius=window_radius,
+                    left_dy_mm=left_dy_mm,
+                    left_dz_mm=left_dz_mm,
+                    right_dy_mm=right_dy_mm,
+                    right_dz_mm=right_dz_mm,
+                )
+                profile = _clamp_profile(profile, max_abs_offset_mm=max_abs_offset_mm)
+                if profile in seen_profiles:
+                    continue
+                seen_profiles.add(profile)
+                ordinal += 1
+                left_label = request.base_request.row_labels[segment_index]
+                right_label = request.base_request.row_labels[
+                    min(len(request.base_request.row_labels) - 1, segment_index + 1)
+                ]
+                candidates.append(
+                    _clone_request(
+                        request.base_request,
+                        request_id=f"round{request.round_index}_corridor_{ordinal:03d}",
+                        profile=profile,
+                        metadata={
+                            "strategy": "local_corridor_asym",
+                            "segment_index": segment_index,
+                            "segment_label": f"{left_label}->{right_label}",
+                            "window_radius": window_radius,
+                            "left_dy_mm": left_dy_mm,
+                            "left_dz_mm": left_dz_mm,
+                            "right_dy_mm": right_dy_mm,
+                            "right_dz_mm": right_dz_mm,
+                            "step_mm": step_mm,
+                        },
+                    )
+                )
+
+            for start_dy_mm, start_dz_mm, end_dy_mm, end_dz_mm in (
+                (step_mm, 0.0, 0.0, 0.0),
+                (-step_mm, 0.0, 0.0, 0.0),
+                (0.0, step_mm, 0.0, 0.0),
+                (0.0, -step_mm, 0.0, 0.0),
+                (0.0, 0.0, step_mm, 0.0),
+                (0.0, 0.0, -step_mm, 0.0),
+                (0.0, 0.0, 0.0, step_mm),
+                (0.0, 0.0, 0.0, -step_mm),
+                (step_mm, 0.0, -step_mm, 0.0),
+                (0.0, step_mm, 0.0, -step_mm),
+            ):
+                profile = _apply_two_node_basis_delta(
+                    base_profile,
+                    segment_index=segment_index,
+                    window_radius=window_radius,
+                    start_dy_mm=start_dy_mm,
+                    start_dz_mm=start_dz_mm,
+                    end_dy_mm=end_dy_mm,
+                    end_dz_mm=end_dz_mm,
+                )
+                profile = _clamp_profile(profile, max_abs_offset_mm=max_abs_offset_mm)
+                if profile in seen_profiles:
+                    continue
+                seen_profiles.add(profile)
+                ordinal += 1
+                left_label = request.base_request.row_labels[segment_index]
+                right_label = request.base_request.row_labels[
+                    min(len(request.base_request.row_labels) - 1, segment_index + 1)
+                ]
+                candidates.append(
+                    _clone_request(
+                        request.base_request,
+                        request_id=f"round{request.round_index}_basis_{ordinal:03d}",
+                        profile=profile,
+                        metadata={
+                            "strategy": "local_basis",
+                            "segment_index": segment_index,
+                            "segment_label": f"{left_label}->{right_label}",
+                            "window_radius": window_radius,
+                            "left_dy_mm": start_dy_mm,
+                            "left_dz_mm": start_dz_mm,
+                            "right_dy_mm": end_dy_mm,
+                            "right_dz_mm": end_dz_mm,
+                            "step_mm": step_mm,
+                        },
+                    )
+                )
     return candidates
 
 
+def _limit_candidates_with_diversity(
+    candidates: list[ProfileEvaluationRequest],
+    *,
+    candidate_limit: int,
+    prefer_local_candidates: bool,
+) -> tuple[ProfileEvaluationRequest, ...]:
+    sorted_candidates = sorted(candidates, key=_candidate_sort_key)
+    if not sorted_candidates:
+        return ()
+
+    if not prefer_local_candidates:
+        return tuple(sorted_candidates[: max(1, candidate_limit)])
+
+    strategy_order = (
+        "nominal",
+        "local_window_y",
+        "local_window_z",
+        "local_corridor_asym",
+        "local_basis",
+        "local_window_diag",
+    )
+    grouped_candidates: dict[str, list[ProfileEvaluationRequest]] = {
+        strategy: [] for strategy in {
+            "nominal",
+            "local_window_y",
+            "local_window_z",
+            "local_window_diag",
+            "local_corridor_asym",
+            "local_basis",
+        }
+    }
+    extra_candidates: list[ProfileEvaluationRequest] = []
+    for candidate in sorted_candidates:
+        strategy = _candidate_group_key(candidate)
+        if strategy in grouped_candidates:
+            grouped_candidates[strategy].append(candidate)
+        else:
+            extra_candidates.append(candidate)
+
+    selected: list[ProfileEvaluationRequest] = []
+    selected_ids: set[str] = set()
+    strategy_positions = {
+        strategy: 0 for strategy in grouped_candidates
+    }
+    while len(selected) < max(1, candidate_limit):
+        added_any = False
+        for strategy in strategy_order:
+            strategy_candidates = grouped_candidates[strategy]
+            strategy_index = strategy_positions[strategy]
+            if strategy_index >= len(strategy_candidates):
+                continue
+            candidate = strategy_candidates[strategy_index]
+            strategy_positions[strategy] = strategy_index + 1
+            if candidate.request_id in selected_ids:
+                continue
+            selected.append(candidate)
+            selected_ids.add(candidate.request_id)
+            added_any = True
+            if len(selected) >= max(1, candidate_limit):
+                break
+        if not added_any:
+            break
+
+    if len(selected) < max(1, candidate_limit):
+        for candidate in sorted_candidates:
+            if candidate.request_id in selected_ids:
+                continue
+            selected.append(candidate)
+            selected_ids.add(candidate.request_id)
+            if len(selected) >= max(1, candidate_limit):
+                break
+
+    return tuple(selected)
+
+
 def propose_candidates(request: RemoteSearchRequest) -> EvaluationBatchRequest:
-    candidates = _build_uniform_candidates(request)
-    if request.round_index >= 2 or request.baseline_result is not None:
+    prefer_local_candidates = bool(request.metadata.get("prefer_local_candidates"))
+    candidates: list[ProfileEvaluationRequest] = []
+    if request.baseline_result is None:
+        candidates.append(_build_nominal_candidate(request))
+    else:
         candidates.extend(_build_local_candidates(request))
 
-    local_first = request.round_index >= 2
-    candidates.sort(
-        key=lambda candidate: (
-            0
-            if (
-                candidate.metadata.get("strategy") == "local_window"
-                and local_first
-            )
-            or (
-                candidate.metadata.get("strategy") == "uniform"
-                and not local_first
-            )
-            else 1,
-            abs(float(candidate.metadata.get("dy_mm", 0.0)))
-            + abs(float(candidate.metadata.get("dz_mm", 0.0))),
-            candidate.request_id,
-        )
+    local_first = prefer_local_candidates or request.round_index >= 2
+    limited = _limit_candidates_with_diversity(
+        candidates,
+        candidate_limit=max(1, request.candidate_limit),
+        prefer_local_candidates=local_first,
     )
-    limited = tuple(candidates[: max(1, request.candidate_limit)])
     return EvaluationBatchRequest(evaluations=limited)
 
 
@@ -295,14 +521,31 @@ def summarize_results(results: Iterable[ProfileEvaluationResult]) -> RemoteSearc
         )
 
     best_result = sorted_results[0]
-    if best_result.status == "valid":
+    target_reachable = (
+        int(best_result.invalid_row_count) == 0
+        and int(best_result.ik_empty_row_count) == 0
+        and bool(best_result.selected_path)
+    )
+    if target_reachable and (
+        int(best_result.config_switches) > 0
+        or int(best_result.bridge_like_segments) > 0
+        or best_result.failing_segments
+    ):
         conclusion = (
-            f"Found a clean candidate: {best_result.request_id} "
+            f"Found a target-reachable candidate with continuity warnings: "
+            f"{best_result.request_id} "
+            f"(config_switches={best_result.config_switches}, "
+            f"bridge_like_segments={best_result.bridge_like_segments}, "
+            f"worst_joint_step={best_result.worst_joint_step_deg:.3f} deg)."
+        )
+    elif target_reachable:
+        conclusion = (
+            f"Found a target-reachable clean candidate: {best_result.request_id} "
             f"(worst_joint_step={best_result.worst_joint_step_deg:.3f} deg)."
         )
     else:
         conclusion = (
-            f"No clean candidate yet; best request is {best_result.request_id} with "
+            f"No target-reachable candidate yet; best request is {best_result.request_id} with "
             f"ik_empty_rows={best_result.ik_empty_row_count}, "
             f"config_switches={best_result.config_switches}, "
             f"bridge_like_segments={best_result.bridge_like_segments}."

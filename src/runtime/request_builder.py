@@ -23,6 +23,7 @@ def refresh_pose_csv(settings: AppRuntimeSettings) -> Path:
             settings.validation_centerline_csv,
             settings.tool_poses_frame2_csv,
             build_options=settings.frame_build_options,
+            append_start_as_terminal=settings.append_start_as_terminal,
             target_frame_origin_mm=settings.target_frame_origin_mm,
             target_frame_rotation_xyz_deg=settings.target_frame_rotation_xyz_deg,
             verify_solution=settings.enable_solver_verification,
@@ -60,6 +61,7 @@ def build_profile_evaluation_request(
     request_metadata.setdefault("request_build_profile", runtime_profile_snapshot())
     request_metadata.setdefault("tool_poses_frame2_csv", str(settings.tool_poses_frame2_csv))
     request_metadata.setdefault("validation_centerline_csv", str(settings.validation_centerline_csv))
+    request_metadata.setdefault("append_start_as_terminal", bool(settings.append_start_as_terminal))
 
     return ProfileEvaluationRequest(
         request_id=request_id,

@@ -13,6 +13,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from main import (
+    APPEND_CENTERLINE_START_AS_TERMINAL,
     ENABLE_CUSTOM_SMOOTHING_AND_POSE_SELECTION,
     FRAME_NAME,
     IK_BACKEND,
@@ -42,6 +43,7 @@ def _build_environment() -> SweepEnvironment:
         frame_name=FRAME_NAME,
         program_name=PROGRAM_NAME,
         ik_backend=IK_BACKEND,
+        append_start_as_terminal=APPEND_CENTERLINE_START_AS_TERMINAL,
         local_parallel_workers=1,
         local_parallel_min_batch_size=999999,
     )
@@ -100,6 +102,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-step-z", type=float, default=5.0)
     parser.add_argument("--max-iters", type=int, default=8)
     parser.add_argument("--no-diagonal", action="store_true")
+    parser.add_argument("--min-y", type=float, default=None, help="Hard lower bound for origin Y.")
+    parser.add_argument("--max-y", type=float, default=None, help="Hard upper bound for origin Y.")
+    parser.add_argument("--min-z", type=float, default=None, help="Hard lower bound for origin Z.")
+    parser.add_argument("--max-z", type=float, default=None, help="Hard upper bound for origin Z.")
     return parser.parse_args()
 
 
@@ -125,6 +131,10 @@ def main() -> int:
             eval_config=eval_config,
             workers=int(args.workers),
             prefix="[sweep]",
+            min_y_mm=None if args.min_y is None else float(args.min_y),
+            max_y_mm=None if args.max_y is None else float(args.max_y),
+            min_z_mm=None if args.min_z is None else float(args.min_z),
+            max_z_mm=None if args.max_z is None else float(args.max_z),
         )
         adaptive_trace = []
     else:
@@ -139,6 +149,10 @@ def main() -> int:
                 min_step_z_mm=float(args.min_step_z),
                 max_iters=max(1, int(args.max_iters)),
                 include_diagonal=not bool(args.no_diagonal),
+                min_y_mm=None if args.min_y is None else float(args.min_y),
+                max_y_mm=None if args.max_y is None else float(args.max_y),
+                min_z_mm=None if args.min_z is None else float(args.min_z),
+                max_z_mm=None if args.max_z is None else float(args.max_z),
             ),
             environment=environment,
             eval_config=eval_config,
@@ -175,6 +189,10 @@ def main() -> int:
         payload["min_step_z"] = float(args.min_step_z)
         payload["max_iters"] = int(args.max_iters)
         payload["diagonal"] = not bool(args.no_diagonal)
+    payload["min_y"] = None if args.min_y is None else float(args.min_y)
+    payload["max_y"] = None if args.max_y is None else float(args.max_y)
+    payload["min_z"] = None if args.min_z is None else float(args.min_z)
+    payload["max_z"] = None if args.max_z is None else float(args.max_z)
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(payload, indent=2), encoding="utf-8")

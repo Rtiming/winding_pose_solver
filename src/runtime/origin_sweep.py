@@ -22,6 +22,7 @@ class SweepEnvironment:
     frame_name: str
     program_name: str
     ik_backend: str
+    append_start_as_terminal: bool = False
     local_parallel_workers: int = 1
     local_parallel_min_batch_size: int = 999999
     artifact_root: Path = Path("artifacts/tmp/origin_sweep")
@@ -52,6 +53,10 @@ class AdaptiveSweepConfig:
     min_step_z_mm: float
     max_iters: int
     include_diagonal: bool
+    min_y_mm: float | None = None
+    max_y_mm: float | None = None
+    min_z_mm: float | None = None
+    max_z_mm: float | None = None
 
 
 @dataclass(frozen=True)
@@ -124,6 +129,50 @@ def build_cases(
     )
 
 
+def _value_within_optional_bounds(
+    value: float,
+    *,
+    lower_bound: float | None,
+    upper_bound: float | None,
+) -> bool:
+    if lower_bound is not None and value < float(lower_bound) - 1e-9:
+        return False
+    if upper_bound is not None and value > float(upper_bound) + 1e-9:
+        return False
+    return True
+
+
+def _case_within_optional_bounds(
+    case: SweepCase,
+    *,
+    min_y_mm: float | None,
+    max_y_mm: float | None,
+    min_z_mm: float | None,
+    max_z_mm: float | None,
+) -> bool:
+    return _value_within_optional_bounds(
+        float(case.y_mm),
+        lower_bound=min_y_mm,
+        upper_bound=max_y_mm,
+    ) and _value_within_optional_bounds(
+        float(case.z_mm),
+        lower_bound=min_z_mm,
+        upper_bound=max_z_mm,
+    )
+
+
+def _deduplicate_cases(cases: Sequence[SweepCase]) -> tuple[SweepCase, ...]:
+    unique_cases: list[SweepCase] = []
+    seen: set[tuple[float, float]] = set()
+    for case in cases:
+        key = case_key(case)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique_cases.append(case)
+    return tuple(unique_cases)
+
+
 def generate_adaptive_neighbors(
     *,
     x_mm: float,
@@ -132,6 +181,10 @@ def generate_adaptive_neighbors(
     step_y_mm: float,
     step_z_mm: float,
     include_diagonal: bool,
+    min_y_mm: float | None = None,
+    max_y_mm: float | None = None,
+    min_z_mm: float | None = None,
+    max_z_mm: float | None = None,
 ) -> tuple[SweepCase, ...]:
     offsets: list[tuple[float, float]] = [
         (0.0, 0.0),
@@ -149,14 +202,26 @@ def generate_adaptive_neighbors(
                 (-step_y_mm, -step_z_mm),
             )
         )
-    return tuple(
+    return _deduplicate_cases(
+        tuple(
         SweepCase(
             x_mm=float(x_mm),
             y_mm=float(center_y_mm + dy_mm),
             z_mm=float(center_z_mm + dz_mm),
         )
         for dy_mm, dz_mm in offsets
-    )
+        if _case_within_optional_bounds(
+            SweepCase(
+                x_mm=float(x_mm),
+                y_mm=float(center_y_mm + dy_mm),
+                z_mm=float(center_z_mm + dz_mm),
+            ),
+            min_y_mm=min_y_mm,
+            max_y_mm=max_y_mm,
+            min_z_mm=min_z_mm,
+            max_z_mm=max_z_mm,
+        )
+    ))
 
 
 def is_better(lhs: SweepResult, rhs: SweepResult) -> bool:
@@ -224,16 +289,31 @@ def run_grid_sweep(
     eval_config: EvalConfig,
     workers: int,
     prefix: str = "[sweep]",
+    min_y_mm: float | None = None,
+    max_y_mm: float | None = None,
+    min_z_mm: float | None = None,
+    max_z_mm: float | None = None,
 ) -> tuple[dict[tuple[float, float], SweepResult], tuple[float, ...], tuple[float, ...]]:
     y_series = tuple(float(value) for value in y_values)
     z_series = tuple(float(value) for value in z_values)
-    cases = build_cases(x_mm=float(x_mm), y_values=y_series, z_values=z_series)
+    cases = tuple(
+        case
+        for case in build_cases(x_mm=float(x_mm), y_values=y_series, z_values=z_series)
+        if _case_within_optional_bounds(
+            case,
+            min_y_mm=min_y_mm,
+            max_y_mm=max_y_mm,
+            min_z_mm=min_z_mm,
+            max_z_mm=max_z_mm,
+        )
+    )
     print(
         f"{prefix} mode=grid cases={len(cases)}, workers={workers}, "
         f"strategy={eval_config.strategy}, "
         f"window_repair={eval_config.run_window_repair}, "
         f"inserted_repair={eval_config.run_inserted_repair}, "
-        f"x={float(x_mm):.3f}, y={y_series}, z={z_series}"
+        f"x={float(x_mm):.3f}, y={y_series}, z={z_series}, "
+        f"bounds=(y:[{min_y_mm},{max_y_mm}], z:[{min_z_mm},{max_z_mm}])"
     )
     completed = evaluate_cases_parallel(
         cases=cases,
@@ -269,8 +349,28 @@ def run_adaptive_sweep(
         f"x={float(config.x_mm):.3f}, start=({center_y_mm:.3f},{center_z_mm:.3f}), "
         f"step=({step_y_mm:.3f},{step_z_mm:.3f}), "
         f"min_step=({min_step_y_mm:.3f},{min_step_z_mm:.3f}), "
-        f"max_iters={max_iters}, diagonal={config.include_diagonal}"
+        f"max_iters={max_iters}, diagonal={config.include_diagonal}, "
+        f"bounds=(y:[{config.min_y_mm},{config.max_y_mm}], z:[{config.min_z_mm},{config.max_z_mm}])"
     )
+
+    start_case = SweepCase(
+        x_mm=float(config.x_mm),
+        y_mm=center_y_mm,
+        z_mm=center_z_mm,
+    )
+    if not _case_within_optional_bounds(
+        start_case,
+        min_y_mm=config.min_y_mm,
+        max_y_mm=config.max_y_mm,
+        min_z_mm=config.min_z_mm,
+        max_z_mm=config.max_z_mm,
+    ):
+        raise ValueError(
+            "Adaptive sweep start origin is outside the configured hard bounds: "
+            f"start=({center_y_mm:.3f}, {center_z_mm:.3f}), "
+            f"bounds=(y:[{config.min_y_mm},{config.max_y_mm}], "
+            f"z:[{config.min_z_mm},{config.max_z_mm}])."
+        )
 
     all_results_by_key: dict[tuple[float, float], SweepResult] = {}
     adaptive_trace: list[dict[str, float | int | str | bool]] = []
@@ -284,6 +384,10 @@ def run_adaptive_sweep(
             step_y_mm=step_y_mm,
             step_z_mm=step_z_mm,
             include_diagonal=config.include_diagonal,
+            min_y_mm=config.min_y_mm,
+            max_y_mm=config.max_y_mm,
+            min_z_mm=config.min_z_mm,
+            max_z_mm=config.max_z_mm,
         )
         pending_cases = tuple(
             case for case in neighbors if case_key(case) not in all_results_by_key
@@ -378,6 +482,7 @@ def _evaluate_case(
         runtime_settings = build_app_runtime_settings(
             validation_centerline_csv=environment.validation_centerline_csv,
             tool_poses_frame2_csv=pose_csv_path,
+            append_start_as_terminal=environment.append_start_as_terminal,
             target_frame_origin_mm=(case.x_mm, case.y_mm, case.z_mm),
             target_frame_rotation_xyz_deg=environment.target_frame_rotation_xyz_deg,
             enable_custom_smoothing_and_pose_selection=environment.enable_custom_smoothing_and_pose_selection,

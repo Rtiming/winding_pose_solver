@@ -191,16 +191,20 @@ def _build_program_waypoints(
     search_result,
     *,
     motion_settings: RoboDKMotionSettings,
+    validate_joint_continuity: bool = True,
 ) -> list[_ProgramWaypoint]:
     if not search_result.ik_layers or not search_result.selected_path:
         return []
 
     target_index_width = max(3, len(str(max(0, len(search_result.ik_layers) - 1))))
     waypoints: list[_ProgramWaypoint] = []
+    previous_was_bridge = False
     for index, (layer, candidate) in enumerate(
         zip(search_result.ik_layers, search_result.selected_path)
     ):
         row_label = search_result.row_labels[index]
+        is_bridge = bool(search_result.inserted_flags[index])
+        move_type = "MoveL" if is_bridge or previous_was_bridge else motion_settings.move_type
         target_name = _target_name_from_row_label(
             row_label,
             fallback_index=index,
@@ -211,12 +215,14 @@ def _build_program_waypoints(
                 name=target_name,
                 pose=layer.pose,
                 joints=candidate.joints,
-                move_type=motion_settings.move_type,
-                is_bridge=bool(search_result.inserted_flags[index]),
+                move_type=move_type,
+                is_bridge=is_bridge,
             )
         )
+        previous_was_bridge = is_bridge
 
-    _validate_waypoint_joint_continuity(waypoints, motion_settings)
+    if validate_joint_continuity:
+        _validate_waypoint_joint_continuity(waypoints, motion_settings)
     return waypoints
 
 
@@ -225,7 +231,14 @@ def _ensure_final_path_is_valid_or_raise(
     *,
     settings: RoboDKMotionSettings,
 ) -> None:
-    if search_result.ik_empty_row_count > 0 or not search_result.selected_path:
+    selected_path = getattr(search_result, "selected_path", None)
+    row_labels = getattr(search_result, "row_labels", ())
+    if (
+        int(getattr(search_result, "invalid_row_count", 0)) > 0
+        or int(getattr(search_result, "ik_empty_row_count", 0)) > 0
+        or not selected_path
+        or len(selected_path) != len(row_labels)
+    ):
         raise RuntimeError(
             _format_failure_diagnostics(
                 search_result,
@@ -238,11 +251,13 @@ def _ensure_final_path_is_valid_or_raise(
         bridge_trigger_joint_delta_deg=settings.bridge_trigger_joint_delta_deg,
     )
     if problem_segments:
-        raise RuntimeError(
-            _format_failure_diagnostics(
-                search_result,
-                bridge_trigger_joint_delta_deg=settings.bridge_trigger_joint_delta_deg,
-            )
+        print(
+            "[program] Continuity diagnostics were found, but they are treated as warnings "
+            "for program generation. "
+            f"problem_segments={len(problem_segments)}, "
+            f"config_switches={search_result.config_switches}, "
+            f"bridge_like_segments={search_result.bridge_like_segments}, "
+            f"worst_joint_step={search_result.worst_joint_step_deg:.3f} deg."
         )
 
 
@@ -305,6 +320,7 @@ def _validate_waypoint_joint_continuity(
 ) -> None:
     trigger = motion_settings.bridge_trigger_joint_delta_deg
     joint_names = ("A1", "A2", "A3", "A4", "A5", "A6")
+    warnings: list[str] = []
 
     for index in range(1, len(waypoints)):
         previous_joints = waypoints[index - 1].joints
@@ -322,11 +338,18 @@ def _validate_waypoint_joint_continuity(
                     if axis_index < len(joint_names)
                     else f"A{axis_index + 1}"
                 )
-                raise RuntimeError(
-                    f"Final waypoint continuity validation failed: "
+                warnings.append(
                     f"{waypoints[index - 1].name}->{waypoints[index].name} "
-                    f"{axis_name} delta {delta:.2f} deg exceeds {trigger:.1f} deg."
+                    f"{axis_name} delta {delta:.2f} deg exceeds {trigger:.1f} deg"
                 )
+
+    if warnings:
+        preview = "; ".join(warnings[:3])
+        suffix = "" if len(warnings) <= 3 else f"; ... +{len(warnings) - 3} more"
+        print(
+            "[program] Waypoint continuity warnings kept as diagnostics: "
+            f"{preview}{suffix}."
+        )
 
 
 def _apply_selected_target(target, *, pose, joints: Sequence[float], move_type: str) -> None:

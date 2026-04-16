@@ -21,6 +21,7 @@ def solve_tool_poses(
     output_csv_path: str | Path,
     *,
     build_options: FrameBuildOptions,
+    append_start_as_terminal: bool = False,
     target_frame_origin_mm: tuple[float, float, float] | np.ndarray,
     target_frame_rotation_xyz_deg: tuple[float, float, float] | np.ndarray,
     verify_solution: bool,
@@ -33,6 +34,7 @@ def solve_tool_poses(
         input_csv_path,
         require_boundaries=False,
         build_options=build_options,
+        append_start_as_terminal=append_start_as_terminal,
     )
     print(format_issue_report(dataset.records))
 

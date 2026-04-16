@@ -82,6 +82,7 @@ def load_centerline_dataset(
     *,
     require_boundaries: bool,
     build_options: FrameBuildOptions,
+    append_start_as_terminal: bool = False,
 ) -> CenterlineDataset:
     """读取中心线 CSV，并构建每一行的局部坐标系记录。"""
     csv_path = Path(csv_path)
@@ -101,6 +102,10 @@ def load_centerline_dataset(
         )
 
     records = build_frame_records(frame, build_options=build_options)
+    if append_start_as_terminal and records:
+        terminal_row_id = _next_synthetic_row_id(records)
+        records.append(_clone_record_as_terminal(records[0], row_id=terminal_row_id))
+        frame = _append_frame_start_as_terminal(frame, row_id=terminal_row_id)
     return CenterlineDataset(csv_path=csv_path, frame=frame, records=records)
 
 
@@ -284,6 +289,45 @@ def default_verification_row_ids(records: list[FrameRecord]) -> list[int]:
             selected_positions.append(position)
 
     return [valid_records[position].row_id for position in selected_positions]
+
+
+def _next_synthetic_row_id(records: list[FrameRecord]) -> int:
+    existing_row_ids = {int(record.row_id) for record in records}
+    candidate = max(existing_row_ids, default=-1) + 1
+    while candidate in existing_row_ids:
+        candidate += 1
+    return candidate
+
+
+def _clone_record_as_terminal(record: FrameRecord, *, row_id: int) -> FrameRecord:
+    return FrameRecord(
+        source_row=record.source_row,
+        row_id=int(row_id),
+        center=np.array(record.center, dtype=float).copy(),
+        raw_tangent=np.array(record.raw_tangent, dtype=float).copy(),
+        raw_normal=np.array(record.raw_normal, dtype=float).copy(),
+        raw_side=None
+        if record.raw_side is None
+        else np.array(record.raw_side, dtype=float).copy(),
+        tangent=None if record.tangent is None else np.array(record.tangent, dtype=float).copy(),
+        normal=None if record.normal is None else np.array(record.normal, dtype=float).copy(),
+        side=None if record.side is None else np.array(record.side, dtype=float).copy(),
+        transform_tool_proc=None
+        if record.transform_tool_proc is None
+        else np.array(record.transform_tool_proc, dtype=float).copy(),
+        valid=bool(record.valid),
+        issues=list(record.issues),
+    )
+
+
+def _append_frame_start_as_terminal(frame: pd.DataFrame, *, row_id: int) -> pd.DataFrame:
+    if frame.empty:
+        return frame
+
+    terminal_row = frame.iloc[[0]].copy()
+    if "index" in terminal_row.columns:
+        terminal_row.loc[:, "index"] = int(row_id)
+    return pd.concat([frame, terminal_row], ignore_index=True)
 
 
 def _align_with_previous(

@@ -155,11 +155,21 @@ def _optimize_joint_path(
     move_type: str,
     start_joints: tuple[float, ...],
     optimizer_settings: _PathOptimizerSettings,
+    require_terminal_match_start: bool = False,
 ) -> tuple[list[_IKCandidate], float]:
     """使用动态规划在整条路径上选出一条全局代价最小的关节序列。"""
 
     if not ik_layers:
         return [], 0.0
+
+    if require_terminal_match_start and len(ik_layers) > 1:
+        return _optimize_closed_joint_path(
+            ik_layers,
+            robot=robot,
+            move_type=move_type,
+            start_joints=start_joints,
+            optimizer_settings=optimizer_settings,
+        )
 
     corridor_scores = _compute_candidate_corridor_scores(ik_layers, optimizer_settings)
     guided_config_path = _build_guided_config_path(
@@ -304,6 +314,97 @@ def _optimize_joint_path(
 
     selected_path.reverse()
     return selected_path, total_cost
+
+
+def _optimize_closed_joint_path(
+    ik_layers: Sequence[_IKLayer],
+    *,
+    robot,
+    move_type: str,
+    start_joints: tuple[float, ...],
+    optimizer_settings: _PathOptimizerSettings,
+) -> tuple[list[_IKCandidate], float]:
+    best_path: list[_IKCandidate] | None = None
+    best_cost = math.inf
+
+    for start_candidate in ik_layers[0].candidates:
+        terminal_candidates = tuple(
+            candidate
+            for candidate in ik_layers[-1].candidates
+            if _candidates_have_matching_joints(start_candidate, candidate)
+        )
+        if not terminal_candidates:
+            continue
+
+        constrained_layers = (
+            _IKLayer(pose=ik_layers[0].pose, candidates=(start_candidate,)),
+            *ik_layers[1:-1],
+            _IKLayer(pose=ik_layers[-1].pose, candidates=terminal_candidates),
+        )
+        try:
+            candidate_path, candidate_cost = _optimize_joint_path(
+                constrained_layers,
+                robot=robot,
+                move_type=move_type,
+                start_joints=start_joints,
+                optimizer_settings=optimizer_settings,
+                require_terminal_match_start=False,
+            )
+        except RuntimeError:
+            continue
+
+        if candidate_cost < best_cost:
+            best_path = candidate_path
+            best_cost = candidate_cost
+
+    if best_path is None:
+        raise RuntimeError(
+            "No globally feasible closed joint sequence could be found with matching "
+            "start and terminal joints."
+        )
+    return best_path, best_cost
+
+
+def _candidates_have_matching_joints(
+    first_candidate: _IKCandidate,
+    second_candidate: _IKCandidate,
+    *,
+    tolerance_deg: float = 1e-6,
+) -> bool:
+    if first_candidate.config_flags != second_candidate.config_flags:
+        return False
+    if len(first_candidate.joints) != len(second_candidate.joints):
+        return False
+    for joint_index, (first_joint, second_joint) in enumerate(
+        zip(first_candidate.joints, second_candidate.joints)
+    ):
+        if joint_index == 5 and _joint6_terminal_values_match(
+            float(first_joint),
+            float(second_joint),
+            tolerance_deg=tolerance_deg,
+        ):
+            continue
+        if abs(float(first_joint) - float(second_joint)) > tolerance_deg:
+            return False
+    return True
+
+
+def _joint6_terminal_values_match(
+    first_joint_deg: float,
+    second_joint_deg: float,
+    *,
+    tolerance_deg: float,
+) -> bool:
+    """Treat A6 start/end values separated by full turns as equivalent.
+
+    This is only used for the synthetic closed-path terminal row, where the
+    target pose is a copy of the start pose.  Intermediate path continuity still
+    uses the real signed joint values.
+    """
+
+    delta = float(second_joint_deg) - float(first_joint_deg)
+    nearest_full_turn = round(delta / 360.0)
+    return abs(delta - 360.0 * nearest_full_turn) <= tolerance_deg
 
 
 def _build_guided_config_path(

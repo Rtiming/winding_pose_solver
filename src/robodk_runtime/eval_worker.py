@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import atexit
+import multiprocessing
+import os
 import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Sequence
 
 import numpy as np
 
@@ -62,8 +66,22 @@ class LiveStationContext:
     frame_name: str
 
 
+@dataclass(frozen=True)
+class PreparedEvaluationResources:
+    settings: RoboDKMotionSettings
+    optimizer_settings: Any
+    a1_lower_deg: float
+    a1_upper_deg: float
+    start_joints: tuple[float, ...]
+    robot_interface: Any
+    seed_joints: tuple[tuple[float, ...], ...]
+
+
 _PROFILE_HOOKS_INSTALLED = False
 _SIX_AXIS_IK_CALIBRATION_CHECK_DONE = False
+_OFFLINE_BATCH_EXECUTOR: ProcessPoolExecutor | None = None
+_OFFLINE_BATCH_EXECUTOR_WORKERS: int | None = None
+_OFFLINE_BATCH_WORKER_CONTEXTS: dict[tuple[str, str], LiveStationContext] = {}
 
 
 def _wrap_profiled(section_name: str, function: Callable[..., Any]) -> Callable[..., Any]:
@@ -119,7 +137,22 @@ def open_live_station_context(
     frame_name: str,
 ) -> LiveStationContext:
     api = _import_robodk_api()
-    rdk = api["Robolink"]()
+    existing_only = os.getenv("WPS_ROBODK_EXISTING_ONLY", "1").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+    }
+    if existing_only:
+        rdk = api["Robolink"](robodk_path="")
+        if rdk.Connect() < 1:
+            raise RuntimeError(
+                "Unable to connect to an already-running RoboDK instance. "
+                "Open the RoboDK project/station first, make sure the API server is enabled, "
+                "or set WPS_ROBODK_EXISTING_ONLY=0 if you intentionally want this script to "
+                "launch RoboDK."
+            )
+    else:
+        rdk = api["Robolink"]()
     robot = _require_item(rdk, robot_name, api["ITEM_TYPE_ROBOT"], "Robot")
     frame = _require_item(rdk, frame_name, api["ITEM_TYPE_FRAME"], "Reference frame")
 
@@ -201,11 +234,226 @@ def _prepare_start_joints(
     return tuple(float(value) for value in request.start_joints[: context.joint_count])
 
 
+def _prepare_evaluation_resources(
+    request: ProfileEvaluationRequest,
+    context: LiveStationContext,
+) -> PreparedEvaluationResources:
+    settings = build_motion_settings_from_dict(request.motion_settings)
+    optimizer_settings = path_optimizer_module._build_optimizer_settings(
+        context.joint_count,
+        settings,
+    )
+    a1_lower_deg, a1_upper_deg = _normalize_angle_range(
+        settings.a1_min_deg,
+        settings.a1_max_deg,
+    )
+    start_joints = _prepare_start_joints(request, context)
+
+    robot_interface = build_robot_interface(
+        ik_backend=getattr(settings, "ik_backend", "robodk"),
+        robodk_robot=context.robot,
+    )
+    if getattr(settings, "ik_backend", "robodk") == "six_axis_ik" and context.rdk is not None:
+        _report_six_axis_ik_calibration_status(context)
+
+    if getattr(robot_interface, "ik_seed_invariant", False):
+        seed_joints: tuple[tuple[float, ...], ...] = ()
+    else:
+        seed_joints = ik_collection_module._build_seed_joint_strategies(
+            robot=robot_interface,
+            lower_limits=context.lower_limits,
+            upper_limits=context.upper_limits,
+            joint_count=context.joint_count,
+        )
+
+    return PreparedEvaluationResources(
+        settings=settings,
+        optimizer_settings=optimizer_settings,
+        a1_lower_deg=a1_lower_deg,
+        a1_upper_deg=a1_upper_deg,
+        start_joints=start_joints,
+        robot_interface=robot_interface,
+        seed_joints=seed_joints,
+    )
+
+
+def _profile_changed_row_indices(
+    baseline_profile: Sequence[tuple[float, float]],
+    candidate_profile: Sequence[tuple[float, float]],
+) -> tuple[int, ...]:
+    if len(baseline_profile) != len(candidate_profile):
+        return tuple(range(len(candidate_profile)))
+
+    changed_indices: list[int] = []
+    for row_index, (baseline_offset, candidate_offset) in enumerate(
+        zip(baseline_profile, candidate_profile)
+    ):
+        if (
+            abs(float(baseline_offset[0]) - float(candidate_offset[0])) > 1e-9
+            or abs(float(baseline_offset[1]) - float(candidate_offset[1])) > 1e-9
+        ):
+            changed_indices.append(row_index)
+    return tuple(changed_indices)
+
+
+def _request_profile_cache_key(
+    request: ProfileEvaluationRequest,
+) -> tuple[tuple[float, float], ...]:
+    return tuple(
+        (round(float(dy_mm), 6), round(float(dz_mm), 6))
+        for dy_mm, dz_mm in request.frame_a_origin_yz_profile_mm
+    )
+
+
+def _evaluate_exact_profile_search(
+    request: ProfileEvaluationRequest,
+    context: LiveStationContext,
+    resources: PreparedEvaluationResources,
+    *,
+    reused_search_result=None,
+):
+    recompute_row_indices = None
+    reused_ik_layers = None
+    if reused_search_result is not None:
+        recompute_row_indices = _profile_changed_row_indices(
+            reused_search_result.frame_a_origin_yz_profile_mm,
+            request.frame_a_origin_yz_profile_mm,
+        )
+        reused_ik_layers = reused_search_result.ik_layers
+
+    return global_search_module._evaluate_frame_a_origin_profile(
+        request.reference_pose_rows,
+        frame_a_origin_yz_profile_mm=request.frame_a_origin_yz_profile_mm,
+        row_labels=request.row_labels,
+        inserted_flags=request.inserted_flags,
+        robot=resources.robot_interface,
+        mat_type=context.mat_type,
+        move_type=resources.settings.move_type,
+        start_joints=resources.start_joints,
+        tool_pose=context.tool_pose,
+        reference_pose=context.reference_pose,
+        joint_count=context.joint_count,
+        optimizer_settings=resources.optimizer_settings,
+        a1_lower_deg=resources.a1_lower_deg,
+        a1_upper_deg=resources.a1_upper_deg,
+        a2_max_deg=resources.settings.a2_max_deg,
+        joint_constraint_tolerance_deg=resources.settings.joint_constraint_tolerance_deg,
+        seed_joints=resources.seed_joints,
+        lower_limits=context.lower_limits,
+        upper_limits=context.upper_limits,
+        bridge_trigger_joint_delta_deg=resources.settings.bridge_trigger_joint_delta_deg,
+        reused_ik_layers=reused_ik_layers,
+        recompute_row_indices=recompute_row_indices,
+    )
+
+
+def _apply_optional_repairs(
+    request: ProfileEvaluationRequest,
+    context: LiveStationContext,
+    resources: PreparedEvaluationResources,
+    search_result,
+):
+    updated_result = search_result
+    if request.run_window_repair:
+        updated_result = local_repair_module._refine_path_with_frame_a_origin_profile(
+            updated_result,
+            robot=resources.robot_interface,
+            mat_type=context.mat_type,
+            move_type=resources.settings.move_type,
+            start_joints=resources.start_joints,
+            tool_pose=context.tool_pose,
+            reference_pose=context.reference_pose,
+            joint_count=context.joint_count,
+            motion_settings=resources.settings,
+            optimizer_settings=resources.optimizer_settings,
+            lower_limits=context.lower_limits,
+            upper_limits=context.upper_limits,
+            a1_lower_deg=resources.a1_lower_deg,
+            a1_upper_deg=resources.a1_upper_deg,
+            a2_max_deg=resources.settings.a2_max_deg,
+            joint_constraint_tolerance_deg=resources.settings.joint_constraint_tolerance_deg,
+        )
+
+    if request.run_inserted_repair:
+        inserted_result = local_repair_module._attempt_inserted_transition_repair(
+            updated_result,
+            robot=resources.robot_interface,
+            mat_type=context.mat_type,
+            move_type=resources.settings.move_type,
+            start_joints=resources.start_joints,
+            tool_pose=context.tool_pose,
+            reference_pose=context.reference_pose,
+            joint_count=context.joint_count,
+            motion_settings=resources.settings,
+            optimizer_settings=resources.optimizer_settings,
+            lower_limits=context.lower_limits,
+            upper_limits=context.upper_limits,
+            a1_lower_deg=resources.a1_lower_deg,
+            a1_upper_deg=resources.a1_upper_deg,
+            a2_max_deg=resources.settings.a2_max_deg,
+            joint_constraint_tolerance_deg=resources.settings.joint_constraint_tolerance_deg,
+        )
+        if inserted_result is not None:
+            updated_result = inserted_result
+    return updated_result
+
+
+def _finalize_request_result(
+    request: ProfileEvaluationRequest,
+    context: LiveStationContext,
+    resources: PreparedEvaluationResources,
+    search_result,
+    *,
+    elapsed_seconds: float,
+) -> ProfileEvaluationResult:
+    validation_message = None
+    extra_metadata: dict[str, Any] = {
+        "ik_candidate_cache": ik_collection_module.ik_candidate_collection_cache_stats(),
+    }
+    force_debug_program = bool(request.metadata.get("force_debug_program_generation"))
+    try:
+        _ensure_final_path_is_valid_or_raise(search_result, settings=resources.settings)
+        if request.create_program:
+            extra_metadata["program_name"] = materialize_program(
+                context,
+                request,
+                search_result,
+                resources.settings,
+            )
+    except RuntimeError as exc:
+        validation_message = str(exc)
+        if force_debug_program and request.create_program and context.rdk is not None:
+            debug_program_name = materialize_program(
+                context,
+                request,
+                search_result,
+                resources.settings,
+                skip_waypoint_validation=True,
+            )
+            extra_metadata["program_name"] = debug_program_name
+            extra_metadata["debug_program_name"] = debug_program_name
+            extra_metadata["debug_program_generation_forced"] = True
+            extra_metadata["debug_program_warning"] = (
+                "Program was generated even though strict path validation failed."
+            )
+
+    return _search_result_to_profile_result(
+        request=request,
+        search_result=search_result,
+        settings=resources.settings,
+        elapsed_seconds=elapsed_seconds,
+        diagnostics=validation_message,
+        metadata=extra_metadata,
+    )
+
+
 def materialize_program(
     context: LiveStationContext,
     request: ProfileEvaluationRequest,
     search_result,
     settings: RoboDKMotionSettings,
+    *,
+    skip_waypoint_validation: bool = False,
 ) -> str:
     program_name = request.program_name or f"Validation_{request.request_id}"
     if request.optimized_csv_path:
@@ -224,7 +472,11 @@ def materialize_program(
         program.setPoseTool(context.robot.PoseTool())
     _apply_motion_settings(program, settings)
 
-    for waypoint in _build_program_waypoints(search_result, motion_settings=settings):
+    for waypoint in _build_program_waypoints(
+        search_result,
+        motion_settings=settings,
+        validate_joint_continuity=not skip_waypoint_validation,
+    ):
         existing_target = context.rdk.Item(waypoint.name, context.api["ITEM_TYPE_TARGET"])
         if existing_target.Valid():
             existing_target.Delete()
@@ -335,135 +587,50 @@ def evaluate_request(
     reset_runtime_profile()
     ik_collection_module.reset_ik_candidate_collection_cache()
     start_time = time.perf_counter()
+    resources = _prepare_evaluation_resources(request, context)
 
-    settings = build_motion_settings_from_dict(request.motion_settings)
-    optimizer_settings = path_optimizer_module._build_optimizer_settings(context.joint_count, settings)
-    a1_lower_deg, a1_upper_deg = _normalize_angle_range(settings.a1_min_deg, settings.a1_max_deg)
-    start_joints = _prepare_start_joints(request, context)
-
-    context.robot.setJoints(list(start_joints or context.original_joints))
-
-    # 构造 IK 后端接口（RoboDK 或 SixAxisIK）
-    robot_interface = build_robot_interface(
-        ik_backend=getattr(settings, "ik_backend", "robodk"),
-        robodk_robot=context.robot,
-    )
-    if getattr(settings, "ik_backend", "robodk") == "six_axis_ik" and context.rdk is not None:
-        _report_six_axis_ik_calibration_status(context)
+    context.robot.setJoints(list(resources.start_joints or context.original_joints))
 
     if request.strategy == "full_search":
         search_result = global_search_module._search_best_exact_pose_path(
             request.reference_pose_rows,
-            robot=robot_interface,
+            robot=resources.robot_interface,
             mat_type=context.mat_type,
-            move_type=settings.move_type,
-            start_joints=start_joints,
+            move_type=resources.settings.move_type,
+            start_joints=resources.start_joints,
             tool_pose=context.tool_pose,
             reference_pose=context.reference_pose,
             joint_count=context.joint_count,
-            motion_settings=settings,
-            optimizer_settings=optimizer_settings,
-            a1_lower_deg=a1_lower_deg,
-            a1_upper_deg=a1_upper_deg,
-            a2_max_deg=settings.a2_max_deg,
-            joint_constraint_tolerance_deg=settings.joint_constraint_tolerance_deg,
+            motion_settings=resources.settings,
+            optimizer_settings=resources.optimizer_settings,
+            a1_lower_deg=resources.a1_lower_deg,
+            a1_upper_deg=resources.a1_upper_deg,
+            a2_max_deg=resources.settings.a2_max_deg,
+            joint_constraint_tolerance_deg=resources.settings.joint_constraint_tolerance_deg,
         )
     elif request.strategy == "exact_profile":
-        if getattr(robot_interface, "ik_seed_invariant", False):
-            seed_joints = ()
-        else:
-            seed_joints = ik_collection_module._build_seed_joint_strategies(
-                robot=robot_interface,
-                lower_limits=context.lower_limits,
-                upper_limits=context.upper_limits,
-                joint_count=context.joint_count,
-            )
-        search_result = global_search_module._evaluate_frame_a_origin_profile(
-            request.reference_pose_rows,
-            frame_a_origin_yz_profile_mm=request.frame_a_origin_yz_profile_mm,
-            row_labels=request.row_labels,
-            inserted_flags=request.inserted_flags,
-            robot=robot_interface,
-            mat_type=context.mat_type,
-            move_type=settings.move_type,
-            start_joints=start_joints,
-            tool_pose=context.tool_pose,
-            reference_pose=context.reference_pose,
-            joint_count=context.joint_count,
-            optimizer_settings=optimizer_settings,
-            a1_lower_deg=a1_lower_deg,
-            a1_upper_deg=a1_upper_deg,
-            a2_max_deg=settings.a2_max_deg,
-            joint_constraint_tolerance_deg=settings.joint_constraint_tolerance_deg,
-            seed_joints=seed_joints,
-            lower_limits=context.lower_limits,
-            upper_limits=context.upper_limits,
-            bridge_trigger_joint_delta_deg=settings.bridge_trigger_joint_delta_deg,
+        search_result = _evaluate_exact_profile_search(
+            request,
+            context,
+            resources,
         )
     else:
         raise ValueError(f"Unsupported evaluation strategy: {request.strategy}")
 
-    if request.run_window_repair:
-        search_result = local_repair_module._refine_path_with_frame_a_origin_profile(
-            search_result,
-            robot=robot_interface,
-            mat_type=context.mat_type,
-            move_type=settings.move_type,
-            start_joints=start_joints,
-            tool_pose=context.tool_pose,
-            reference_pose=context.reference_pose,
-            joint_count=context.joint_count,
-            motion_settings=settings,
-            optimizer_settings=optimizer_settings,
-            lower_limits=context.lower_limits,
-            upper_limits=context.upper_limits,
-            a1_lower_deg=a1_lower_deg,
-            a1_upper_deg=a1_upper_deg,
-            a2_max_deg=settings.a2_max_deg,
-            joint_constraint_tolerance_deg=settings.joint_constraint_tolerance_deg,
-        )
-
-    if request.run_inserted_repair:
-        inserted_result = local_repair_module._attempt_inserted_transition_repair(
-            search_result,
-            robot=robot_interface,
-            mat_type=context.mat_type,
-            move_type=settings.move_type,
-            start_joints=start_joints,
-            tool_pose=context.tool_pose,
-            reference_pose=context.reference_pose,
-            joint_count=context.joint_count,
-            motion_settings=settings,
-            optimizer_settings=optimizer_settings,
-            lower_limits=context.lower_limits,
-            upper_limits=context.upper_limits,
-            a1_lower_deg=a1_lower_deg,
-            a1_upper_deg=a1_upper_deg,
-            a2_max_deg=settings.a2_max_deg,
-            joint_constraint_tolerance_deg=settings.joint_constraint_tolerance_deg,
-        )
-        if inserted_result is not None:
-            search_result = inserted_result
-
-    validation_message = None
-    extra_metadata: dict[str, Any] = {
-        "ik_candidate_cache": ik_collection_module.ik_candidate_collection_cache_stats(),
-    }
-    try:
-        _ensure_final_path_is_valid_or_raise(search_result, settings=settings)
-        if request.create_program:
-            extra_metadata["program_name"] = materialize_program(context, request, search_result, settings)
-    except RuntimeError as exc:
-        validation_message = str(exc)
+    search_result = _apply_optional_repairs(
+        request,
+        context,
+        resources,
+        search_result,
+    )
 
     elapsed_seconds = time.perf_counter() - start_time
-    result = _search_result_to_profile_result(
+    result = _finalize_request_result(
         request=request,
+        context=context,
+        resources=resources,
         search_result=search_result,
-        settings=settings,
         elapsed_seconds=elapsed_seconds,
-        diagnostics=validation_message,
-        metadata=extra_metadata,
     )
     print(
         f"[{request.request_id}] status={result.status}, "
@@ -474,6 +641,31 @@ def evaluate_request(
         f"time={result.timing_seconds:.3f}s"
     )
     return result, search_result
+
+
+def evaluate_single_request(
+    request: ProfileEvaluationRequest,
+) -> tuple[ProfileEvaluationResult, Any]:
+    if request.motion_settings.get("ik_backend") == "six_axis_ik" and not request.create_program:
+        context = open_offline_ik_station_context(
+            robot_name=request.robot_name,
+            frame_name=request.frame_name,
+        )
+        return evaluate_request(request, context)
+
+    context = open_live_station_context(
+        robot_name=request.robot_name,
+        frame_name=request.frame_name,
+    )
+    if context.rdk is not None:
+        context.rdk.Render(False)
+    try:
+        return evaluate_request(request, context)
+    finally:
+        if context.rdk is not None:
+            context.rdk.Render(True)
+        if context.original_joints:
+            context.robot.setJoints(list(context.original_joints))
 
 
 def _load_batch_request(path: str | Path) -> EvaluationBatchRequest:
@@ -552,6 +744,206 @@ def open_offline_ik_station_context(
     )
 
 
+def _resolve_offline_batch_workers(request_count: int) -> int:
+    configured_value = os.getenv("WPS_OFFLINE_BATCH_WORKERS")
+    if configured_value is not None:
+        try:
+            parsed_value = int(configured_value)
+        except ValueError:
+            parsed_value = 0
+        if parsed_value > 0:
+            return max(1, min(request_count, parsed_value))
+
+    cpu_count = os.cpu_count() or 1
+    return max(1, min(request_count, 4, max(1, cpu_count // 2)))
+
+
+def _can_run_offline_parallel(batch_request: EvaluationBatchRequest) -> bool:
+    if not _can_run_offline(batch_request):
+        return False
+    if len(batch_request.evaluations) <= 1:
+        return False
+    main_file = getattr(__import__("__main__"), "__file__", None)
+    if not main_file or not Path(str(main_file)).exists():
+        return False
+
+    for request in batch_request.evaluations:
+        # Avoid nested process pools on shared machines. When a batch fans out
+        # across processes, keep each request itself single-process.
+        if int(request.motion_settings.get("local_parallel_workers", 1)) != 1:
+            return False
+    return True
+
+
+def _get_offline_batch_executor(worker_count: int) -> ProcessPoolExecutor:
+    global _OFFLINE_BATCH_EXECUTOR, _OFFLINE_BATCH_EXECUTOR_WORKERS
+    if (
+        _OFFLINE_BATCH_EXECUTOR is None
+        or _OFFLINE_BATCH_EXECUTOR_WORKERS != worker_count
+    ):
+        shutdown_offline_batch_executor()
+        _OFFLINE_BATCH_EXECUTOR = ProcessPoolExecutor(
+            max_workers=worker_count,
+            mp_context=multiprocessing.get_context("spawn"),
+        )
+        _OFFLINE_BATCH_EXECUTOR_WORKERS = worker_count
+    return _OFFLINE_BATCH_EXECUTOR
+
+
+def shutdown_offline_batch_executor() -> None:
+    global _OFFLINE_BATCH_EXECUTOR, _OFFLINE_BATCH_EXECUTOR_WORKERS
+    if _OFFLINE_BATCH_EXECUTOR is not None:
+        _OFFLINE_BATCH_EXECUTOR.shutdown(wait=True, cancel_futures=False)
+        _OFFLINE_BATCH_EXECUTOR = None
+        _OFFLINE_BATCH_EXECUTOR_WORKERS = None
+
+
+def _get_cached_offline_batch_worker_context(
+    *,
+    robot_name: str,
+    frame_name: str,
+) -> LiveStationContext:
+    cache_key = (str(robot_name), str(frame_name))
+    cached_context = _OFFLINE_BATCH_WORKER_CONTEXTS.get(cache_key)
+    if cached_context is not None:
+        return cached_context
+    context = open_offline_ik_station_context(
+        robot_name=robot_name,
+        frame_name=frame_name,
+    )
+    _OFFLINE_BATCH_WORKER_CONTEXTS[cache_key] = context
+    return context
+
+
+def _evaluate_request_offline_parallel_worker(
+    request_payload: dict[str, Any],
+) -> dict[str, Any]:
+    request = ProfileEvaluationRequest.from_dict(request_payload)
+    context = _get_cached_offline_batch_worker_context(
+        robot_name=request.robot_name,
+        frame_name=request.frame_name,
+    )
+    result, _search = evaluate_request(request, context)
+    return result.to_dict()
+
+
+def _evaluate_batch_request_offline_parallel(
+    batch_request: EvaluationBatchRequest,
+) -> EvaluationBatchResult:
+    worker_count = _resolve_offline_batch_workers(len(batch_request.evaluations))
+    if worker_count <= 1:
+        first_request = batch_request.evaluations[0]
+        context = open_offline_ik_station_context(
+            robot_name=first_request.robot_name,
+            frame_name=first_request.frame_name,
+        )
+        results = tuple(
+            evaluate_request(request, context)[0]
+            for request in batch_request.evaluations
+        )
+        return EvaluationBatchResult(results=results)
+
+    executor = _get_offline_batch_executor(worker_count)
+    futures: dict[object, int] = {}
+    ordered_results: list[ProfileEvaluationResult | None] = [
+        None for _ in batch_request.evaluations
+    ]
+    for request_index, request in enumerate(batch_request.evaluations):
+        future = executor.submit(
+            _evaluate_request_offline_parallel_worker,
+            request.to_dict(),
+        )
+        futures[future] = request_index
+
+    for future in as_completed(futures):
+        request_index = futures[future]
+        ordered_results[request_index] = ProfileEvaluationResult.from_dict(future.result())
+
+    return EvaluationBatchResult(
+        results=tuple(result for result in ordered_results if result is not None)
+    )
+
+
+def _can_use_shared_exact_profile_batch(
+    batch_request: EvaluationBatchRequest,
+) -> bool:
+    if not _can_run_offline(batch_request):
+        return False
+    if not batch_request.evaluations:
+        return False
+
+    first_request = batch_request.evaluations[0]
+    first_reference_rows = tuple(first_request.reference_pose_rows)
+    first_row_labels = tuple(first_request.row_labels)
+    first_inserted_flags = tuple(first_request.inserted_flags)
+    first_motion_settings = dict(first_request.motion_settings)
+
+    return all(
+        request.strategy == "exact_profile"
+        and not request.create_program
+        and tuple(request.reference_pose_rows) == first_reference_rows
+        and tuple(request.row_labels) == first_row_labels
+        and tuple(request.inserted_flags) == first_inserted_flags
+        and dict(request.motion_settings) == first_motion_settings
+        for request in batch_request.evaluations
+    )
+
+
+def _evaluate_shared_exact_profile_batch(
+    batch_request: EvaluationBatchRequest,
+) -> EvaluationBatchResult:
+    first_request = batch_request.evaluations[0]
+    context = open_offline_ik_station_context(
+        robot_name=first_request.robot_name,
+        frame_name=first_request.frame_name,
+    )
+    resources = _prepare_evaluation_resources(first_request, context)
+    install_runtime_profile_hooks()
+    ik_collection_module.reset_ik_candidate_collection_cache()
+
+    ordered_results: list[ProfileEvaluationResult] = []
+    result_cache: dict[tuple[tuple[float, float], ...], ProfileEvaluationResult] = {}
+    search_cache: dict[tuple[tuple[float, float], ...], Any] = {}
+    reuse_search_result = None
+
+    for request in batch_request.evaluations:
+        profile_key = _request_profile_cache_key(request)
+        cached_result = result_cache.get(profile_key)
+        cached_search_result = search_cache.get(profile_key)
+        if cached_result is not None and cached_search_result is not None:
+            ordered_results.append(cached_result)
+            reuse_search_result = cached_search_result
+            continue
+
+        reset_runtime_profile()
+        started = time.perf_counter()
+        search_result = _evaluate_exact_profile_search(
+            request,
+            context,
+            resources,
+            reused_search_result=reuse_search_result,
+        )
+        search_result = _apply_optional_repairs(
+            request,
+            context,
+            resources,
+            search_result,
+        )
+        result = _finalize_request_result(
+            request=request,
+            context=context,
+            resources=resources,
+            search_result=search_result,
+            elapsed_seconds=time.perf_counter() - started,
+        )
+        result_cache[profile_key] = result
+        search_cache[profile_key] = search_result
+        ordered_results.append(result)
+        reuse_search_result = search_result
+
+    return EvaluationBatchResult(results=tuple(ordered_results))
+
+
 def evaluate_batch_request(
     batch_request: EvaluationBatchRequest,
 ) -> EvaluationBatchResult:
@@ -559,6 +951,15 @@ def evaluate_batch_request(
         raise ValueError("No evaluation requests found.")
 
     first_request = batch_request.evaluations[0]
+
+    if _can_use_shared_exact_profile_batch(batch_request):
+        return _evaluate_shared_exact_profile_batch(batch_request)
+
+    if _can_run_offline_parallel(batch_request):
+        try:
+            return _evaluate_batch_request_offline_parallel(batch_request)
+        except Exception:
+            shutdown_offline_batch_executor()
 
     if _can_run_offline(batch_request):
         context = open_offline_ik_station_context(
@@ -581,6 +982,9 @@ def evaluate_batch_request(
             context.robot.setJoints(list(context.original_joints))
 
     return EvaluationBatchResult(results=results)
+
+
+atexit.register(shutdown_offline_batch_executor)
 
 
 def evaluate_batch_file(request_path: str | Path, result_path: str | Path) -> Path:

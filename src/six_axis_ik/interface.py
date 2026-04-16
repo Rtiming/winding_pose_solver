@@ -151,6 +151,8 @@ class SixAxisIKSolver:
         self.pose_position_tolerance_mm = float(pose_position_tolerance_mm)
         self.pose_orientation_tolerance_deg = float(pose_orientation_tolerance_deg)
         self.periodic_dedup_tolerance_deg = float(periodic_dedup_tolerance_deg)
+        self._cached_effective_model_key: tuple[object, ...] | None = None
+        self._cached_effective_model: RobotModel | None = None
 
     @classmethod
     def from_config(
@@ -170,6 +172,22 @@ class SixAxisIKSolver:
         robot_upper_limits_deg: Sequence[float] | None,
     ) -> RobotModel:
         """按本次调用上下文生成实际使用的机器人模型。"""
+        cache_key = (
+            id(tool_pose) if tool_pose is not None else None,
+            id(reference_pose) if reference_pose is not None else None,
+            None
+            if robot_lower_limits_deg is None
+            else tuple(float(value) for value in robot_lower_limits_deg),
+            None
+            if robot_upper_limits_deg is None
+            else tuple(float(value) for value in robot_upper_limits_deg),
+        )
+        if (
+            self._cached_effective_model is not None
+            and cache_key == self._cached_effective_model_key
+        ):
+            return self._cached_effective_model
+
         effective_model = self.robot_model
 
         if tool_pose is not None:
@@ -201,6 +219,8 @@ class SixAxisIKSolver:
                 joint_max_deg=upper,
             )
 
+        self._cached_effective_model_key = cache_key
+        self._cached_effective_model = effective_model
         return effective_model
 
     def _target_pose_in_frame(

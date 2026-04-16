@@ -23,6 +23,7 @@ class AppRuntimeSettings:
     program_name: str
     frame_build_options: FrameBuildOptions
     motion_settings: RoboDKMotionSettings
+    append_start_as_terminal: bool
     enable_solver_verification: bool
     verification_row_ids: tuple[int, ...] | None
     verification_tolerance: float
@@ -40,6 +41,7 @@ def run_visualization(settings: AppRuntimeSettings) -> None:
     plot_centerline_frames(
         settings.validation_centerline_csv,
         build_options=settings.frame_build_options,
+        append_start_as_terminal=settings.append_start_as_terminal,
         step=settings.visualization_step,
         vector_scale=settings.visualization_vector_scale,
         show_tangent=settings.show_tangent,
@@ -56,6 +58,7 @@ def run_pose_solver(settings: AppRuntimeSettings) -> None:
         settings.validation_centerline_csv,
         settings.tool_poses_frame2_csv,
         build_options=settings.frame_build_options,
+        append_start_as_terminal=settings.append_start_as_terminal,
         target_frame_origin_mm=settings.target_frame_origin_mm,
         target_frame_rotation_xyz_deg=settings.target_frame_rotation_xyz_deg,
         verify_solution=settings.enable_solver_verification,

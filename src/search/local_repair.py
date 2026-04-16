@@ -3399,72 +3399,141 @@ def _attempt_inserted_transition_repair(
 
     lower_limits_tuple = tuple(float(value) for value in lower_limits[:joint_count])
     upper_limits_tuple = tuple(float(value) for value in upper_limits[:joint_count])
-    problem_segments = _collect_problem_segments(
-        search_result.selected_path,
-        bridge_trigger_joint_delta_deg=motion_settings.bridge_trigger_joint_delta_deg,
+    current_result = search_result
+    accepted_any = False
+    attempted_repairs: set[tuple[str, str, int]] = set()
+    max_inserted_repair_passes = max(
+        1,
+        min(4, len(tuple(motion_settings.frame_a_origin_yz_insertion_counts)) + 2),
     )
-    if not problem_segments:
-        return search_result
 
-    best_clean_result: _PathSearchResult | None = None
-    for segment_index, _config_changed, _max_joint_delta, _mean_joint_delta in problem_segments[:3]:
-        for insertion_count in motion_settings.frame_a_origin_yz_insertion_counts:
-            (
-                augmented_reference_rows,
-                augmented_profile,
-                augmented_labels,
-                augmented_flags,
-            ) = _insert_interpolated_transition_rows(
-                search_result.reference_pose_rows,
-                search_result.frame_a_origin_yz_profile_mm,
-                search_result.row_labels,
-                search_result.inserted_flags,
-                segment_index=segment_index,
-                insertion_count=insertion_count,
-            )
-            candidate_result = _evaluate_frame_a_origin_profile(
-                augmented_reference_rows,
-                frame_a_origin_yz_profile_mm=augmented_profile,
-                row_labels=augmented_labels,
-                inserted_flags=augmented_flags,
-                robot=robot,
-                mat_type=mat_type,
-                move_type=move_type,
-                start_joints=start_joints,
-                tool_pose=tool_pose,
-                reference_pose=reference_pose,
-                joint_count=joint_count,
-                optimizer_settings=optimizer_settings,
-                a1_lower_deg=a1_lower_deg,
-                a1_upper_deg=a1_upper_deg,
-                a2_max_deg=a2_max_deg,
-                joint_constraint_tolerance_deg=joint_constraint_tolerance_deg,
-                seed_joints=(
-                    ()
-                    if getattr(robot, "ik_seed_invariant", False)
-                    else _build_local_seed_joints(search_result, segment_index, segment_index + 1)
-                ),
-                lower_limits=lower_limits_tuple,
-                upper_limits=upper_limits_tuple,
-                bridge_trigger_joint_delta_deg=motion_settings.bridge_trigger_joint_delta_deg,
-            )
-            residual_problems = _collect_problem_segments(
-                candidate_result.selected_path,
-                bridge_trigger_joint_delta_deg=motion_settings.bridge_trigger_joint_delta_deg,
-            )
-            if residual_problems:
-                continue
-            if best_clean_result is None or _path_search_sort_key(candidate_result) < _path_search_sort_key(best_clean_result):
-                best_clean_result = candidate_result
-                print(
-                    "Accepted inserted transition samples: "
-                    f"segment={search_result.row_labels[segment_index]}->{search_result.row_labels[segment_index + 1]}, "
-                    f"inserted_points={insertion_count}, "
-                    f"waypoint_count={len(candidate_result.pose_rows)}, "
-                    f"worst_joint_step={candidate_result.worst_joint_step_deg:.3f} deg."
+    for pass_index in range(max_inserted_repair_passes):
+        problem_segments = _collect_problem_segments(
+            current_result.selected_path,
+            bridge_trigger_joint_delta_deg=motion_settings.bridge_trigger_joint_delta_deg,
+        )
+        if not problem_segments:
+            return current_result
+
+        best_repair_result: _PathSearchResult | None = None
+        best_repair_key: tuple[float, ...] | None = None
+        best_repair_note: tuple[str, str, int, int] | None = None
+        base_worst_joint_step = float(current_result.worst_joint_step_deg)
+        base_problem_count = len(problem_segments)
+
+        for segment_index, _config_changed, _max_joint_delta, _mean_joint_delta in problem_segments[:4]:
+            left_label = str(current_result.row_labels[segment_index])
+            right_label = str(current_result.row_labels[segment_index + 1])
+            for insertion_count in motion_settings.frame_a_origin_yz_insertion_counts:
+                repair_signature = (left_label, right_label, int(insertion_count))
+                if repair_signature in attempted_repairs:
+                    continue
+                attempted_repairs.add(repair_signature)
+                (
+                    augmented_reference_rows,
+                    augmented_profile,
+                    augmented_labels,
+                    augmented_flags,
+                ) = _insert_interpolated_transition_rows(
+                    current_result.reference_pose_rows,
+                    current_result.frame_a_origin_yz_profile_mm,
+                    current_result.row_labels,
+                    current_result.inserted_flags,
+                    segment_index=segment_index,
+                    insertion_count=insertion_count,
                 )
+                candidate_result = _evaluate_frame_a_origin_profile(
+                    augmented_reference_rows,
+                    frame_a_origin_yz_profile_mm=augmented_profile,
+                    row_labels=augmented_labels,
+                    inserted_flags=augmented_flags,
+                    robot=robot,
+                    mat_type=mat_type,
+                    move_type=move_type,
+                    start_joints=start_joints,
+                    tool_pose=tool_pose,
+                    reference_pose=reference_pose,
+                    joint_count=joint_count,
+                    optimizer_settings=optimizer_settings,
+                    a1_lower_deg=a1_lower_deg,
+                    a1_upper_deg=a1_upper_deg,
+                    a2_max_deg=a2_max_deg,
+                    joint_constraint_tolerance_deg=joint_constraint_tolerance_deg,
+                    seed_joints=(
+                        ()
+                        if getattr(robot, "ik_seed_invariant", False)
+                        else _build_local_seed_joints(current_result, segment_index, segment_index + 1)
+                    ),
+                    lower_limits=lower_limits_tuple,
+                    upper_limits=upper_limits_tuple,
+                    bridge_trigger_joint_delta_deg=motion_settings.bridge_trigger_joint_delta_deg,
+                )
+                residual_problems = _collect_problem_segments(
+                    candidate_result.selected_path,
+                    bridge_trigger_joint_delta_deg=motion_settings.bridge_trigger_joint_delta_deg,
+                )
+                if candidate_result.invalid_row_count != 0 or candidate_result.ik_empty_row_count != 0:
+                    continue
 
-    return best_clean_result
+                is_clean_repair = not residual_problems
+                improves_global_sort = _path_search_sort_key(candidate_result) < _path_search_sort_key(current_result)
+                reduces_problem_count = len(residual_problems) < base_problem_count
+                reduces_worst_jump = (
+                    float(candidate_result.worst_joint_step_deg)
+                    < base_worst_joint_step - 1e-6
+                )
+                does_not_worsen_large_jump = (
+                    float(candidate_result.worst_joint_step_deg)
+                    <= base_worst_joint_step + 1e-6
+                )
+                if not (
+                    is_clean_repair
+                    or improves_global_sort
+                    or reduces_problem_count
+                    or reduces_worst_jump
+                    or does_not_worsen_large_jump
+                ):
+                    continue
+
+                repair_key = (
+                    0.0 if is_clean_repair else 1.0,
+                    float(len(residual_problems)),
+                    float(candidate_result.worst_joint_step_deg),
+                    float(candidate_result.mean_joint_step_deg),
+                    float(candidate_result.config_switches),
+                    float(candidate_result.bridge_like_segments),
+                    float(candidate_result.offset_step_jitter_mm),
+                    float(candidate_result.offset_jerk_mm),
+                    float(candidate_result.total_cost),
+                )
+                if best_repair_key is None or repair_key < best_repair_key:
+                    best_repair_key = repair_key
+                    best_repair_result = candidate_result
+                    best_repair_note = (
+                        left_label,
+                        right_label,
+                        int(insertion_count),
+                        len(residual_problems),
+                    )
+
+        if best_repair_result is None or best_repair_note is None:
+            break
+
+        current_result = best_repair_result
+        accepted_any = True
+        left_label, right_label, insertion_count, residual_count = best_repair_note
+        residual_note = "clean" if residual_count == 0 else f"residual_warnings={residual_count}"
+        print(
+            "Accepted inserted transition samples: "
+            f"pass={pass_index + 1}, "
+            f"segment={left_label}->{right_label}, "
+            f"inserted_points={insertion_count}, "
+            f"waypoint_count={len(current_result.pose_rows)}, "
+            f"worst_joint_step={current_result.worst_joint_step_deg:.3f} deg, "
+            f"{residual_note}."
+        )
+
+    return current_result if accepted_any else None
 
 
 def _add_boundary_scan_states(
