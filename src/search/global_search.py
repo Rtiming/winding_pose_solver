@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from dataclasses import replace
 from typing import Sequence
 
 from src.core.geometry import _build_pose, _trim_joint_vector
@@ -68,6 +69,9 @@ def _search_best_exact_pose_path(
         lower_limits=lower_limits,
         upper_limits=upper_limits,
         bridge_trigger_joint_delta_deg=motion_settings.bridge_trigger_joint_delta_deg,
+        lock_profile_endpoints=bool(
+            getattr(motion_settings, "lock_frame_a_origin_yz_profile_endpoints", True)
+        ),
     )
     return best_result
 
@@ -96,19 +100,26 @@ def _evaluate_frame_a_origin_profile(
     bridge_trigger_joint_delta_deg: float,
     reused_ik_layers: Sequence[_IKLayer] | None = None,
     recompute_row_indices: Sequence[int] | None = None,
+    lock_profile_endpoints: bool = False,
 ) -> _PathSearchResult:
-    frame_a_origin_yz_profile_mm = _close_terminal_profile_if_needed(
+    frame_a_origin_yz_profile_mm = _normalize_frame_a_origin_yz_profile(
         reference_pose_rows,
         frame_a_origin_yz_profile_mm,
+        lock_profile_endpoints=lock_profile_endpoints,
     )
     if (
         recompute_row_indices is not None
         and len(reference_pose_rows) >= 2
-        and _reference_path_has_terminal_start_copy(reference_pose_rows)
     ):
         recompute_set = {int(index) for index in recompute_row_indices}
         terminal_index = len(reference_pose_rows) - 1
-        if 0 in recompute_set or terminal_index in recompute_set:
+        if (
+            lock_profile_endpoints
+            or (
+                _reference_path_has_terminal_start_copy(reference_pose_rows)
+                and (0 in recompute_set or terminal_index in recompute_set)
+            )
+        ):
             recompute_set.add(0)
             recompute_set.add(terminal_index)
         recompute_row_indices = tuple(sorted(recompute_set))
@@ -182,8 +193,32 @@ def _finalize_frame_a_origin_profile_result(
             )
             selected_path = tuple(selected_path_list)
         except RuntimeError:
-            selected_path = ()
-            total_cost = math.inf
+            if bool(getattr(optimizer_settings, "enable_joint_continuity_constraint", False)):
+                # Keep a diagnostic path when the hard per-step constraint is too
+                # tight. Official delivery is still blocked later by continuity
+                # gates, but users can inspect the actual bad segments.
+                try:
+                    fallback_optimizer_settings = replace(
+                        optimizer_settings,
+                        enable_joint_continuity_constraint=False,
+                    )
+                    selected_path_list, total_cost = _optimize_joint_path(
+                        ik_layers_tuple,
+                        robot=robot,
+                        move_type=move_type,
+                        start_joints=start_joints,
+                        optimizer_settings=fallback_optimizer_settings,
+                        require_terminal_match_start=_reference_path_has_terminal_start_copy(
+                            reference_pose_rows
+                        ),
+                    )
+                    selected_path = tuple(selected_path_list)
+                except RuntimeError:
+                    selected_path = ()
+                    total_cost = math.inf
+            else:
+                selected_path = ()
+                total_cost = math.inf
 
     if selected_path:
         (
@@ -232,17 +267,44 @@ def _finalize_frame_a_origin_profile_result(
     )
 
 
-def _close_terminal_profile_if_needed(
+def _normalize_frame_a_origin_yz_profile(
     reference_pose_rows: Sequence[dict[str, float]],
     frame_a_origin_yz_profile_mm: Sequence[tuple[float, float]],
+    *,
+    lock_profile_endpoints: bool = False,
 ) -> tuple[tuple[float, float], ...]:
     profile = tuple(
         (float(dy_mm), float(dz_mm))
         for dy_mm, dz_mm in frame_a_origin_yz_profile_mm
     )
-    if len(profile) >= 2 and _reference_path_has_terminal_start_copy(reference_pose_rows):
+    if not profile:
+        return profile
+
+    terminal_index = len(profile) - 1
+    has_terminal_start_copy = (
+        len(profile) >= 2 and _reference_path_has_terminal_start_copy(reference_pose_rows)
+    )
+    if lock_profile_endpoints:
+        locked_profile = list(profile)
+        locked_profile[0] = (0.0, 0.0)
+        if len(locked_profile) >= 2:
+            locked_profile[terminal_index] = (0.0, 0.0)
+        return tuple(locked_profile)
+
+    if has_terminal_start_copy:
         profile = (*profile[:-1], profile[0])
     return profile
+
+
+def _close_terminal_profile_if_needed(
+    reference_pose_rows: Sequence[dict[str, float]],
+    frame_a_origin_yz_profile_mm: Sequence[tuple[float, float]],
+) -> tuple[tuple[float, float], ...]:
+    return _normalize_frame_a_origin_yz_profile(
+        reference_pose_rows,
+        frame_a_origin_yz_profile_mm,
+        lock_profile_endpoints=False,
+    )
 
 
 def _reference_path_has_terminal_start_copy(

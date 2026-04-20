@@ -38,6 +38,9 @@ ROBOT_JOINT_SPEED_DEG_S = 30.0
 ROBOT_LINEAR_ACCEL_MM_S2 = 600.0
 ROBOT_JOINT_ACCEL_DEG_S2 = 120.0
 ROBOT_ROUNDING_MM = -1.0
+# Hide generated program targets after each target has stored pose and joint
+# payloads.  Runtime code hides target items individually instead of calling
+# Program.ShowTargets(False), which can make RoboDK display "target undefined".
 HIDE_TARGETS_AFTER_GENERATION = True
 
 # Hard joint constraints
@@ -48,7 +51,9 @@ JOINT_CONSTRAINT_TOLERANCE_DEG = 1e-6
 
 # Continuity constraints
 ENABLE_JOINT_CONTINUITY_CONSTRAINT = True
-MAX_JOINT_STEP_DEG = (5.0, 5.0, 5.0, 180.0, 100.0, 180.0)
+MAX_JOINT_STEP_DEG = (5.0, 5.0, 5.0, 45.0, 30.0, 45.0)
+IK_MAX_CANDIDATES_PER_CONFIG_FAMILY = 4
+USE_GUIDED_CONFIG_PATH = True
 BRIDGE_TRIGGER_JOINT_DELTA_DEG = 30.0
 BRIDGE_STEP_DEG = (2.0, 2.0, 2.0, 20.0, 10.0, 20.0)
 
@@ -59,9 +64,20 @@ FRAME_A_ORIGIN_YZ_STEP_SCHEDULE_MM = (4.0, 2.0, 1.0)
 FRAME_A_ORIGIN_YZ_WINDOW_RADIUS = 8
 FRAME_A_ORIGIN_YZ_MAX_PASSES = 4
 FRAME_A_ORIGIN_YZ_INSERTION_COUNTS = (4, 8)
+LOCK_FRAME_A_ORIGIN_YZ_PROFILE_ENDPOINTS = True
 WRIST_PHASE_LOCK_THRESHOLD_DEG = 12.0
+ENABLE_JOINT_SPACE_BRIDGE_REPAIR = True
+JOINT_SPACE_BRIDGE_MAX_INSERTIONS_PER_SEGMENT = 24
+JOINT_SPACE_BRIDGE_MAX_TCP_DEVIATION_MM = 20.0
+JOINT_SPACE_BRIDGE_MAX_TCP_PATH_RATIO = 4.0
 LOCAL_PARALLEL_WORKERS = 0  # 0 = auto
 LOCAL_PARALLEL_MIN_BATCH_SIZE = 8
+BIG_CIRCLE_STEP_DEG_THRESHOLD = 170.0
+BRANCH_FLIP_RATIO_THRESHOLD = 8.0
+BRANCH_FLIP_RATIO_EPS_MM = 1e-3
+OFFICIAL_WORST_JOINT_STEP_DEG_LIMIT = 60.0
+ENABLE_SAME_FAMILY_SEGMENT_REPAIR = True
+SAME_FAMILY_REPAIR_MAX_SEGMENTS = 8
 
 
 def build_frame_options() -> FrameBuildOptions:
@@ -94,6 +110,8 @@ def build_motion_settings(
         joint_constraint_tolerance_deg=JOINT_CONSTRAINT_TOLERANCE_DEG,
         enable_joint_continuity_constraint=ENABLE_JOINT_CONTINUITY_CONSTRAINT,
         max_joint_step_deg=MAX_JOINT_STEP_DEG,
+        ik_max_candidates_per_config_family=IK_MAX_CANDIDATES_PER_CONFIG_FAMILY,
+        use_guided_config_path=USE_GUIDED_CONFIG_PATH,
         bridge_trigger_joint_delta_deg=BRIDGE_TRIGGER_JOINT_DELTA_DEG,
         bridge_step_deg=BRIDGE_STEP_DEG,
         frame_a_origin_yz_envelope_schedule_mm=FRAME_A_ORIGIN_YZ_ENVELOPE_SCHEDULE_MM,
@@ -101,9 +119,22 @@ def build_motion_settings(
         frame_a_origin_yz_window_radius=FRAME_A_ORIGIN_YZ_WINDOW_RADIUS,
         frame_a_origin_yz_max_passes=FRAME_A_ORIGIN_YZ_MAX_PASSES,
         frame_a_origin_yz_insertion_counts=FRAME_A_ORIGIN_YZ_INSERTION_COUNTS,
+        lock_frame_a_origin_yz_profile_endpoints=LOCK_FRAME_A_ORIGIN_YZ_PROFILE_ENDPOINTS,
         wrist_phase_lock_threshold_deg=WRIST_PHASE_LOCK_THRESHOLD_DEG,
+        enable_joint_space_bridge_repair=ENABLE_JOINT_SPACE_BRIDGE_REPAIR,
+        joint_space_bridge_max_insertions_per_segment=(
+            JOINT_SPACE_BRIDGE_MAX_INSERTIONS_PER_SEGMENT
+        ),
+        joint_space_bridge_max_tcp_deviation_mm=JOINT_SPACE_BRIDGE_MAX_TCP_DEVIATION_MM,
+        joint_space_bridge_max_tcp_path_ratio=JOINT_SPACE_BRIDGE_MAX_TCP_PATH_RATIO,
         local_parallel_workers=local_parallel_workers,
         local_parallel_min_batch_size=local_parallel_min_batch_size,
+        big_circle_step_deg_threshold=BIG_CIRCLE_STEP_DEG_THRESHOLD,
+        branch_flip_ratio_threshold=BRANCH_FLIP_RATIO_THRESHOLD,
+        branch_flip_ratio_eps_mm=BRANCH_FLIP_RATIO_EPS_MM,
+        official_worst_joint_step_deg_limit=OFFICIAL_WORST_JOINT_STEP_DEG_LIMIT,
+        enable_same_family_segment_repair=ENABLE_SAME_FAMILY_SEGMENT_REPAIR,
+        same_family_repair_max_segments=SAME_FAMILY_REPAIR_MAX_SEGMENTS,
         ik_backend=ik_backend,
     )
 

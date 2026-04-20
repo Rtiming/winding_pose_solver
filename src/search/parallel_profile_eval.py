@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from typing import Sequence
 
 from src.core.motion_settings import RoboDKMotionSettings
-from src.core.types import _PathSearchResult
+from src.core.types import _IKLayer, _PathSearchResult
 
 
 @dataclass(frozen=True)
@@ -27,6 +27,8 @@ class _OfflineExactEvalContext:
 @dataclass(frozen=True)
 class _ExactProfileBatchSpec:
     reference_pose_rows: tuple[dict[str, float], ...]
+    base_frame_a_origin_yz_profile_mm: tuple[tuple[float, float], ...]
+    reused_ik_layers: tuple[_IKLayer, ...] | None
     frame_a_origin_yz_profiles_mm: tuple[tuple[tuple[float, float], ...], ...]
     row_labels: tuple[str, ...]
     inserted_flags: tuple[bool, ...]
@@ -52,6 +54,8 @@ def resolve_local_parallel_workers(configured_workers: int) -> int:
 def maybe_parallel_evaluate_exact_profiles(
     *,
     reference_pose_rows: Sequence[dict[str, float]],
+    base_frame_a_origin_yz_profile_mm: Sequence[tuple[float, float]],
+    reused_ik_layers: Sequence[_IKLayer] | None,
     frame_a_origin_yz_profiles_mm: Sequence[Sequence[tuple[float, float]]],
     row_labels: Sequence[str],
     inserted_flags: Sequence[bool],
@@ -72,14 +76,29 @@ def maybe_parallel_evaluate_exact_profiles(
     if len(profile_batches) < motion_settings.local_parallel_min_batch_size:
         return None
 
+    base_profile = tuple(
+        (float(dy_mm), float(dz_mm))
+        for dy_mm, dz_mm in base_frame_a_origin_yz_profile_mm
+    )
+    reused_ik_layers_tuple = (
+        None
+        if reused_ik_layers is None
+        else tuple(reused_ik_layers)
+    )
+
     chunk_count = min(worker_count, len(profile_batches))
     chunk_size = max(1, math.ceil(len(profile_batches) / max(1, chunk_count)))
+    reference_pose_rows_tuple = tuple(dict(row) for row in reference_pose_rows)
+    row_labels_tuple = tuple(str(label) for label in row_labels)
+    inserted_flags_tuple = tuple(bool(flag) for flag in inserted_flags)
     batch_specs = [
         _ExactProfileBatchSpec(
-            reference_pose_rows=tuple(dict(row) for row in reference_pose_rows),
+            reference_pose_rows=reference_pose_rows_tuple,
+            base_frame_a_origin_yz_profile_mm=base_profile,
+            reused_ik_layers=reused_ik_layers_tuple,
             frame_a_origin_yz_profiles_mm=profile_batches[start_index : start_index + chunk_size],
-            row_labels=tuple(str(label) for label in row_labels),
-            inserted_flags=tuple(bool(flag) for flag in inserted_flags),
+            row_labels=row_labels_tuple,
+            inserted_flags=inserted_flags_tuple,
             motion_settings=motion_settings,
             start_joints=None
             if start_joints is None
@@ -168,6 +187,9 @@ def _evaluate_exact_profile_batch_worker(
         if batch_spec.start_joints is None
         else tuple(float(value) for value in batch_spec.start_joints)
     )
+    reused_ik_layers = batch_spec.reused_ik_layers
+    if reused_ik_layers is not None and len(reused_ik_layers) != len(batch_spec.reference_pose_rows):
+        reused_ik_layers = None
 
     return tuple(
         _evaluate_frame_a_origin_profile(
@@ -191,9 +213,36 @@ def _evaluate_exact_profile_batch_worker(
             lower_limits=context.lower_limits,
             upper_limits=context.upper_limits,
             bridge_trigger_joint_delta_deg=motion_settings.bridge_trigger_joint_delta_deg,
+            reused_ik_layers=reused_ik_layers,
+            recompute_row_indices=_profile_changed_row_indices(
+                batch_spec.base_frame_a_origin_yz_profile_mm,
+                profile,
+            ),
+            lock_profile_endpoints=bool(
+                getattr(motion_settings, "lock_frame_a_origin_yz_profile_endpoints", True)
+            ),
         )
         for profile in batch_spec.frame_a_origin_yz_profiles_mm
     )
+
+
+def _profile_changed_row_indices(
+    base_profile: Sequence[tuple[float, float]],
+    candidate_profile: Sequence[tuple[float, float]],
+) -> tuple[int, ...]:
+    if len(base_profile) != len(candidate_profile):
+        return tuple(range(len(candidate_profile)))
+
+    changed_indices: list[int] = []
+    for row_index, (base_offset, candidate_offset) in enumerate(
+        zip(base_profile, candidate_profile)
+    ):
+        if (
+            abs(float(base_offset[0]) - float(candidate_offset[0])) > 1e-9
+            or abs(float(base_offset[1]) - float(candidate_offset[1])) > 1e-9
+        ):
+            changed_indices.append(row_index)
+    return tuple(changed_indices)
 
 
 atexit.register(shutdown_exact_profile_executor)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import heapq
 import itertools
 import math
 from dataclasses import dataclass
@@ -12,6 +13,8 @@ from src.search.bridge_builder import _insert_interpolated_transition_rows
 from src.core.geometry import _build_pose, _mean_abs_joint_delta
 from src.search.global_search import (
     _evaluate_frame_a_origin_profile,
+    _normalize_frame_a_origin_yz_profile,
+    _summarize_profile_metrics,
     _profile_cache_key,
     _path_search_sort_key,
 )
@@ -20,9 +23,13 @@ from src.search.parallel_profile_eval import maybe_parallel_evaluate_exact_profi
 from src.search.path_optimizer import (
     _candidate_lineage_key,
     _candidate_transition_penalty,
+    _is_benign_wrist_singularity_config_change,
+    _joint_limit_penalty,
     _joint_transition_penalty,
+    _singularity_penalty,
+    _summarize_selected_path,
 )
-from src.core.types import _IKCandidate, _PathOptimizerSettings, _PathSearchResult
+from src.core.types import _IKCandidate, _IKLayer, _PathOptimizerSettings, _PathSearchResult
 
 
 @dataclass(frozen=True)
@@ -126,6 +133,8 @@ _HANDOVER_CORRIDOR_STAGE2_GROUP_WEIGHTS = (
     0.1,
 )
 _INSCRIBED_OCTAGON_COS_22P5 = 0.9238795325112867
+_WINDOW_STATE_MAX_CANDIDATES_PER_OFFSET = 16
+_WINDOW_STATE_MAX_CANDIDATES_PER_FAMILY = 3
 
 
 def _profile_changed_row_indices(
@@ -151,6 +160,7 @@ def _evaluate_exact_profile_with_cache(
     candidate_profile: Sequence[tuple[float, float]],
     *,
     base_result: _PathSearchResult,
+    lock_profile_endpoints: bool,
     profile_result_cache: dict[tuple[tuple[float, float], ...], _PathSearchResult],
     robot,
     mat_type,
@@ -169,6 +179,11 @@ def _evaluate_exact_profile_with_cache(
     upper_limits: Sequence[float],
     bridge_trigger_joint_delta_deg: float,
 ) -> _PathSearchResult:
+    candidate_profile = _normalize_frame_a_origin_yz_profile(
+        base_result.reference_pose_rows,
+        candidate_profile,
+        lock_profile_endpoints=lock_profile_endpoints,
+    )
     profile_key = _profile_cache_key(candidate_profile)
     cached_result = profile_result_cache.get(profile_key)
     if cached_result is not None:
@@ -201,9 +216,25 @@ def _evaluate_exact_profile_with_cache(
         bridge_trigger_joint_delta_deg=bridge_trigger_joint_delta_deg,
         reused_ik_layers=base_result.ik_layers,
         recompute_row_indices=recompute_row_indices,
+        lock_profile_endpoints=lock_profile_endpoints,
     )
     profile_result_cache[profile_key] = evaluated_result
     return evaluated_result
+
+
+def _lock_profile_endpoints_if_needed(
+    profile: Sequence[tuple[float, float]],
+    *,
+    reference_pose_rows: Sequence[dict[str, float]],
+    motion_settings,
+) -> tuple[tuple[float, float], ...]:
+    return _normalize_frame_a_origin_yz_profile(
+        reference_pose_rows,
+        profile,
+        lock_profile_endpoints=bool(
+            getattr(motion_settings, "lock_frame_a_origin_yz_profile_endpoints", True)
+        ),
+    )
 
 
 def _lineage_matches_family(
@@ -244,6 +275,7 @@ def _refine_path_with_frame_a_origin_profile(
 
     lower_limits_tuple = tuple(float(value) for value in lower_limits[:joint_count])
     upper_limits_tuple = tuple(float(value) for value in upper_limits[:joint_count])
+    continuity_step_limit_mm = _resolve_profile_continuity_step_limit(motion_settings)
     profile_result_cache: dict[tuple[tuple[float, float], ...], _PathSearchResult] = {
         _profile_cache_key(best_result.frame_a_origin_yz_profile_mm): best_result
     }
@@ -290,6 +322,7 @@ def _refine_path_with_frame_a_origin_profile(
         problem_segments = _collect_problem_segments(
             best_result.selected_path,
             bridge_trigger_joint_delta_deg=motion_settings.bridge_trigger_joint_delta_deg,
+            max_segments=5,
         )
         if not problem_segments:
             break
@@ -312,21 +345,31 @@ def _refine_path_with_frame_a_origin_profile(
 
             # For config-switch segments add wider envelope passes so the DP can reach
             # bridge points that lie farther from the nominal winding path.
-            envelope_schedule = list(motion_settings.frame_a_origin_yz_envelope_schedule_mm)
+            envelope_schedule = tuple(
+                float(value)
+                for value in motion_settings.frame_a_origin_yz_envelope_schedule_mm
+            )
+            normal_max_envelope = max(envelope_schedule, default=0.0)
             if _config_changed:
-                max_normal_envelope = max(float(e) for e in envelope_schedule)
+                widened_envelopes: list[float] = []
+                seen_envelopes = set(envelope_schedule)
                 for multiplier in (2.0, 3.0):
-                    wider = round(max_normal_envelope * multiplier, 1)
-                    if wider not in envelope_schedule:
-                        envelope_schedule.append(wider)
+                    wider = round(normal_max_envelope * multiplier, 1)
+                    if wider not in seen_envelopes:
+                        seen_envelopes.add(wider)
+                        widened_envelopes.append(wider)
+                envelope_schedule = (*envelope_schedule, *widened_envelopes)
 
+            base_step_schedule = tuple(
+                float(value) for value in motion_settings.frame_a_origin_yz_step_schedule_mm
+            )
+            coarse_step_schedule = base_step_schedule[:2] or base_step_schedule
             for envelope_mm in envelope_schedule:
                 # Coarser steps for extra-wide passes to keep cost bounded.
-                max_normal_envelope_f = max(float(e) for e in motion_settings.frame_a_origin_yz_envelope_schedule_mm)
                 step_schedule = (
-                    list(motion_settings.frame_a_origin_yz_step_schedule_mm)[:2]
-                    if float(envelope_mm) > max_normal_envelope_f
-                    else list(motion_settings.frame_a_origin_yz_step_schedule_mm)
+                    coarse_step_schedule
+                    if float(envelope_mm) > normal_max_envelope
+                    else base_step_schedule
                 )
                 for step_mm in step_schedule:
                     candidate_profile = _solve_window_profile_dp(
@@ -351,6 +394,11 @@ def _refine_path_with_frame_a_origin_profile(
                     )
                     if candidate_profile is None:
                         continue
+                    candidate_profile = _lock_profile_endpoints_if_needed(
+                        candidate_profile,
+                        reference_pose_rows=best_result.reference_pose_rows,
+                        motion_settings=motion_settings,
+                    )
                     profile_key = tuple(
                         (round(float(dy_mm), 6), round(float(dz_mm), 6))
                         for dy_mm, dz_mm in candidate_profile
@@ -398,6 +446,8 @@ def _refine_path_with_frame_a_origin_profile(
         if uncached_candidate_profiles:
             parallel_results = maybe_parallel_evaluate_exact_profiles(
                 reference_pose_rows=best_result.reference_pose_rows,
+                base_frame_a_origin_yz_profile_mm=best_result.frame_a_origin_yz_profile_mm,
+                reused_ik_layers=best_result.ik_layers,
                 frame_a_origin_yz_profiles_mm=[
                     candidate_profile
                     for candidate_profile, _metadata in uncached_candidate_profiles
@@ -427,6 +477,13 @@ def _refine_path_with_frame_a_origin_profile(
                         _evaluate_exact_profile_with_cache(
                             candidate_profile,
                             base_result=best_result,
+                            lock_profile_endpoints=bool(
+                                getattr(
+                                    motion_settings,
+                                    "lock_frame_a_origin_yz_profile_endpoints",
+                                    True,
+                                )
+                            ),
                             profile_result_cache=profile_result_cache,
                             robot=robot,
                             mat_type=mat_type,
@@ -528,6 +585,7 @@ def _refine_path_with_global_continuous_profile(
     )
     if fd_step_mm <= 0.0:
         return best_result
+    continuity_step_limit_mm = _resolve_profile_continuity_step_limit(motion_settings)
 
     for iteration_index in range(_GLOBAL_CONTINUOUS_REFINEMENT_MAX_ITERS):
         problem_segments = _collect_problem_segments(
@@ -557,11 +615,20 @@ def _refine_path_with_global_continuous_profile(
         if linearizations is None:
             break
 
-        max_profile_step_mm = _resolve_profile_continuity_step_limit(motion_settings)
+        max_profile_step_mm = continuity_step_limit_mm
         update_proposals: list[tuple[str, tuple[tuple[float, float], ...]]] = []
-        use_minmax = _GLOBAL_CONTINUOUS_ENABLE_MINMAX and any(
+        has_config_switch_problem = any(
             config_changed for _seg, config_changed, _max, _mean in problem_segments
         )
+        use_minmax = bool(_GLOBAL_CONTINUOUS_ENABLE_MINMAX)
+        if (
+            not use_minmax
+            and has_config_switch_problem
+            and int(getattr(best_result, "bridge_like_segments", 0)) >= 2
+        ):
+            # Multi-bridge windows are dominated by the worst transition.
+            # Enable min-max stage to target peak joint jump directly.
+            use_minmax = True
         if use_minmax:
             minmax_update = _solve_global_profile_minmax_update(
                 best_result,
@@ -599,11 +666,17 @@ def _refine_path_with_global_continuous_profile(
                     trust_scale=trust_scale,
                     max_abs_offset_mm=max_abs_offset_mm,
                 )
+                candidate_profile = _lock_profile_endpoints_if_needed(
+                    candidate_profile,
+                    reference_pose_rows=best_result.reference_pose_rows,
+                    motion_settings=motion_settings,
+                )
                 if candidate_profile == best_result.frame_a_origin_yz_profile_mm:
                     continue
                 if not _profile_is_continuous_enough(
                     candidate_profile,
                     motion_settings=motion_settings,
+                    max_step_mm=max_profile_step_mm,
                 ):
                     continue
                 profile_key = tuple(
@@ -643,6 +716,8 @@ def _refine_path_with_global_continuous_profile(
             ]
             parallel_results = maybe_parallel_evaluate_exact_profiles(
                 reference_pose_rows=best_result.reference_pose_rows,
+                base_frame_a_origin_yz_profile_mm=best_result.frame_a_origin_yz_profile_mm,
+                reused_ik_layers=best_result.ik_layers,
                 frame_a_origin_yz_profiles_mm=candidate_profiles,
                 row_labels=best_result.row_labels,
                 inserted_flags=best_result.inserted_flags,
@@ -670,6 +745,13 @@ def _refine_path_with_global_continuous_profile(
                         _evaluate_exact_profile_with_cache(
                             candidate_profile,
                             base_result=best_result,
+                            lock_profile_endpoints=bool(
+                                getattr(
+                                    motion_settings,
+                                    "lock_frame_a_origin_yz_profile_endpoints",
+                                    True,
+                                )
+                            ),
                             profile_result_cache=profile_result_cache,
                             robot=robot,
                             mat_type=mat_type,
@@ -713,6 +795,7 @@ def _refine_path_with_global_continuous_profile(
             if not _profile_is_continuous_enough(
                 candidate_profile,
                 motion_settings=motion_settings,
+                max_step_mm=continuity_step_limit_mm,
             ):
                 continue
             if _path_search_sort_key(candidate_result) < _path_search_sort_key(best_result):
@@ -997,7 +1080,7 @@ def _collect_profile_family_candidate(
         seed_joints=(
             ()
             if getattr(robot, "ik_seed_invariant", False)
-            else (tuple(float(value) for value in selected_candidate.joints),)
+            else (tuple(float(value) for value in reference_candidate.joints),)
         ),
         joint_count=joint_count,
         optimizer_settings=optimizer_settings,
@@ -1433,11 +1516,13 @@ def _profile_is_continuous_enough(
     profile: Sequence[tuple[float, float]],
     *,
     motion_settings,
+    max_step_mm: float | None = None,
 ) -> bool:
     if len(profile) <= 1:
         return True
 
-    max_step_mm = _resolve_profile_continuity_step_limit(motion_settings)
+    if max_step_mm is None:
+        max_step_mm = _resolve_profile_continuity_step_limit(motion_settings)
 
     return all(
         math.hypot(
@@ -1494,6 +1579,7 @@ def _refine_path_with_handover_corridors(
     fd_step_mm = min(_GLOBAL_CONTINUOUS_REFINEMENT_FD_STEP_MM, max_abs_offset_mm)
     if fd_step_mm <= 0.0:
         return best_result
+    continuity_step_limit_mm = _resolve_profile_continuity_step_limit(motion_settings)
 
     for iteration_index in range(_HANDOVER_CORRIDOR_MAX_ITERS):
         config_problem_segments = [
@@ -1501,6 +1587,7 @@ def _refine_path_with_handover_corridors(
             for segment in _collect_problem_segments(
                 best_result.selected_path,
                 bridge_trigger_joint_delta_deg=motion_settings.bridge_trigger_joint_delta_deg,
+                max_segments=3,
             )
             if segment[1]
         ]
@@ -1551,7 +1638,7 @@ def _refine_path_with_handover_corridors(
                     target_segment=target_descriptor.target_segment,
                     optimizer_settings=optimizer_settings,
                     max_abs_offset_mm=max_abs_offset_mm,
-                    max_profile_step_mm=_resolve_profile_continuity_step_limit(motion_settings),
+                    max_profile_step_mm=continuity_step_limit_mm,
                 )
                 if primary_solve_result is not None:
                     solve_results.append(primary_solve_result)
@@ -1562,7 +1649,7 @@ def _refine_path_with_handover_corridors(
                             target_segment=target_descriptor.target_segment,
                             optimizer_settings=optimizer_settings,
                             max_abs_offset_mm=max_abs_offset_mm,
-                            max_profile_step_mm=_resolve_profile_continuity_step_limit(motion_settings),
+                            max_profile_step_mm=continuity_step_limit_mm,
                             reason="sidecar",
                         )
                         if l2_sidecar_result is not None:
@@ -1579,11 +1666,17 @@ def _refine_path_with_handover_corridors(
                             trust_scale=trust_scale,
                             max_abs_offset_mm=max_abs_offset_mm,
                         )
+                        candidate_profile = _lock_profile_endpoints_if_needed(
+                            candidate_profile,
+                            reference_pose_rows=best_result.reference_pose_rows,
+                            motion_settings=motion_settings,
+                        )
                         if candidate_profile == best_result.frame_a_origin_yz_profile_mm:
                             continue
                         if not _profile_is_continuous_enough(
                             candidate_profile,
                             motion_settings=motion_settings,
+                            max_step_mm=continuity_step_limit_mm,
                         ):
                             continue
                         corridor_delta_scaled = tuple(
@@ -1653,6 +1746,8 @@ def _refine_path_with_handover_corridors(
         if uncached_candidate_profiles:
             parallel_results = maybe_parallel_evaluate_exact_profiles(
                 reference_pose_rows=best_result.reference_pose_rows,
+                base_frame_a_origin_yz_profile_mm=best_result.frame_a_origin_yz_profile_mm,
+                reused_ik_layers=best_result.ik_layers,
                 frame_a_origin_yz_profiles_mm=[
                     candidate_profile
                     for candidate_profile, _metadata in uncached_candidate_profiles
@@ -1682,6 +1777,13 @@ def _refine_path_with_handover_corridors(
                         _evaluate_exact_profile_with_cache(
                             candidate_profile,
                             base_result=best_result,
+                            lock_profile_endpoints=bool(
+                                getattr(
+                                    motion_settings,
+                                    "lock_frame_a_origin_yz_profile_endpoints",
+                                    True,
+                                )
+                            ),
                             profile_result_cache=profile_result_cache,
                             robot=robot,
                             mat_type=mat_type,
@@ -1724,6 +1826,7 @@ def _refine_path_with_handover_corridors(
             if not _profile_is_continuous_enough(
                 candidate_profile,
                 motion_settings=motion_settings,
+                max_step_mm=continuity_step_limit_mm,
             ):
                 continue
             if _path_search_sort_key(candidate_result) < _path_search_sort_key(best_result):
@@ -3393,6 +3496,7 @@ def _attempt_inserted_transition_repair(
     a1_upper_deg: float,
     a2_max_deg: float,
     joint_constraint_tolerance_deg: float,
+    run_post_inserted_window_repair: bool = True,
 ) -> _PathSearchResult | None:
     if not search_result.selected_path:
         return None
@@ -3467,6 +3571,13 @@ def _attempt_inserted_transition_repair(
                     lower_limits=lower_limits_tuple,
                     upper_limits=upper_limits_tuple,
                     bridge_trigger_joint_delta_deg=motion_settings.bridge_trigger_joint_delta_deg,
+                    lock_profile_endpoints=bool(
+                        getattr(
+                            motion_settings,
+                            "lock_frame_a_origin_yz_profile_endpoints",
+                            True,
+                        )
+                    ),
                 )
                 residual_problems = _collect_problem_segments(
                     candidate_result.selected_path,
@@ -3519,6 +3630,42 @@ def _attempt_inserted_transition_repair(
         if best_repair_result is None or best_repair_note is None:
             break
 
+        if run_post_inserted_window_repair:
+            refined_repair_result = _refine_path_with_frame_a_origin_profile(
+                best_repair_result,
+                robot=robot,
+                mat_type=mat_type,
+                move_type=move_type,
+                start_joints=start_joints,
+                tool_pose=tool_pose,
+                reference_pose=reference_pose,
+                joint_count=joint_count,
+                motion_settings=motion_settings,
+                optimizer_settings=optimizer_settings,
+                lower_limits=lower_limits_tuple,
+                upper_limits=upper_limits_tuple,
+                a1_lower_deg=a1_lower_deg,
+                a1_upper_deg=a1_upper_deg,
+                a2_max_deg=a2_max_deg,
+                joint_constraint_tolerance_deg=joint_constraint_tolerance_deg,
+            )
+            if _path_search_sort_key(refined_repair_result) < _path_search_sort_key(
+                best_repair_result
+            ):
+                refined_residual_problems = _collect_problem_segments(
+                    refined_repair_result.selected_path,
+                    bridge_trigger_joint_delta_deg=(
+                        motion_settings.bridge_trigger_joint_delta_deg
+                    ),
+                )
+                best_repair_result = refined_repair_result
+                best_repair_note = (
+                    best_repair_note[0],
+                    best_repair_note[1],
+                    best_repair_note[2],
+                    len(refined_residual_problems),
+                )
+
         current_result = best_repair_result
         accepted_any = True
         left_label, right_label, insertion_count, residual_count = best_repair_note
@@ -3534,6 +3681,408 @@ def _attempt_inserted_transition_repair(
         )
 
     return current_result if accepted_any else None
+
+
+def _attempt_joint_space_bridge_repair(
+    search_result: _PathSearchResult,
+    *,
+    robot,
+    tool_pose,
+    reference_pose,
+    joint_count: int,
+    motion_settings,
+    optimizer_settings: _PathOptimizerSettings,
+    lower_limits: Sequence[float],
+    upper_limits: Sequence[float],
+) -> _PathSearchResult | None:
+    """Split residual wrist/config jumps with explicit joint-space bridge waypoints.
+
+    This is deliberately different from the closed-path terminal A6 equivalence:
+    each inserted bridge has one concrete joint vector and all middle-path
+    continuity metrics still use real absolute joint differences.  The bridge
+    exists as a motion-instruction fallback for residual wrist flips that Y/Z
+    pose repair cannot remove without a large physical detour.
+    """
+
+    if not bool(getattr(motion_settings, "enable_joint_space_bridge_repair", False)):
+        return None
+    if not search_result.selected_path:
+        return None
+
+    max_insertions = int(
+        getattr(motion_settings, "joint_space_bridge_max_insertions_per_segment", 0)
+    )
+    if max_insertions <= 0:
+        return None
+
+    problem_segments = _collect_problem_segments(
+        search_result.selected_path,
+        bridge_trigger_joint_delta_deg=motion_settings.bridge_trigger_joint_delta_deg,
+    )
+    if not problem_segments:
+        return None
+
+    problem_segment_indices = {int(segment_index) for segment_index, *_ in problem_segments}
+    step_limits = _normalize_joint_bridge_step_limits(
+        getattr(motion_settings, "bridge_step_deg", (20.0,)),
+        joint_count=joint_count,
+    )
+    lower_limits_tuple = tuple(float(value) for value in lower_limits[:joint_count])
+    upper_limits_tuple = tuple(float(value) for value in upper_limits[:joint_count])
+
+    new_reference_rows: list[dict[str, float]] = []
+    new_pose_rows: list[dict[str, float]] = []
+    new_ik_layers: list[_IKLayer] = []
+    new_selected_path: list[_IKCandidate] = []
+    new_profile: list[tuple[float, float]] = []
+    new_labels: list[str] = []
+    new_flags: list[bool] = []
+    inserted_total = 0
+    bridged_segments: list[tuple[str, str, int]] = []
+    skipped_segments: list[tuple[str, str, float, float]] = []
+
+    def append_existing(row_index: int) -> None:
+        new_reference_rows.append(dict(search_result.reference_pose_rows[row_index]))
+        new_pose_rows.append(dict(search_result.pose_rows[row_index]))
+        new_ik_layers.append(search_result.ik_layers[row_index])
+        new_selected_path.append(search_result.selected_path[row_index])
+        new_profile.append(
+            (
+                float(search_result.frame_a_origin_yz_profile_mm[row_index][0]),
+                float(search_result.frame_a_origin_yz_profile_mm[row_index][1]),
+            )
+        )
+        new_labels.append(str(search_result.row_labels[row_index]))
+        new_flags.append(bool(search_result.inserted_flags[row_index]))
+
+    for row_index in range(len(search_result.selected_path)):
+        append_existing(row_index)
+        if row_index + 1 >= len(search_result.selected_path):
+            continue
+        if row_index not in problem_segment_indices:
+            continue
+
+        previous_candidate = search_result.selected_path[row_index]
+        current_candidate = search_result.selected_path[row_index + 1]
+        insertion_count = _joint_bridge_insertion_count(
+            previous_candidate.joints,
+            current_candidate.joints,
+            step_limits=step_limits,
+        )
+        insertion_count = min(insertion_count, max_insertions)
+        if insertion_count <= 0:
+            continue
+
+        left_label = str(search_result.row_labels[row_index])
+        right_label = str(search_result.row_labels[row_index + 1])
+        left_profile = search_result.frame_a_origin_yz_profile_mm[row_index]
+        right_profile = search_result.frame_a_origin_yz_profile_mm[row_index + 1]
+        bridge_entries: list[tuple[dict[str, float], dict[str, float], object, _IKCandidate, tuple[float, float], str]] = []
+        for insertion_index in range(1, insertion_count + 1):
+            ratio = insertion_index / (insertion_count + 1)
+            bridge_joints = tuple(
+                float(previous + (current - previous) * ratio)
+                for previous, current in zip(previous_candidate.joints, current_candidate.joints)
+            )
+            bridge_pose = _pose_from_joints_in_frame(
+                robot,
+                bridge_joints,
+                tool_pose=tool_pose,
+                reference_pose=reference_pose,
+            )
+            bridge_pose_row = _pose_row_from_pose_object(bridge_pose)
+            bridge_profile = (
+                float(left_profile[0] + (right_profile[0] - left_profile[0]) * ratio),
+                float(left_profile[1] + (right_profile[1] - left_profile[1]) * ratio),
+            )
+            bridge_reference_row = dict(bridge_pose_row)
+            bridge_reference_row["y_mm"] = float(bridge_reference_row["y_mm"]) - bridge_profile[0]
+            bridge_reference_row["z_mm"] = float(bridge_reference_row["z_mm"]) - bridge_profile[1]
+            bridge_candidate = _make_joint_bridge_candidate(
+                robot,
+                bridge_joints,
+                lower_limits=lower_limits_tuple,
+                upper_limits=upper_limits_tuple,
+                optimizer_settings=optimizer_settings,
+            )
+            bridge_entries.append(
+                (
+                    bridge_reference_row,
+                    bridge_pose_row,
+                    bridge_pose,
+                    bridge_candidate,
+                    bridge_profile,
+                    f"{left_label}_JBR_{insertion_index:02d}",
+                )
+            )
+
+        detour_metrics = _joint_bridge_tcp_detour_metrics(
+            search_result.pose_rows[row_index],
+            search_result.pose_rows[row_index + 1],
+            [entry[1] for entry in bridge_entries],
+        )
+        max_deviation_mm = float(
+            getattr(motion_settings, "joint_space_bridge_max_tcp_deviation_mm", 20.0)
+        )
+        max_path_ratio = float(
+            getattr(motion_settings, "joint_space_bridge_max_tcp_path_ratio", 4.0)
+        )
+        if (
+            detour_metrics["max_deviation_mm"] > max_deviation_mm + 1e-9
+            or detour_metrics["path_ratio"] > max_path_ratio + 1e-9
+        ):
+            skipped_segments.append(
+                (
+                    left_label,
+                    right_label,
+                    detour_metrics["path_ratio"],
+                    detour_metrics["max_deviation_mm"],
+                )
+            )
+            continue
+
+        for bridge_reference_row, bridge_pose_row, bridge_pose, bridge_candidate, bridge_profile, bridge_label in bridge_entries:
+            new_reference_rows.append(bridge_reference_row)
+            new_pose_rows.append(bridge_pose_row)
+            new_ik_layers.append(_IKLayer(pose=bridge_pose, candidates=(bridge_candidate,)))
+            new_selected_path.append(bridge_candidate)
+            new_profile.append(bridge_profile)
+            new_labels.append(bridge_label)
+            new_flags.append(True)
+            inserted_total += 1
+        bridged_segments.append((left_label, right_label, insertion_count))
+
+    if inserted_total <= 0:
+        if skipped_segments:
+            skipped_note = ", ".join(
+                f"{left}->{right}:ratio={ratio:.2f},dev={deviation:.1f}mm"
+                for left, right, ratio, deviation in skipped_segments[:4]
+            )
+            print(
+                "Rejected joint-space bridge repair because TCP detour is too large: "
+                f"{skipped_note}."
+            )
+        return None
+
+    (
+        config_switches,
+        bridge_like_segments,
+        worst_joint_step_deg,
+        mean_joint_step_deg,
+    ) = _summarize_selected_path(
+        tuple(new_selected_path),
+        bridge_trigger_joint_delta_deg=motion_settings.bridge_trigger_joint_delta_deg,
+    )
+    (
+        offset_step_jitter_mm,
+        offset_jerk_mm,
+        max_abs_offset_mm,
+        total_abs_offset_mm,
+    ) = _summarize_profile_metrics(tuple(new_profile))
+
+    bridged_result = _PathSearchResult(
+        reference_pose_rows=tuple(new_reference_rows),
+        pose_rows=tuple(new_pose_rows),
+        ik_layers=tuple(new_ik_layers),
+        selected_path=tuple(new_selected_path),
+        total_cost=_joint_bridge_path_cost(tuple(new_selected_path), optimizer_settings),
+        frame_a_origin_yz_profile_mm=tuple(new_profile),
+        row_labels=tuple(new_labels),
+        inserted_flags=tuple(new_flags),
+        invalid_row_count=search_result.invalid_row_count,
+        ik_empty_row_count=search_result.ik_empty_row_count,
+        config_switches=config_switches,
+        bridge_like_segments=bridge_like_segments,
+        worst_joint_step_deg=worst_joint_step_deg,
+        mean_joint_step_deg=mean_joint_step_deg,
+        offset_step_jitter_mm=offset_step_jitter_mm,
+        offset_jerk_mm=offset_jerk_mm,
+        max_abs_offset_mm=max_abs_offset_mm,
+        total_abs_offset_mm=total_abs_offset_mm,
+    )
+
+    if _path_search_sort_key(bridged_result) >= _path_search_sort_key(search_result):
+        return None
+
+    segment_note = ", ".join(
+        f"{left}->{right}:{count}" for left, right, count in bridged_segments[:6]
+    )
+    if len(bridged_segments) > 6:
+        segment_note += f", +{len(bridged_segments) - 6} more"
+    print(
+        "Accepted joint-space bridge repair: "
+        f"inserted_points={inserted_total}, "
+        f"segments=[{segment_note}], "
+        f"config_switches={bridged_result.config_switches}, "
+        f"bridge_like_segments={bridged_result.bridge_like_segments}, "
+        f"worst_joint_step={bridged_result.worst_joint_step_deg:.3f} deg."
+    )
+    return bridged_result
+
+
+def _normalize_joint_bridge_step_limits(
+    step_limits: Sequence[float],
+    *,
+    joint_count: int,
+) -> tuple[float, ...]:
+    normalized = [float(value) for value in step_limits]
+    if not normalized:
+        normalized = [20.0]
+    if len(normalized) < joint_count:
+        normalized.extend([normalized[-1]] * (joint_count - len(normalized)))
+    return tuple(max(1e-6, value) for value in normalized[:joint_count])
+
+
+def _joint_bridge_insertion_count(
+    previous_joints: Sequence[float],
+    current_joints: Sequence[float],
+    *,
+    step_limits: Sequence[float],
+) -> int:
+    required_steps = 1
+    for previous, current, limit in zip(previous_joints, current_joints, step_limits):
+        required_steps = max(required_steps, int(math.ceil(abs(current - previous) / limit)))
+    return max(0, required_steps - 1)
+
+
+def _joint_bridge_tcp_detour_metrics(
+    left_pose_row: dict[str, float],
+    right_pose_row: dict[str, float],
+    bridge_pose_rows: Sequence[dict[str, float]],
+) -> dict[str, float]:
+    points = [
+        _pose_row_translation(left_pose_row),
+        *(_pose_row_translation(row) for row in bridge_pose_rows),
+        _pose_row_translation(right_pose_row),
+    ]
+    direct_distance = _point_distance(points[0], points[-1])
+    path_distance = sum(_point_distance(first, second) for first, second in zip(points, points[1:]))
+    max_deviation = max(
+        _point_to_segment_distance(point, points[0], points[-1])
+        for point in points
+    )
+    path_ratio = path_distance / max(direct_distance, 1e-9)
+    return {
+        "direct_distance_mm": float(direct_distance),
+        "path_distance_mm": float(path_distance),
+        "path_ratio": float(path_ratio),
+        "max_deviation_mm": float(max_deviation),
+    }
+
+
+def _pose_row_translation(row: dict[str, float]) -> tuple[float, float, float]:
+    return (
+        float(row["x_mm"]),
+        float(row["y_mm"]),
+        float(row["z_mm"]),
+    )
+
+
+def _point_distance(
+    first: Sequence[float],
+    second: Sequence[float],
+) -> float:
+    return math.sqrt(
+        sum((float(current) - float(previous)) ** 2 for previous, current in zip(first, second))
+    )
+
+
+def _point_to_segment_distance(
+    point: Sequence[float],
+    segment_start: Sequence[float],
+    segment_end: Sequence[float],
+) -> float:
+    start = tuple(float(value) for value in segment_start)
+    end = tuple(float(value) for value in segment_end)
+    query = tuple(float(value) for value in point)
+    direction = tuple(end_value - start_value for start_value, end_value in zip(start, end))
+    length_sq = sum(value * value for value in direction)
+    if length_sq <= 1e-12:
+        return _point_distance(query, start)
+    ratio = sum(
+        (query_value - start_value) * direction_value
+        for query_value, start_value, direction_value in zip(query, start, direction)
+    ) / length_sq
+    ratio = max(0.0, min(1.0, ratio))
+    projection = tuple(
+        start_value + ratio * direction_value
+        for start_value, direction_value in zip(start, direction)
+    )
+    return _point_distance(query, projection)
+
+
+def _pose_from_joints_in_frame(
+    robot,
+    joints: Sequence[float],
+    *,
+    tool_pose,
+    reference_pose,
+):
+    pose_from_joints = getattr(robot, "PoseFromJointsInFrame", None)
+    if not callable(pose_from_joints):
+        raise RuntimeError("The IK backend does not expose PoseFromJointsInFrame.")
+    return pose_from_joints(tuple(float(value) for value in joints), tool_pose, reference_pose)
+
+
+def _pose_row_from_pose_object(pose) -> dict[str, float]:
+    return {
+        "x_mm": float(pose[0, 3]),
+        "y_mm": float(pose[1, 3]),
+        "z_mm": float(pose[2, 3]),
+        "r11": float(pose[0, 0]),
+        "r12": float(pose[0, 1]),
+        "r13": float(pose[0, 2]),
+        "r21": float(pose[1, 0]),
+        "r22": float(pose[1, 1]),
+        "r23": float(pose[1, 2]),
+        "r31": float(pose[2, 0]),
+        "r32": float(pose[2, 1]),
+        "r33": float(pose[2, 2]),
+    }
+
+
+def _make_joint_bridge_candidate(
+    robot,
+    joints: Sequence[float],
+    *,
+    lower_limits: Sequence[float],
+    upper_limits: Sequence[float],
+    optimizer_settings: _PathOptimizerSettings,
+) -> _IKCandidate:
+    joints_tuple = tuple(float(value) for value in joints)
+    config_flags = _config_flags_for_joints(robot, joints_tuple)
+    return _IKCandidate(
+        joints=joints_tuple,
+        config_flags=config_flags,
+        joint_limit_penalty=_joint_limit_penalty(
+            joints_tuple,
+            lower_limits,
+            upper_limits,
+            optimizer_settings,
+        ),
+        singularity_penalty=_singularity_penalty(robot, joints_tuple, optimizer_settings),
+        branch_id=None,
+    )
+
+
+def _config_flags_for_joints(robot, joints: tuple[float, ...]) -> tuple[int, ...]:
+    try:
+        config_values = robot.JointsConfig(list(joints)).list()
+    except Exception:
+        return ()
+    return tuple(int(round(value)) for value in config_values[:3])
+
+
+def _joint_bridge_path_cost(
+    selected_path: Sequence[_IKCandidate],
+    optimizer_settings: _PathOptimizerSettings,
+) -> float:
+    return float(
+        sum(
+            _candidate_transition_penalty(previous_candidate, current_candidate, optimizer_settings)
+            for previous_candidate, current_candidate in zip(selected_path, selected_path[1:])
+        )
+    )
 
 
 def _add_boundary_scan_states(
@@ -3562,6 +4111,64 @@ def _add_boundary_scan_states(
                 if abs(dy) > max_abs_offset_mm + 1e-9 or abs(dz) > max_abs_offset_mm + 1e-9:
                     break
                 probe_fn(dy, dz)
+
+
+def _select_window_state_candidates(
+    candidates: Sequence[_IKCandidate],
+) -> tuple[_IKCandidate, ...]:
+    """Keep local Y/Z DP candidate states family-diverse.
+
+    SixAxisIK can return enough candidates that a plain ``candidates[:N]`` cut
+    drops an entire wrist-flip family.  That is especially bad in the exact
+    places this repair is meant to handle, so retain a small quota per config
+    family and explicitly keep the nearest-J5 candidate in each family.
+    """
+
+    if len(candidates) <= _WINDOW_STATE_MAX_CANDIDATES_PER_OFFSET:
+        return tuple(candidates)
+
+    grouped: dict[tuple[int, ...], list[_IKCandidate]] = {}
+    for candidate in candidates:
+        grouped.setdefault(candidate.config_flags, []).append(candidate)
+
+    selected: list[_IKCandidate] = []
+    seen: set[tuple[float, ...]] = set()
+
+    def append_candidate(candidate: _IKCandidate) -> None:
+        key = tuple(round(float(value), 9) for value in candidate.joints)
+        if key in seen:
+            return
+        seen.add(key)
+        selected.append(candidate)
+
+    def quality_key(candidate: _IKCandidate) -> tuple[float, float, tuple[float, ...]]:
+        abs_j5 = abs(float(candidate.joints[4])) if len(candidate.joints) >= 5 else math.inf
+        return (
+            float(candidate.joint_limit_penalty + candidate.singularity_penalty),
+            abs_j5,
+            tuple(float(value) for value in candidate.joints),
+        )
+
+    def wrist_key(candidate: _IKCandidate) -> tuple[float, float, tuple[float, ...]]:
+        abs_j5 = abs(float(candidate.joints[4])) if len(candidate.joints) >= 5 else math.inf
+        return (
+            abs_j5,
+            float(candidate.joint_limit_penalty + candidate.singularity_penalty),
+            tuple(float(value) for value in candidate.joints),
+        )
+
+    for family in sorted(grouped):
+        family_candidates = sorted(grouped[family], key=quality_key)
+        for candidate in family_candidates[:_WINDOW_STATE_MAX_CANDIDATES_PER_FAMILY]:
+            append_candidate(candidate)
+        append_candidate(min(family_candidates, key=wrist_key))
+
+    for candidate in sorted(candidates, key=lambda item: (quality_key(item), item.config_flags)):
+        if len(selected) >= _WINDOW_STATE_MAX_CANDIDATES_PER_OFFSET:
+            break
+        append_candidate(candidate)
+
+    return tuple(selected[:_WINDOW_STATE_MAX_CANDIDATES_PER_OFFSET])
 
 
 def _solve_window_profile_dp(
@@ -3667,7 +4274,9 @@ def _solve_window_profile_dp(
         _bridge_candidate_cache.clear()
 
         def _append_state(dy_mm: float, dz_mm: float) -> None:
-            for cand in _probe_offset(dy_mm, dz_mm, reference_row)[:6]:
+            for cand in _select_window_state_candidates(
+                _probe_offset(dy_mm, dz_mm, reference_row)
+            ):
                 dk = (
                     round(dy_mm, dedup_rounding),
                     round(dz_mm, dedup_rounding),
@@ -3702,7 +4311,7 @@ def _solve_window_profile_dp(
                 a2_max_deg=a2_max_deg,
                 joint_constraint_tolerance_deg=joint_constraint_tolerance_deg,
             )
-            for candidate in candidates[:6]:
+            for candidate in _select_window_state_candidates(candidates):
                 dedup_key = (
                     round(dy_mm, dedup_rounding),
                     round(dz_mm, dedup_rounding),
@@ -3875,16 +4484,19 @@ def _collect_problem_segments(
     selected_path: Sequence[_IKCandidate],
     *,
     bridge_trigger_joint_delta_deg: float,
+    max_segments: int | None = None,
 ) -> tuple[tuple[int, bool, float, float], ...]:
     segments: list[tuple[int, bool, float, float]] = []
     for segment_index, (previous_candidate, current_candidate) in enumerate(
         zip(selected_path, selected_path[1:])
     ):
-        joint_deltas = [
-            abs(current - previous)
-            for previous, current in zip(previous_candidate.joints, current_candidate.joints)
-        ]
-        max_joint_delta = max(joint_deltas, default=0.0)
+        max_joint_delta = max(
+            (
+                abs(current - previous)
+                for previous, current in zip(previous_candidate.joints, current_candidate.joints)
+            ),
+            default=0.0,
+        )
         mean_joint_delta = _mean_abs_joint_delta(
             previous_candidate.joints,
             current_candidate.joints,
@@ -3894,18 +4506,44 @@ def _collect_problem_segments(
         # (>= _CONFIG_SWITCH_MIN_JOINT_DELTA_DEG).  Near-zero config "flips"
         # caused by a bit crossing zero (e.g. wrist flip near J5≈0°) are benign
         # and should not trigger expensive window-repair passes.
-        meaningful_config_problem = config_changed and max_joint_delta >= _CONFIG_SWITCH_MIN_JOINT_DELTA_DEG
+        benign_wrist_flip = _is_benign_wrist_singularity_config_change(
+            previous_candidate,
+            current_candidate,
+            max_joint_delta_deg=max_joint_delta,
+            bridge_trigger_joint_delta_deg=bridge_trigger_joint_delta_deg,
+        )
+        meaningful_config_problem = (
+            config_changed
+            and not benign_wrist_flip
+            and max_joint_delta >= _CONFIG_SWITCH_MIN_JOINT_DELTA_DEG
+        )
         if meaningful_config_problem or max_joint_delta > bridge_trigger_joint_delta_deg:
             segments.append((segment_index, config_changed, max_joint_delta, mean_joint_delta))
 
-    segments.sort(
-        key=lambda item: (
+    if not segments:
+        return ()
+
+    def sort_key(item: tuple[int, bool, float, float]) -> tuple[float, ...]:
+        # Keep a deterministic tie-breaker on segment index so partial selection
+        # is stable and matches full-sort behavior.
+        return (
             -int(item[1]),
             -float(item[2]),
             -float(item[3]),
+            float(item[0]),
         )
-    )
-    return tuple(segments)
+
+    if max_segments is None:
+        segments.sort(key=sort_key)
+        return tuple(segments)
+
+    limit = max(0, int(max_segments))
+    if limit <= 0:
+        return ()
+    if len(segments) <= limit:
+        segments.sort(key=sort_key)
+        return tuple(segments)
+    return tuple(heapq.nsmallest(limit, segments, key=sort_key))
 
 
 def _format_focus_segment_report(search_result: _PathSearchResult) -> str:
@@ -3943,6 +4581,7 @@ def _format_failure_diagnostics(
     problem_segments = _collect_problem_segments(
         search_result.selected_path,
         bridge_trigger_joint_delta_deg=bridge_trigger_joint_delta_deg,
+        max_segments=8,
     )
     if problem_segments:
         lines.append("Failing segments:")
