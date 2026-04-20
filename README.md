@@ -1,314 +1,359 @@
 # winding_pose_solver
 
-Pose generation, IK validation, and RoboDK program materialization for the winding task.
+`winding_pose_solver` generates winding-tool poses from centerline data,
+evaluates IK reachability, searches for a usable robot joint path, and can
+materialize the selected path as a RoboDK program.
 
-This repository supports two interchangeable IK backends:
+The project is coordinate-driven: the winding tool/work frame must visit the
+target coordinate points in order. Posture quality metrics such as config
+switches and worst joint step are diagnostics and optimization targets, not the
+root goal unless explicitly promoted to hard constraints for a run.
 
-- `robodk`: uses RoboDK as the live truth source
-- `six_axis_ik`: uses the embedded local analytic solver in `src/six_axis_ik/`
+## Current Defaults
 
-The codebase is now organized by responsibility so the runtime entrypoints, live RoboDK integration, and path-search logic are easier to maintain independently.
-
-## Current Default Setup
-
-The main run config lives at the top of `main.py`.
-
-Current important defaults:
+The top-level `main.py` is now a thin control panel. Implementation is in
+`src/runtime/main_entrypoint.py`.
 
 ```python
-TARGET_FRAME_A_ORIGIN_IN_FRAME2_MM = (1126.0, -650.0, 1130.0)
-TARGET_FRAME_A_ROTATION_IN_FRAME2_XYZ_DEG = (0, 0, -180.0)
-IK_BACKEND = "six_axis_ik"
+TARGET_FRAME_A_ORIGIN_IN_FRAME2_MM = (1126.0, -447.5, 1077.5)
+RUN_MODE = "online"
+SINGLE_ACTION = "program"
+ONLINE_ROLE = "coordinator"
+ONLINE_SERVER_DIR = "/home/tzwang/program/winding_pose_solver"
+REMOTE_SYNC_MODE = "push"  # off | guard | push
+ENABLE_TARGET_ORIGIN_YZ_SEARCH = True
 ```
 
-With this orientation and the current strict constraints (`A2_MAX_DEG = 115`), the local pipeline currently produces a valid continuous path (`config_switches=0`, `bridge_like_segments=0`).
+`main.py` is intentionally a commented control panel. Edit those top-level
+parameters first; deeper defaults and advanced tuning stay in
+`src/runtime/main_entrypoint.py` and `app_settings.py`.
 
-## Repository Layout
+Because `ENABLE_TARGET_ORIGIN_YZ_SEARCH=True`, a plain `python main.py` starts
+with origin search before any post-dispatch flow. Set it to `False` when you
+want `RUN_MODE="online"` or `RUN_MODE="single"` to run directly.
+
+Closed winding rule currently enforced by the search/import path:
+
+- Terminal I1-I5 must equal start I1-I5.
+- Terminal I6 must equal start I6 plus or minus one full turn.
+- A fake `0` degree A6 terminal closure is rejected.
+
+Official RoboDK delivery also uses the current strict motion-quality gate:
+
+- `invalid_row_count == 0`
+- `ik_empty_row_count == 0`
+- complete `selected_path`
+- closed-winding terminal rule passes when the path is closed
+- `bridge_like_segments == 0`
+- `big_circle_step_count == 0`
+- `worst_joint_step_deg <= 60`
+
+`config_switches` is reported as a diagnostic signal. It is not a standalone
+blocker because a config label can change benignly near a singularity when the
+joint and TCP motion remain continuous.
+
+## Architecture
 
 ```text
-main.py
-app_settings.py
-online_requester.py
-online_worker.py
-online_roundtrip.py
-scripts/
+main.py                         thin user control panel (compat exports)
+app_settings.py                 shared runtime tuning
+online_roundtrip.py             compatibility wrapper
+scripts/                        thin diagnostics and operation CLIs
 src/
-  core/
-  runtime/
-  robodk_runtime/
-  search/
-  six_axis_ik/
-  README.md
+  core/                         math, schemas, CSV, pose solving
+  search/                       IK candidates, DP path search, repair
+  runtime/                      orchestration, logging, origin search
+    main_entrypoint.py          canonical main-mode implementation
+    online/                     coordinator/server/receiver implementations
+  robodk_runtime/               live RoboDK import/program generation
+  six_axis_ik/                  embedded local IK/FK backend
+artifacts/                      generated runs, logs, temporary outputs
+data/                           input CSVs and small generated pose CSVs
 ```
 
-### Package responsibilities
+Keep reusable logic out of `main.py`. When adding behavior, put it in the
+owning package and keep `main.py` as a small switchboard.
 
-- `src/core/`
-  - Shared math, CSV loading, schema models, pose solving, visualization, and backend-agnostic helpers.
-- `src/runtime/`
-  - High-level local and online orchestration.
-  - Includes app flow, request building, requester-side search runner, runtime profiling, and run-log formatting helpers (`src/runtime/run_logging.py`).
-  - Includes origin sweep utilities (`src/runtime/origin_sweep.py`) used for parallel Y/Z search and adaptive iteration (`run_grid_sweep`, `run_adaptive_sweep`).
-- `src/robodk_runtime/`
-  - RoboDK-station-bound logic.
-  - Includes live evaluation against the open station and final RoboDK program creation.
-- `src/search/`
-  - Exact path search and repair pipeline.
-  - Includes IK candidate collection, DP path selection, window refinement, and inserted-transition repair.
-- `src/six_axis_ik/`
-  - Embedded local six-axis IK/FK model and analytic backend.
-  - Can run without a live RoboDK station for evaluation-only workflows.
+## Main Workflows
 
-Each package directory now also contains a short local `README.md` describing its role, which helps both humans and coding agents quickly find the right edit surface.
+### Online Coordinator
 
-### Compatibility wrappers
+Windows builds the request, sends compute to `master`, downloads the handoff,
+and optionally generates the RoboDK program locally.
 
-Older flat imports are still supported through thin wrapper files such as:
-
-- `src/app_runner.py`
-- `src/request_builder.py`
-- `src/remote_search_runner.py`
-- `src/runtime_profiler.py`
-- `src/robodk_eval_worker.py`
-- `src/robodk_program.py`
-- `src/bridge_builder.py`
-- `src/collab_models.py`
-- `src/frame_math.py`
-- `src/geometry.py`
-- `src/motion_settings.py`
-- `src/pose_csv.py`
-- `src/pose_solver.py`
-- `src/robot_interface.py`
-- `src/types.py`
-- `src/visualization.py`
-- `src/global_search.py`
-- `src/ik_collection.py`
-- `src/local_repair.py`
-- `src/path_optimizer.py`
-
-These wrappers re-export the new package contents so existing scripts do not break while the codebase transitions to the new structure.
-
-## Main Workflow
-
-For the single-machine flow, the pipeline is:
-
-1. Read `data/validation_centerline.csv`.
-2. Build each process-local frame from the centerline geometry.
-3. Solve the required tool pose in `Frame 2` for the fixed target `Frame A`.
-4. Write `data/tool_poses_frame2.csv`.
-5. Collect IK candidates with the selected backend.
-6. Run exact path search and optional local repair.
-7. Validate continuity and, if valid, create a RoboDK program.
-
-The key idea is:
-
-```text
-T_frame2_tool(i) = T_frame2_A * inverse(T_tool_proc(i))
-```
-
-So each row in the centerline defines a local process frame on the tool, and the code solves the tool pose needed to place that local frame onto the fixed target `A` in `Frame 2`.
-
-## Continuous Y/Z Optimization Workflow
-
-The path solver keeps orientation fixed and optimizes a continuous Frame-A origin Y/Z profile along the whole trajectory.
-
-- Global stage:
-  - Build IK candidates and run exact DP.
-  - Apply full-path continuous Y/Z refinement (LSQ-based) and re-evaluate with exact search.
-- Local stage:
-  - Run window repair and handover corridor refinement near problematic transitions.
-  - Keep strict hard constraints (`A1`, `A2`, joint continuity) and only accept exact improvements.
-- Optional outer search:
-  - Sweep `TARGET_FRAME_A_ORIGIN_IN_FRAME2_MM` over Y/Z with parallel workers to find a better basin, then run the exact pipeline.
-
-This means the system is not only selecting discrete IK points; it is also optimizing a trajectory-wide continuous Y/Z profile under the same strict constraints.
-
-## Entry Points
-
-### Single-machine
+If `ENABLE_TARGET_ORIGIN_YZ_SEARCH=True` in `main.py`, turn it off before a
+direct online smoke. Otherwise the entrypoint intentionally starts with origin
+search.
 
 ```powershell
-python main.py
+python main.py --mode online --online-role coordinator --run-id smoke --skip-final-generate
 ```
 
-Default `single` action is now `solve` (compute path only, no RoboDK program import).
-This mode can run with `ik_backend="six_axis_ik"` without requiring RoboDK.
+Useful defaults in `main.py`:
 
-Explicitly choose single-machine action:
+```python
+ONLINE_HOST = "master"
+ONLINE_SERVER_DIR = "/home/tzwang/program/winding_pose_solver"
+ONLINE_ENV_NAME = "winding_pose_solver"
+ONLINE_FINAL_GENERATE_PROGRAM = True
+REMOTE_SYNC_MODE = "push"  # off | guard | push
+ENFORCE_REMOTE_SYNC_GUARD = True
+```
+
+Retry budgets can also be overridden by env vars:
+`WPS_ONLINE_RETRY_CANDIDATE_LIMIT`, `WPS_ONLINE_RETRY_REPAIR_LIMIT`,
+`WPS_ONLINE_RETRY_MAX_ROUNDS`.
+
+Direct coordinator CLI also supports:
 
 ```powershell
-python main.py --mode single --single-action solve
-python main.py --mode single --single-action program
+python online_roundtrip.py run-online --remote-sync-mode push --request artifacts/online_runs/main_request.json --run-id smoke_sync --skip-final-generate
 ```
 
-Visualization only (legacy shortcut still supported):
+### Server Role Only
+
+Run pure server compute from an existing request:
 
 ```powershell
-python main.py --visualize
+python online_roundtrip.py run-server --request artifacts/online_runs/main_request.json --run-id server_smoke --allow-invalid-outputs
 ```
 
-Single-run artifacts are written under `artifacts/local_runs/<run_id>/`:
+On `master`, heavy server compute should run through Slurm. The online
+coordinator and origin-search runner already wrap remote compute with `srun`
+when Slurm is available.
 
-- `request.json`: exact evaluation request used for this run.
-- `eval_result.json`: full evaluation result payload.
-- `selected_joint_path.csv`: solved execution path (`j1..j6` joint angles + config flags).
-- `run_archive.json`: compact run archive with basic settings, status, and key metrics.
+### Receiver Role Only
 
-`run_archive.json` is written for both success and runtime failure paths.
-
-### Online requester
+Use a server handoff to import the selected path into the local RoboDK station:
 
 ```powershell
-python online_requester.py propose --request request.json --candidates candidates.json
-python online_requester.py summarize --results results.json --summary summary.json
+python online_roundtrip.py run-receiver --handoff artifacts/online_runs/<run_id>/handoff_package.json --run-id <run_id>_receiver
 ```
 
-### Online worker
+The receiver should import the selected joint path directly; it should not run
+a fresh full search just to generate the RoboDK program.
+
+### Single-Machine Solve
+
+Use this for local debugging or when RoboDK is not needed:
 
 ```powershell
-python online_worker.py eval --request request.json --result result.json
-python online_worker.py eval-batch --request candidates.json --result results.json
+python main.py --mode single --single-action solve --run-id local_smoke
 ```
 
-### Online roundtrip controller
+Use program mode only when the correct RoboDK station is open:
 
 ```powershell
-python online_roundtrip.py build-request --request artifacts/online_runs/request.json --candidate-limit 4
-python online_roundtrip.py run-round --host master --request artifacts/online_runs/request.json --run-id smoke_round1
+python main.py --mode single --single-action program --run-id local_program
 ```
 
-If the request uses `ik_backend="six_axis_ik"` and does not ask for final program generation during candidate evaluation, you can let the server run the offline IK stage itself:
+## Smart Frame-A Origin Search
+
+The project can search a Y/Z square around
+`TARGET_FRAME_A_ORIGIN_IN_FRAME2_MM` to find better global Frame-A origin
+basins.
+
+From `main.py`:
+
+```python
+ENABLE_TARGET_ORIGIN_YZ_SEARCH = True
+TARGET_ORIGIN_YZ_SEARCH_USE_SERVER = True
+TARGET_ORIGIN_YZ_SEARCH_SQUARE_SIZE_MM = 600.0
+TARGET_ORIGIN_YZ_SEARCH_INITIAL_STEP_MM = 150.0
+TARGET_ORIGIN_YZ_SEARCH_MIN_STEP_MM = 10.0
+TARGET_ORIGIN_YZ_SEARCH_MAX_ITERS = 5
+TARGET_ORIGIN_YZ_SEARCH_BEAM_WIDTH = 4
+```
+
+The top-level switch above controls whether the normal `python main.py` entry
+starts with origin search. More specialized dispatch controls, usable-count
+limits, diagonal policy, and validation-grid settings live in
+`src/runtime/main_entrypoint.py` and can also be overridden by CLI flags.
+
+Or from the CLI:
 
 ```powershell
-python online_roundtrip.py run-round --host master --request artifacts/online_runs/request.json --run-id smoke_round1 --server-eval-when-possible
+python main.py --mode origin_search --run-id origin_search_300
 ```
 
-The final RoboDK program-generation step still stays local.
+Dispatch the top usable candidates directly after origin search:
+
+```powershell
+python main.py --mode origin_search --origin-search-dispatch online_role --origin-search-post-top-n 2 --run-id origin_search_300_online
+```
+
+The CLI wrapper is:
+
+```powershell
+python scripts/sweep_target_origin_yz.py --mode smart-square --seed-origin 1126,-400,1130 --square-size-mm 300 --smart-initial-step-mm 75 --smart-min-step-mm 25 --smart-max-iters 4 --beam-width 4 --workers 8 --skip-window-repair --skip-inserted-repair
+```
+
+The `smart-square` algorithm is not an exhaustive final grid search:
+
+1. Evaluate center, edge midpoints, and corners of the square.
+2. Keep a diverse beam of promising points.
+3. Evaluate 3x3 neighborhoods around those points.
+4. Shrink step size and repeat.
+5. Optionally run a coarse validation grid with
+   `--validation-grid-step-mm`.
+
+Reusable implementation:
+
+- `src/runtime/origin_sweep.py`: search algorithms and scoring.
+- `src/runtime/origin_search_runner.py`: `main.py` local/remote launcher.
+- `scripts/sweep_target_origin_yz.py`: thin CLI.
+
+Performance note: origin sweeps reuse the parsed centerline dataset inside each
+worker process. The cached key includes CSV path, mtime, size, frame-build
+options, and terminal-append mode, so repeated Y/Z candidates do not rebuild
+the centerline frames while still invalidating when the input CSV changes.
+
+Typical output:
+
+- `artifacts/online_runs/<run_id>/origin_yz_search_results.json`
+- `artifacts/online_runs/<run_id>/origin_search_selection.json`
+- ranked candidate origins, baseline metrics, and trace metadata
 
 ## IK Backends
 
-Switch the backend in `main.py`:
+The thin `main.py` currently exposes only the parameters you most often adjust.
+Backend defaults are kept in `src/runtime/main_entrypoint.py` and
+`app_settings.py`:
 
 ```python
 IK_BACKEND = "six_axis_ik"  # or "robodk"
 ```
 
-### `robodk`
+`six_axis_ik`:
 
-- Uses RoboDK `SolveIK_All` and related live station behavior.
-- Requires RoboDK and the target station to be open.
+- Embedded local analytic/numeric backend.
+- Works on the Linux server without RoboDK.
+- Preferred for online compute and sweeps.
 
-### `six_axis_ik`
+`robodk`:
 
-- Uses the embedded local solver in `src/six_axis_ik/`.
-- Supports offline evaluation when program creation is disabled.
-- Shares the same high-level search pipeline through `src/core/robot_interface.py`.
-- In single mode, RoboDK is only required when you choose `--single-action program`
-  (or when `ik_backend="robodk"`).
+- Uses RoboDK as the live truth source.
+- Requires an open RoboDK station on Windows.
+- Keep RoboDK-specific logic in `src/robodk_runtime/`.
 
-## Diagnostics Scripts
+## Important Modules
 
-### Parallel target-origin sweep
+`src/core/`
 
-Search for feasible Y/Z target-origin basins in parallel:
+- `pose_solver.py`: centerline to tool pose generation.
+- `frame_math.py`, `geometry.py`: reusable math.
+- `collab_models.py`: request/result schemas.
+- `motion_settings.py`: shared motion settings dataclass.
 
-```powershell
-python scripts/sweep_target_origin_yz.py --mode grid --x 1126 --y-values=-700,-650,-600 --z-values=1130,1180 --workers 4 --strategy exact_profile --skip-inserted-repair
+`src/search/`
+
+- `ik_collection.py`: IK candidate collection.
+- `path_optimizer.py`: DP path selection, continuity costs, closed terminal
+  full-turn rule.
+- `local_repair.py`: local Y/Z and inserted-transition repair.
+- `global_search.py`: high-level exact profile evaluation.
+
+`src/runtime/`
+
+- `app.py`: high-level local app flow.
+- `request_builder.py`: request construction.
+- `remote_search.py`: candidate proposal for online runs.
+- `local_retry.py`: profile retry/repair orchestration.
+- `origin_sweep.py`: grid, adaptive, candidate, and smart-square origin search.
+- `origin_search_runner.py`: `main.py` origin-search launcher.
+- `run_logging.py`: run logs and console tee.
+- `delivery.py`: target-reachability delivery gate helpers.
+
+`src/robodk_runtime/`
+
+- `eval_worker.py`: evaluation worker context.
+- `result_import.py`: direct handoff import into RoboDK.
+- `program.py`: RoboDK target/program materialization.
+
+## Artifacts
+
+Common run outputs:
+
+```text
+artifacts/local_runs/<run_id>/request.json
+artifacts/local_runs/<run_id>/eval_result.json
+artifacts/local_runs/<run_id>/selected_joint_path.csv
+artifacts/local_runs/<run_id>/run_archive.json
+artifacts/online_runs/<run_id>/request.json
+artifacts/online_runs/<run_id>/results.json
+artifacts/online_runs/<run_id>/handoff_package.json
+artifacts/online_runs/<run_id>/origin_yz_search_results.json
+artifacts/run_logs/
+artifacts/tmp/
 ```
 
-Adaptive iteration around a seed point:
+Generated artifacts are diagnostic data. Do not commit large run outputs unless
+there is a specific reason.
 
-```powershell
-python scripts/sweep_target_origin_yz.py --mode adaptive --x 1126 --start-y -650 --start-z 1130 --step-y 20 --step-z 20 --max-iters 6 --workers 4 --strategy full_search
+## Remote Sync
+
+Canonical server checkout:
+
+```text
+master:/home/tzwang/program/winding_pose_solver
 ```
 
-The script writes ranked JSON results under `artifacts/tmp/` and is built on `src/runtime/origin_sweep.py` so the algorithm can be reused in tests and future optimization modules.
+The old path below is retired:
 
-Recent refactor notes for this sweep path:
-
-- `scripts/sweep_target_origin_yz.py` is now a thin CLI wrapper.
-- Core search logic lives in `src/runtime/origin_sweep.py`, which is easier to import directly in tests.
-- Parallel case execution now runs in worker batches and reuses per-process offline IK context to reduce process overhead without changing exact scoring/constraints.
-
-### Backend parity
-
-Compare solvability row by row:
-
-```powershell
-python scripts/compare_ik_backends.py
+```text
+/home/tzwang/apps/winding_pose_solver
 ```
 
-Current result with the default orientation above:
-
-- `SixAxisIK`: `496/496`
-- `RoboDK`: `496/496`
-- backend disagreement rows: `0`
-
-### Focused window diagnosis
-
-Inspect a local row window:
+Preferred compare/sync wrapper:
 
 ```powershell
-python scripts/diagnose_ik_window.py --start 395 --end 406 --padding 4
+& "$env:USERPROFILE\.codex\skills\winding-master-sync\scripts\Sync-WindingMaster.ps1" -Mode Compare
+& "$env:USERPROFILE\.codex\skills\winding-master-sync\scripts\Sync-WindingMaster.ps1" -Mode Push
 ```
 
-This writes a CSV report under:
+Built-in online coordinator preflight modes:
 
-- `artifacts/diagnostics/`
+- `off`: skip preflight sync checks.
+- `guard`: hash-check key files and fail-fast if local/remote differ.
+- `push`: upload local source tree first, then run the hash guard.
 
-### Import a diagnostic window into RoboDK
+When syncing manually, back up remote files before overwriting them and avoid
+deleting local-only or remote-only work unless explicitly requested.
 
-```powershell
-python scripts/import_ik_window_to_robodk.py --start 395 --end 406 --padding 4
-```
+## Validation
 
-This creates diagnostic targets in the live RoboDK station so you can inspect the neighborhood visually.
-
-## Dependencies
-
-The dependency files are split by runtime role:
-
-- `requirements.shared.txt`
-- `requirements.server.txt`
-- `requirements.local-worker.txt`
-- `environment.server.yml`
-- `environment.local-worker.yml`
-
-Use the local-worker environment when running RoboDK-related flows.
-The shared dependency set now includes `scipy`, which is required by the embedded `six_axis_ik` backend.
-
-## RoboDK Assumptions
-
-The live station is expected to contain at least:
-
-- robot: `KUKA`
-- frame: `Frame 2`
-
-When `six_axis_ik` is used together with a live RoboDK station, the worker now checks whether the live Tool and Frame calibration match the embedded `six_axis_ik` configuration and prints a warning if they diverge.
-
-## Recommended Edit Zones
-
-When you want to change behavior, the most useful files are:
-
-- Project run config: `main.py`
-- Default settings and tuning: `app_settings.py`
-- Shared math / schemas / pose generation: `src/core/`
-- Live evaluation and final validation: `src/robodk_runtime/eval_worker.py`
-- Program creation in RoboDK: `src/robodk_runtime/program.py`
-- Exact path search and repair: `src/search/`
-- Local analytic IK model: `src/six_axis_ik/`
-
-## Smoke Checks After Refactors
-
-These commands are a good minimum regression set:
+Lightweight checks:
 
 ```powershell
+python -m py_compile main.py online_roundtrip.py src/runtime/origin_sweep.py src/runtime/origin_search_runner.py scripts/sweep_target_origin_yz.py
 python main.py --help
-python online_requester.py --help
-python online_worker.py --help
-python scripts/sweep_target_origin_yz.py --mode grid --x 1126 --y-values=-650 --z-values=1130 --workers 1 --strategy exact_profile --skip-inserted-repair
-python scripts/compare_ik_backends.py
-python scripts/diagnose_ik_window.py --start 395 --end 406 --padding 4
+python scripts/sweep_target_origin_yz.py --help
 ```
 
-If you change the target orientation, tool calibration, or frame calibration, rerun the backend comparison and the focused diagnostic window before trusting the new path results.
+Online smoke without RoboDK finalization:
+
+```powershell
+python main.py --mode online --online-role coordinator --run-id smoke --skip-final-generate
+```
+
+Origin-search smoke:
+
+```powershell
+python scripts/sweep_target_origin_yz.py --mode smart-square --seed-origin 1126,-400,1130 --square-size-mm 300 --smart-max-iters 1 --workers 1 --skip-window-repair --skip-inserted-repair
+```
+
+Remote compile:
+
+```powershell
+ssh master "cd /home/tzwang/program/winding_pose_solver && conda run -n winding_pose_solver python -m py_compile main.py src/runtime/origin_sweep.py src/runtime/origin_search_runner.py scripts/sweep_target_origin_yz.py"
+```
+
+For heavy server sweeps or repair experiments, use Slurm on `master`.
+
+## Current Optimization Notes
+
+Recent 300x300 smart-square search around `(1126, -400, 1130)` found better
+global seeds, but did not eliminate all bridge/config warnings by origin alone.
+The next practical optimization layer is focused local repair around the
+remaining large wrist/config transitions, using the smart-square candidates as
+seed origins.

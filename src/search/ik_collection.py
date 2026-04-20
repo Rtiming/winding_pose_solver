@@ -219,7 +219,19 @@ def _collect_ik_candidates(
     candidates: list[_IKCandidate] = []
     seen: set[tuple[float, ...]] = set()
 
-    all_solutions = robot.SolveIK_All(pose, tool_pose, reference_pose)
+    solve_all_filtered = getattr(robot, "SolveIK_AllFiltered", None)
+    if callable(solve_all_filtered):
+        all_solutions = solve_all_filtered(
+            pose,
+            tool_pose,
+            reference_pose,
+            a1_lower_deg=a1_lower_deg,
+            a1_upper_deg=a1_upper_deg,
+            a2_max_deg=a2_max_deg,
+            tolerance_deg=joint_constraint_tolerance_deg,
+        )
+    else:
+        all_solutions = robot.SolveIK_All(pose, tool_pose, reference_pose)
     for raw_solution in all_solutions:
         _append_candidate_if_unique(
             candidates,
@@ -261,6 +273,31 @@ def _collect_ik_candidates(
             candidate.joints,
         )
     )
+
+    # Keep enough candidates for fixed-point fallback to explore alternate
+    # branches, while still bounding the O(N*K^2) DP cost.
+    max_candidates_per_config_family = max(
+        1,
+        int(getattr(optimizer_settings, "ik_max_candidates_per_config_family", 4)),
+    )
+    if len(candidates) > max_candidates_per_config_family * 2:
+        from itertools import groupby
+        filtered: list[_IKCandidate] = []
+        for flags, group in groupby(candidates, key=lambda c: c.config_flags):
+            family = sorted(
+                group,
+                key=lambda c: c.joint_limit_penalty + c.singularity_penalty,
+            )
+            filtered.extend(family[:max_candidates_per_config_family])
+        candidates = filtered
+        candidates.sort(
+            key=lambda candidate: (
+                candidate.config_flags,
+                candidate.joint_limit_penalty + candidate.singularity_penalty,
+                candidate.joints,
+            )
+        )
+
     cached_result = tuple(candidates)
     if len(_IK_CANDIDATE_CACHE) >= _IK_CANDIDATE_CACHE_MAX_SIZE:
         _IK_CANDIDATE_CACHE.pop(next(iter(_IK_CANDIDATE_CACHE)))

@@ -24,8 +24,8 @@ class _PathOptimizerSettings:
     wrist_flip_sign_penalty: float = 100.0
     joint6_spin_threshold_deg: float = 120.0
     joint6_spin_penalty_per_deg: float = 1.5
-    large_jump_threshold_deg: float = 35.0
-    large_jump_penalty_weight: float = 0.3
+    large_jump_threshold_deg: float = 20.0
+    large_jump_penalty_weight: float = 5.0
 
     # 逼近关节限位时的惩罚。
     joint_limit_margin_ratio: float = 0.10
@@ -43,20 +43,22 @@ class _PathOptimizerSettings:
 
     # 点与点之间的连续性硬约束。
     enable_joint_continuity_constraint: bool = True
-    max_joint_step_deg: tuple[float, ...] = (5.0, 5.0, 5.0, 60.0, 45.0, 90.0)
+    max_joint_step_deg: tuple[float, ...] = (5.0, 5.0, 5.0, 45.0, 30.0, 45.0)
+    ik_max_candidates_per_config_family: int = 4
+    use_guided_config_path: bool = True
 
     # 第一个点与机器人当前姿态的关系只作为轻量参考，避免当前站点姿态把整条路径"带歪"。
     start_transition_weight: float = 0.20
 
     # 候选点自身的"近限位 / 近奇异"代价仍保留，但只占一部分权重，
     # 以免局部节点惩罚过大，反而逼着 DP 提前离开整条更平顺的位形走廊。
-    node_penalty_scale: float = 0.22
+    node_penalty_scale: float = 0.15
 
     # "优选连续性"不是硬约束，而是用来识别整条路径中那些能长距离维持同一位形族的候选走廊。
     preferred_joint_step_deg: tuple[float, ...] = (5.0, 5.0, 5.0, 25.0, 25.0, 25.0)
-    preferred_transition_bonus: float = 12.0
-    same_config_stay_bonus: float = 8.0
-    corridor_bonus_per_step: float = 3.0
+    preferred_transition_bonus: float = 30.0
+    same_config_stay_bonus: float = 40.0
+    corridor_bonus_per_step: float = 10.0
     corridor_bonus_cap: float = 20.0
 
     # 先在 config_flags 层面做一遍"位形族路径规划"时使用的切换惩罚。
@@ -69,6 +71,16 @@ class _PathOptimizerSettings:
     # 尽量不要在腕奇异附近把姿态突变甩给 A6。
     wrist_phase_lock_threshold_deg: float = 12.0
     wrist_phase_lock_penalty_per_deg: float = 6.0
+
+    # Hard rule for closed winding paths: terminal I1-I5 must match the start
+    # and I6 must differ by this many full turns.  Config changes remain a
+    # continuity cost/diagnostic unless explicitly locked by settings.
+    closed_path_joint6_turns: int = 1
+    closed_path_joint6_turn_tolerance_deg: float = 1e-3
+    closed_path_single_config: bool = False
+    closed_path_locked_config_indices: tuple[int, ...] = ()
+    closed_path_joint6_direction_sample_count: int = 40
+    closed_path_joint6_direction_min_delta_deg: float = 1.0
 
 
 @dataclass(frozen=True)

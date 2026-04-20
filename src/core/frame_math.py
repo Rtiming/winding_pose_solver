@@ -119,6 +119,7 @@ def build_frame_records(
 
     # previous_valid_record 用来保证相邻有效行的方向尽量连续。
     previous_valid_record: FrameRecord | None = None
+    has_side_columns = all(column in frame.columns for column in SIDE_COLUMNS)
 
     for source_row, (_, row) in enumerate(frame.iterrows()):
         # row_id 优先取 CSV 中的 index 列；没有时退回到行号。
@@ -128,9 +129,7 @@ def build_frame_records(
         center = _vector_from_row(row, CENTER_COLUMNS)
         raw_tangent = _vector_from_row(row, TANGENT_COLUMNS)
         raw_normal = _vector_from_row(row, NORMAL_COLUMNS)
-        raw_side = _vector_from_row(row, SIDE_COLUMNS) if all(
-            column in frame.columns for column in SIDE_COLUMNS
-        ) else None
+        raw_side = _vector_from_row(row, SIDE_COLUMNS) if has_side_columns else None
 
         record = FrameRecord(
             source_row=source_row,

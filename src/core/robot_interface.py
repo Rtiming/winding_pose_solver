@@ -57,11 +57,17 @@ class RoboDKRobotInterface:
     def SolveIK(self, pose: Any, seed: list[float], tool_pose: Any, reference_pose: Any) -> Any:
         return self._robot.SolveIK(pose, seed, tool_pose, reference_pose)
 
+    def SolveIKSeeded(self, pose: Any, seed: list[float], tool_pose: Any, reference_pose: Any) -> Any:
+        return self._robot.SolveIK(pose, seed, tool_pose, reference_pose)
+
     def JointsConfig(self, joints_list: list[float]) -> Any:
         return self._robot.JointsConfig(joints_list)
 
     def JointPoses(self, joints_list: list[float]) -> list:
         return self._robot.JointPoses(joints_list)
+
+    def PoseFromJointsInFrame(self, joints_list: Sequence[float], tool_pose: Any, reference_pose: Any) -> Any:
+        return self._robot.SolveFK(list(joints_list), tool=tool_pose, reference=reference_pose)
 
 
 class SixAxisIKRobotInterface:
@@ -108,7 +114,7 @@ class SixAxisIKRobotInterface:
             return (id(pose),)
 
     def SolveIK_All(self, pose: Any, tool_pose: Any, reference_pose: Any) -> list[list[float]]:
-        self._cached_pose_key = self._pose_cache_key(pose)
+        self._cached_pose_key = ("all", self._pose_cache_key(pose))
         result = self._solver.solve_ik_all_joint_records(
             pose,
             target_space="frame",
@@ -122,8 +128,46 @@ class SixAxisIKRobotInterface:
         self._cached_all_solutions = [solution.joints_deg.tolist() for solution in result]
         return list(self._cached_all_solutions)
 
+    def SolveIK_AllFiltered(
+        self,
+        pose: Any,
+        tool_pose: Any,
+        reference_pose: Any,
+        *,
+        a1_lower_deg: float,
+        a1_upper_deg: float,
+        a2_max_deg: float,
+        tolerance_deg: float,
+    ) -> list[list[float]]:
+        filter_lower = [float(value) for value in self._model.joint_min_deg]
+        filter_upper = [float(value) for value in self._model.joint_max_deg]
+        if len(filter_lower) >= 1 and len(filter_upper) >= 1:
+            filter_lower[0] = max(filter_lower[0], float(a1_lower_deg) - float(tolerance_deg))
+            filter_upper[0] = min(filter_upper[0], float(a1_upper_deg) + float(tolerance_deg))
+        if len(filter_upper) >= 2:
+            filter_upper[1] = min(filter_upper[1], float(a2_max_deg) + float(tolerance_deg))
+
+        cache_filter_key = (
+            tuple(round(value, 9) for value in filter_lower),
+            tuple(round(value, 9) for value in filter_upper),
+        )
+        self._cached_pose_key = ("filtered", self._pose_cache_key(pose), cache_filter_key)
+        result = self._solver.solve_ik_all_joint_records(
+            pose,
+            target_space="frame",
+            tool_pose=tool_pose,
+            reference_pose=reference_pose,
+            filter_lower_deg=filter_lower,
+            filter_upper_deg=filter_upper,
+        )
+        self._cached_branch_ids = {
+            tuple(float(value) for value in solution.joints_deg.tolist()): solution.branch_id
+            for solution in result
+        }
+        self._cached_all_solutions = [solution.joints_deg.tolist() for solution in result]
+        return list(self._cached_all_solutions)
     def SolveIK(self, pose: Any, seed: list[float], tool_pose: Any, reference_pose: Any) -> list[float]:
-        key = self._pose_cache_key(pose)
+        key = ("all", self._pose_cache_key(pose))
         if key == self._cached_pose_key:
             if not self._cached_all_solutions:
                 return []
@@ -144,6 +188,18 @@ class SixAxisIKRobotInterface:
             return result.preferred_solution.joints_deg.tolist()
         return []
 
+    def SolveIKSeeded(self, pose: Any, seed: list[float], tool_pose: Any, reference_pose: Any) -> list[float]:
+        result = self._solver.solve_ik(
+            pose,
+            target_space="frame",
+            seed_joints_deg=seed,
+            tool_pose=tool_pose,
+            reference_pose=reference_pose,
+        )
+        if result.success and result.preferred_solution is not None:
+            return result.preferred_solution.joints_deg.tolist()
+        return []
+
     def JointsConfig(self, joints_list: list[float]) -> _ListWrapper:
         return _ListWrapper(list(self.JointGeometryMetrics(joints_list).config_flags))
 
@@ -153,6 +209,12 @@ class SixAxisIKRobotInterface:
 
     def JointPoses(self, joints_list: list[float]) -> list:
         return _compute_link_poses(joints_list, self._model)
+
+    def PoseFromJointsInFrame(self, joints_list: Sequence[float], tool_pose: Any, reference_pose: Any):
+        from src.core.simple_mat import SimpleMat
+
+        pose = self._model.fk_tcp_in_frame(joints_list)
+        return SimpleMat(pose.tolist())
 
     def JointGeometryMetrics(
         self,

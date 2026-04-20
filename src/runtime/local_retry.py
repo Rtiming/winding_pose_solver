@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from time import perf_counter
 from typing import Any
@@ -44,13 +45,27 @@ def _result_sort_key(result: ProfileEvaluationResult) -> tuple[float, ...]:
     return (
         float(result.invalid_row_count),
         float(result.ik_empty_row_count),
-        float(result.config_switches),
         float(result.bridge_like_segments),
+        float(getattr(result, "big_circle_step_count", 0)),
         float(result.worst_joint_step_deg),
         float(result.mean_joint_step_deg),
+        float(result.config_switches),
         float(result.total_cost),
         float(result.timing_seconds),
     )
+
+
+def _positive_int_from_env(name: str) -> int | None:
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        return None
+    try:
+        parsed_value = int(raw_value)
+    except ValueError:
+        return None
+    if parsed_value <= 0:
+        return None
+    return parsed_value
 
 
 def _force_single_process_request(
@@ -59,6 +74,16 @@ def _force_single_process_request(
     motion_settings = dict(request.motion_settings)
     motion_settings["local_parallel_workers"] = 1
     motion_settings["local_parallel_min_batch_size"] = 999999
+    metadata = dict(request.metadata)
+    profile_worker_override = _positive_int_from_env("WPS_SERVER_PROFILE_WORKERS")
+    if profile_worker_override is not None:
+        min_batch_override = _positive_int_from_env("WPS_SERVER_PROFILE_MIN_BATCH_SIZE") or 4
+        motion_settings["local_parallel_workers"] = profile_worker_override
+        motion_settings["local_parallel_min_batch_size"] = min_batch_override
+        metadata["server_repair_parallel"] = {
+            "local_parallel_workers": profile_worker_override,
+            "local_parallel_min_batch_size": min_batch_override,
+        }
     return ProfileEvaluationRequest(
         request_id=request.request_id,
         robot_name=request.robot_name,
@@ -79,7 +104,7 @@ def _force_single_process_request(
         create_program=request.create_program,
         program_name=request.program_name,
         optimized_csv_path=request.optimized_csv_path,
-        metadata=dict(request.metadata),
+        metadata=metadata,
     )
 
 
@@ -112,7 +137,7 @@ def _build_repair_request(
         start_joints=base_request.start_joints,
         run_window_repair=True,
         run_inserted_repair=True,
-        include_pose_rows_in_result=False,
+        include_pose_rows_in_result=True,
         create_program=False,
         program_name=base_request.program_name,
         optimized_csv_path=base_request.optimized_csv_path,
@@ -130,6 +155,8 @@ def _top_result_summary(
         "ik_empty_row_count": int(result.ik_empty_row_count),
         "config_switches": int(result.config_switches),
         "bridge_like_segments": int(result.bridge_like_segments),
+        "big_circle_step_count": int(getattr(result, "big_circle_step_count", 0)),
+        "branch_flip_ratio": float(getattr(result, "branch_flip_ratio", 0.0)),
         "worst_joint_step_deg": float(result.worst_joint_step_deg),
         "mean_joint_step_deg": float(result.mean_joint_step_deg),
         "total_cost": float(result.total_cost),
@@ -235,8 +262,9 @@ def _round_progress_sort_key(
     return (
         float(unresolved_focus_count),
         *(float(value) for value in focus_metrics),
-        float(result.config_switches),
         float(result.bridge_like_segments),
+        float(getattr(result, "big_circle_step_count", 0)),
+        float(result.config_switches),
         *_result_sort_key(result),
     )
 
@@ -277,7 +305,17 @@ def _evaluate_exact_candidates_with_reuse(
         robot_name=base_request.robot_name,
         frame_name=base_request.frame_name,
     )
-    resources = _prepare_evaluation_resources(base_request, context)
+    resource_cache: dict[tuple[tuple[str, str], ...], Any] = {}
+
+    def _resources_for(request: ProfileEvaluationRequest):
+        settings_key = tuple(
+            sorted((str(key), repr(value)) for key, value in dict(request.motion_settings).items())
+        )
+        cached_resources = resource_cache.get(settings_key)
+        if cached_resources is None:
+            cached_resources = _prepare_evaluation_resources(request, context)
+            resource_cache[settings_key] = cached_resources
+        return cached_resources
 
     ordered_pairs: list[tuple[ProfileEvaluationResult, Any] | None] = [None for _ in requests]
     for request_index, request in enumerate(requests):
@@ -294,6 +332,7 @@ def _evaluate_exact_candidates_with_reuse(
             cache_metrics["exact_misses"] = cache_metrics.get("exact_misses", 0) + 1
         reset_runtime_profile()
         started = perf_counter()
+        resources = _resources_for(request)
         search_result = _evaluate_exact_profile_search(
             request,
             context,
@@ -328,7 +367,17 @@ def _evaluate_repair_requests_from_exact_results(
         robot_name=base_request.robot_name,
         frame_name=base_request.frame_name,
     )
-    resources = _prepare_evaluation_resources(base_request, context)
+    resource_cache: dict[tuple[tuple[str, str], ...], Any] = {}
+
+    def _resources_for(request: ProfileEvaluationRequest):
+        settings_key = tuple(
+            sorted((str(key), repr(value)) for key, value in dict(request.motion_settings).items())
+        )
+        cached_resources = resource_cache.get(settings_key)
+        if cached_resources is None:
+            cached_resources = _prepare_evaluation_resources(request, context)
+            resource_cache[settings_key] = cached_resources
+        return cached_resources
 
     ordered_pairs: list[tuple[ProfileEvaluationResult, Any] | None] = [None for _ in requests]
     for request_index, request in enumerate(requests):
@@ -355,7 +404,8 @@ def _evaluate_repair_requests_from_exact_results(
             cache_metrics["repair_misses"] = cache_metrics.get("repair_misses", 0) + 1
         reset_runtime_profile()
         started = perf_counter()
-        repaired_search_result = _apply_optional_repairs(
+        resources = _resources_for(request)
+        repaired_search_result, repair_metadata = _apply_optional_repairs(
             request,
             context,
             resources,
@@ -367,6 +417,7 @@ def _evaluate_repair_requests_from_exact_results(
             resources=resources,
             search_result=repaired_search_result,
             elapsed_seconds=perf_counter() - started,
+            repair_metadata=repair_metadata,
         )
         result_cache[profile_key] = repaired_result
         search_cache[profile_key] = repaired_search_result
@@ -420,6 +471,7 @@ def run_local_profile_retry(
     max_rounds: int,
     baseline_search_result=None,
 ) -> LocalProfileRetryOutcome:
+    retry_started = perf_counter()
     if baseline_result.status == "valid" and not result_has_continuity_warnings(baseline_result):
         return LocalProfileRetryOutcome(
             best_result=baseline_result,
@@ -450,7 +502,10 @@ def run_local_profile_retry(
         "fallback_misses": 0,
     }
 
-    for round_index in range(1, max(1, int(max_rounds)) + 1):
+    retry_round_count = max(0, int(max_rounds))
+    repair_retry_budget = max(0, int(repair_retry_limit))
+    for round_index in range(1, retry_round_count + 1):
+        round_started = perf_counter()
         focus_segments = _focus_segment_indices(working_baseline)
         remote_request = build_remote_search_request(
             base_request,
@@ -463,7 +518,9 @@ def run_local_profile_retry(
                 "prefer_local_candidates": True,
             },
         )
+        candidate_proposal_started = perf_counter()
         candidate_batch = propose_candidates(remote_request)
+        candidate_proposal_seconds = perf_counter() - candidate_proposal_started
         if not candidate_batch.evaluations:
             break
 
@@ -472,6 +529,7 @@ def run_local_profile_retry(
             for request in candidate_batch.evaluations
         )
 
+        candidate_eval_started = perf_counter()
         candidate_pairs_with_search: tuple[tuple[ProfileEvaluationResult, Any], ...] = ()
         if _can_use_internal_exact_retry(base_request, working_baseline_search_result):
             candidate_pairs_with_search = _evaluate_exact_candidates_with_reuse(
@@ -497,6 +555,7 @@ def run_local_profile_retry(
                 cache_metrics=cache_metrics,
             )
             candidate_search_by_request_id = {}
+        candidate_eval_seconds = perf_counter() - candidate_eval_started
 
         candidate_pairs = sorted(
             zip(prepared_requests, evaluated_candidate_results),
@@ -525,13 +584,14 @@ def run_local_profile_retry(
         repair_requests: tuple[ProfileEvaluationRequest, ...] = ()
         if (
             result_has_continuity_warnings(best_focus_result)
+            and repair_retry_budget > 0
             and not _focus_segments_resolved(
                 best_focus_result,
                 focus_segments=focus_segments,
             )
         ):
             selected_repair_pairs = tuple(
-                repair_candidate_pairs[: max(1, int(repair_retry_limit))]
+                repair_candidate_pairs[:repair_retry_budget]
             )
             round_summary["selected_repair_sources"] = [
                 {
@@ -565,7 +625,9 @@ def run_local_profile_retry(
         best_repair_result = None
         best_repair_request_id = None
         repair_search_by_request_id: dict[str, Any] = {}
+        repair_eval_seconds = 0.0
         if repair_requests:
+            repair_eval_started = perf_counter()
             if _can_use_internal_exact_retry(base_request, working_baseline_search_result):
                 repair_pairs_with_search = _evaluate_repair_requests_from_exact_results(
                     repair_requests,
@@ -600,6 +662,7 @@ def run_local_profile_retry(
                 round_summary["best_repair_candidate_request"] = _request_summary(
                     best_repair_request_id
                 )
+            repair_eval_seconds = perf_counter() - repair_eval_started
 
         current_candidates_by_request_id: dict[str, tuple[ProfileEvaluationResult, Any]] = {
             str(working_baseline.request_id): (
@@ -631,6 +694,12 @@ def run_local_profile_retry(
         )
         round_summary["round_best"] = _top_result_summary(current_round_best_result)
         round_summary["round_cache_metrics"] = dict(cache_metrics)
+        round_summary["timing_seconds"] = {
+            "candidate_proposal": candidate_proposal_seconds,
+            "candidate_eval": candidate_eval_seconds,
+            "repair_eval": repair_eval_seconds,
+            "round_total": perf_counter() - round_started,
+        }
         rounds_payload.append(round_summary)
 
         if _round_progress_sort_key(
@@ -659,6 +728,9 @@ def run_local_profile_retry(
             "initial_result": _top_result_summary(baseline_result),
             "best_result": _top_result_summary(best_result),
             "rounds": rounds_payload,
+            "timing_seconds": {
+                "retry_total": perf_counter() - retry_started,
+            },
             "cache_metrics": dict(cache_metrics),
             "cache_sizes": {
                 "exact_result_cache": len(exact_result_cache),

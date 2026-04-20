@@ -99,12 +99,9 @@ class AnalyticSeedGenerator:
                 if full_joint_seed is not None:
                     full_joint_seeds.append(full_joint_seed)
 
-        arm_candidates = self._sort_arm_candidates(
-            self._deduplicate_arm_candidates(arm_candidates, periodic_dedup_tolerance_deg),
-            preferred_seed,
-        )
+        arm_candidates = self._sort_arm_candidates(arm_candidates, preferred_seed)
         full_joint_seeds = self._sort_full_joint_seeds(
-            self._deduplicate_full_joint_seeds(full_joint_seeds, periodic_dedup_tolerance_deg),
+            self._deduplicate_periodic_joint_seeds(full_joint_seeds, periodic_dedup_tolerance_deg),
             preferred_seed,
             target_flange_base_T=target_flange_base_T,
         )
@@ -297,7 +294,8 @@ class AnalyticSeedGenerator:
                 solved_wrist_center = self.robot_model.fk_wrist_center_in_robot_base(
                     np.r_[candidate, np.zeros(3, dtype=float)]
                 )
-                if np.linalg.norm(solved_wrist_center - target_wrist_center_mm) > 1e-5:
+                wrist_center_error_mm = solved_wrist_center - target_wrist_center_mm
+                if float(wrist_center_error_mm @ wrist_center_error_mm) > 1e-10:
                     continue
                 arm_candidates.append(candidate)
 
@@ -492,6 +490,23 @@ class AnalyticSeedGenerator:
             unique_seeds.append(candidate_vector)
         return unique_seeds
 
+    def _deduplicate_periodic_joint_seeds(
+        self,
+        joint_seeds_deg: Sequence[Sequence[float]],
+        periodic_dedup_tolerance_deg: float,
+    ) -> List[np.ndarray]:
+        """对已经规范化过的完整 joint seeds 做周期去重。"""
+        unique_seeds: List[np.ndarray] = []
+        for candidate in joint_seeds_deg:
+            candidate_vector = as_joint_vector(candidate, "candidate")
+            if any(
+                joint_distance_deg(candidate_vector, saved) <= periodic_dedup_tolerance_deg
+                for saved in unique_seeds
+            ):
+                continue
+            unique_seeds.append(candidate_vector.copy())
+        return unique_seeds
+
     def _sort_arm_candidates(
         self,
         arm_candidates: Sequence[np.ndarray],
@@ -538,6 +553,9 @@ class AnalyticSeedGenerator:
         target_flange_base_T: np.ndarray,
     ) -> List[np.ndarray]:
         """按 seed 距离或字典序排序完整 6 轴 seeds。"""
+        if preferred_seed_joints_deg is None:
+            return sorted(joint_seeds, key=lambda candidate: tuple(np.round(candidate, 9).tolist()))
+
         def seed_quality(candidate: np.ndarray) -> tuple[float, float]:
             solved_flange_base_T = self.robot_model.fk_flange(candidate)
             position_error_mm = float(
@@ -546,14 +564,6 @@ class AnalyticSeedGenerator:
             orientation_error = float(rotation_error_deg(solved_flange_base_T, target_flange_base_T))
             return position_error_mm, orientation_error
 
-        if preferred_seed_joints_deg is None:
-            return sorted(
-                joint_seeds,
-                key=lambda candidate: (
-                    seed_quality(candidate),
-                    tuple(np.round(candidate, 9).tolist()),
-                ),
-            )
         return sorted(
             joint_seeds,
             key=lambda candidate: (

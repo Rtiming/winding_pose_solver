@@ -3,6 +3,7 @@
 ## Cross-Agent Workflow Preferences
 
 - The user generally prefers autonomous internal iteration for non-trivial coding tasks.
+- Canonical server path is `/home/tzwang/program/winding_pose_solver`; do not use the retired `/home/tzwang/apps/winding_pose_solver` copy.
 - Default loop: understand and scope, implement a first pass, self-review the diff, run the smallest relevant validation, fix issues found, and do one more cleanup or refinement pass if it is likely to improve the result.
 - Do not stop after a merely plausible first draft if another cheap pass would materially improve correctness, maintainability, or clarity.
 - Ask the user for input only when there is a real requirement gap, an important tradeoff, or an external blocker.

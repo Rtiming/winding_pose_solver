@@ -20,10 +20,11 @@ def _result_sort_key(result: ProfileEvaluationResult) -> tuple[float, ...]:
     return (
         float(result.invalid_row_count),
         float(result.ik_empty_row_count),
-        float(result.config_switches),
         float(result.bridge_like_segments),
+        float(getattr(result, "big_circle_step_count", 0)),
         float(result.worst_joint_step_deg),
         float(result.mean_joint_step_deg),
+        float(result.config_switches),
         float(result.total_cost),
         float(result.timing_seconds),
     )
@@ -527,8 +528,9 @@ def summarize_results(results: Iterable[ProfileEvaluationResult]) -> RemoteSearc
         and bool(best_result.selected_path)
     )
     if target_reachable and (
-        int(best_result.config_switches) > 0
-        or int(best_result.bridge_like_segments) > 0
+        int(best_result.bridge_like_segments) > 0
+        or int(getattr(best_result, "big_circle_step_count", 0)) > 0
+        or int(best_result.config_switches) > 0
         or best_result.failing_segments
     ):
         conclusion = (
@@ -536,6 +538,7 @@ def summarize_results(results: Iterable[ProfileEvaluationResult]) -> RemoteSearc
             f"{best_result.request_id} "
             f"(config_switches={best_result.config_switches}, "
             f"bridge_like_segments={best_result.bridge_like_segments}, "
+            f"big_circle_step_count={int(getattr(best_result, 'big_circle_step_count', 0))}, "
             f"worst_joint_step={best_result.worst_joint_step_deg:.3f} deg)."
         )
     elif target_reachable:
@@ -548,7 +551,8 @@ def summarize_results(results: Iterable[ProfileEvaluationResult]) -> RemoteSearc
             f"No target-reachable candidate yet; best request is {best_result.request_id} with "
             f"ik_empty_rows={best_result.ik_empty_row_count}, "
             f"config_switches={best_result.config_switches}, "
-            f"bridge_like_segments={best_result.bridge_like_segments}."
+            f"bridge_like_segments={best_result.bridge_like_segments}, "
+            f"big_circle_step_count={int(getattr(best_result, 'big_circle_step_count', 0))}."
         )
 
     notes = []

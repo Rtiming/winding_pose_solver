@@ -7,7 +7,16 @@ import numpy as np
 
 from . import config
 from .analytic_solver import AnalyticSeedGenerator
-from .kinematics import IKResult, JOINT_COUNT, LocalIKSolutionSet, RobotModel, joint_distance_deg
+from .kinematics import (
+    IKResult,
+    JOINT_COUNT,
+    LocalIKSolution,
+    LocalIKSolutionSet,
+    RobotModel,
+    joint_distance_deg,
+    joints_within_limits,
+    rotation_error_deg,
+)
 from .numeric_solver import NumericIKSolver
 
 
@@ -39,6 +48,23 @@ class IKSolveAllRequest:
     pose_position_tolerance_mm: float
     pose_orientation_tolerance_deg: float
     periodic_dedup_tolerance_deg: float
+
+
+@dataclass(frozen=True)
+class _AnalyticBranchSolution:
+    branch_index: int
+    joints_deg: np.ndarray
+    position_error_mm: float
+    orientation_error_deg: float
+
+
+@dataclass(frozen=True)
+class _TurnVariantRecord:
+    joints_deg: np.ndarray
+    branch_index: int
+    turn_offsets: np.ndarray
+    distance_to_seed_deg: float | None
+    within_filter_limits: bool
 
 
 class IKBackend(Protocol):
@@ -274,6 +300,84 @@ class PureAnalyticIKBackend:
             self._cached_seed_generator = AnalyticSeedGenerator(robot_model)
         return self._cached_numeric_solver, self._cached_seed_generator
 
+    def _collect_valid_branch_solutions(
+        self,
+        request: IKSolveAllRequest,
+        full_seeds: Sequence[np.ndarray],
+    ) -> list[_AnalyticBranchSolution]:
+        """对解析 seeds 只做一次 FK/误差筛选，供三个输出路径复用。"""
+        target_position_mm = request.target_frame_pose[:3, 3]
+        position_tolerance_sq = float(request.pose_position_tolerance_mm**2)
+        branch_solutions: list[_AnalyticBranchSolution] = []
+        seen_joints: list[np.ndarray] = []
+
+        for branch_index, seed_vec in enumerate(full_seeds):
+            fk = request.robot_model.fk_tcp_in_frame(seed_vec)
+            position_delta_mm = fk[:3, 3] - target_position_mm
+            position_error_sq = float(position_delta_mm @ position_delta_mm)
+            if position_error_sq > position_tolerance_sq:
+                continue
+
+            orientation_error_deg = float(rotation_error_deg(fk, request.target_frame_pose))
+            if orientation_error_deg > request.pose_orientation_tolerance_deg:
+                continue
+
+            if any(
+                joint_distance_deg(seed_vec, seen) <= request.periodic_dedup_tolerance_deg
+                for seen in seen_joints
+            ):
+                continue
+
+            seen_joints.append(seed_vec)
+            branch_solutions.append(
+                _AnalyticBranchSolution(
+                    branch_index=branch_index,
+                    joints_deg=seed_vec,
+                    position_error_mm=float(np.sqrt(position_error_sq)),
+                    orientation_error_deg=orientation_error_deg,
+                )
+            )
+
+        return branch_solutions
+
+    def _build_turn_variant_records(
+        self,
+        request: IKSolveAllRequest,
+        numeric: NumericIKSolver,
+        branch_solutions: Sequence[_AnalyticBranchSolution],
+    ) -> list[_TurnVariantRecord]:
+        """把 branch 解展开成 turn variant 记录，供多种输出格式共享。"""
+        filter_lower = np.asarray(request.filter_lower_deg, dtype=float)
+        filter_upper = np.asarray(request.filter_upper_deg, dtype=float)
+        seed = None if request.seed_joints_deg is None else np.asarray(request.seed_joints_deg, dtype=float)
+
+        variant_records: list[_TurnVariantRecord] = []
+        for branch_sol in branch_solutions:
+            for variant_joints, turn_offsets in numeric.expand_solution_turn_variants(branch_sol.joints_deg):
+                within_filter_limits = joints_within_limits(variant_joints, filter_lower, filter_upper)
+                variant_records.append(
+                    _TurnVariantRecord(
+                        joints_deg=variant_joints,
+                        branch_index=branch_sol.branch_index,
+                        turn_offsets=turn_offsets,
+                        distance_to_seed_deg=None
+                        if seed is None
+                        else joint_distance_deg(variant_joints, seed),
+                        within_filter_limits=within_filter_limits,
+                    )
+                )
+
+        variant_records.sort(
+            key=lambda item: (
+                float("inf")
+                if item.distance_to_seed_deg is None
+                else item.distance_to_seed_deg,
+                item.branch_index,
+                tuple(item.turn_offsets.tolist()),
+            )
+        )
+        return variant_records
+
     def solve(self, request: IKSolveRequest) -> IKResult:
         solver, seed_generator = self._solver_and_seed_generator(request.robot_model)
         _, full_seeds = seed_generator.generate_seed_candidates(
@@ -312,80 +416,54 @@ class PureAnalyticIKBackend:
         )
 
     def solve_all(self, request: IKSolveAllRequest) -> "LocalIKSolutionSet":
-        from .kinematics import (
-            LocalIKSolution,
-            LocalIKSolutionSet,
-            joints_within_limits,
-            joint_distance_deg as _jd,
-            rotation_error_deg,
-        )
-
         numeric, seed_generator = self._solver_and_seed_generator(request.robot_model)
         _, full_seeds = seed_generator.generate_seed_candidates(
             request.target_frame_pose,
             preferred_seed_joints_deg=request.seed_joints_deg,
             periodic_dedup_tolerance_deg=request.periodic_dedup_tolerance_deg,
         )
+        branch_solutions = self._collect_valid_branch_solutions(request, full_seeds)
 
         filter_lower = np.asarray(request.filter_lower_deg, dtype=float)
         filter_upper = np.asarray(request.filter_upper_deg, dtype=float)
         seed = None if request.seed_joints_deg is None else np.asarray(request.seed_joints_deg, dtype=float)
 
-        # Validate each analytic seed via FK (no optimization needed)
-        branch_solutions: list[LocalIKSolution] = []
-        seen_joints: list[np.ndarray] = []
-
-        for branch_index, seed_vec in enumerate(full_seeds):
-            fk = request.robot_model.fk_tcp_in_frame(seed_vec)
-            pos_err = float(np.linalg.norm(fk[:3, 3] - request.target_frame_pose[:3, 3]))
-            rot_err = rotation_error_deg(fk, request.target_frame_pose)
-
-            if pos_err > request.pose_position_tolerance_mm:
-                continue
-            if rot_err > request.pose_orientation_tolerance_deg:
-                continue
-
-            # Deduplicate
-            if any(_jd(seed_vec, seen) <= request.periodic_dedup_tolerance_deg for seen in seen_joints):
-                continue
-            seen_joints.append(seed_vec)
-
-            branch_solutions.append(
-                LocalIKSolution(
-                    index=branch_index,
-                    branch_index=branch_index,
-                    joints_deg=seed_vec,
-                    seed_joints_deg=seed_vec,
-                    turn_offsets=np.zeros(len(seed_vec), dtype=int),
-                    within_robot_limits=request.robot_model.within_joint_limits(seed_vec),
-                    within_filter_limits=joints_within_limits(seed_vec, filter_lower, filter_upper),
-                    distance_to_seed_deg=None if seed is None else _jd(seed_vec, seed),
-                    residual_norm=pos_err,
-                    position_error_mm=pos_err,
-                    orientation_error_deg=rot_err,
-                )
+        branch_solution_records: dict[int, LocalIKSolution] = {}
+        for branch_sol in branch_solutions:
+            branch_solution_records[branch_sol.branch_index] = LocalIKSolution(
+                index=branch_sol.branch_index,
+                branch_index=branch_sol.branch_index,
+                joints_deg=branch_sol.joints_deg,
+                seed_joints_deg=branch_sol.joints_deg,
+                turn_offsets=np.zeros(len(branch_sol.joints_deg), dtype=int),
+                within_robot_limits=request.robot_model.within_joint_limits(branch_sol.joints_deg),
+                within_filter_limits=joints_within_limits(branch_sol.joints_deg, filter_lower, filter_upper),
+                distance_to_seed_deg=None if seed is None else joint_distance_deg(branch_sol.joints_deg, seed),
+                residual_norm=branch_sol.position_error_mm,
+                position_error_mm=branch_sol.position_error_mm,
+                orientation_error_deg=branch_sol.orientation_error_deg,
             )
 
         # Turn expansion
         all_solutions: list[LocalIKSolution] = []
-        for branch_sol in branch_solutions:
-            for variant_joints, turn_offsets in numeric.expand_solution_turn_variants(branch_sol.joints_deg):
-                dist = None if seed is None else _jd(variant_joints, seed)
-                all_solutions.append(
-                    LocalIKSolution(
-                        index=-1,
-                        branch_index=branch_sol.branch_index,
-                        joints_deg=variant_joints,
-                        seed_joints_deg=branch_sol.seed_joints_deg,
-                        turn_offsets=turn_offsets,
-                        within_robot_limits=True,
-                        within_filter_limits=joints_within_limits(variant_joints, filter_lower, filter_upper),
-                        distance_to_seed_deg=dist,
-                        residual_norm=branch_sol.residual_norm,
-                        position_error_mm=branch_sol.position_error_mm,
-                        orientation_error_deg=branch_sol.orientation_error_deg,
-                    )
+        variant_records = self._build_turn_variant_records(request, numeric, branch_solutions)
+        for variant_record in variant_records:
+            branch_sol = branch_solution_records[variant_record.branch_index]
+            all_solutions.append(
+                LocalIKSolution(
+                    index=-1,
+                    branch_index=variant_record.branch_index,
+                    joints_deg=variant_record.joints_deg,
+                    seed_joints_deg=branch_sol.seed_joints_deg,
+                    turn_offsets=variant_record.turn_offsets,
+                    within_robot_limits=True,
+                    within_filter_limits=variant_record.within_filter_limits,
+                    distance_to_seed_deg=variant_record.distance_to_seed_deg,
+                    residual_norm=branch_sol.residual_norm,
+                    position_error_mm=branch_sol.position_error_mm,
+                    orientation_error_deg=branch_sol.orientation_error_deg,
                 )
+            )
 
         all_solutions.sort(
             key=lambda s: (
@@ -422,133 +500,46 @@ class PureAnalyticIKBackend:
             filter_lower_limits_deg=filter_lower.copy(),
             filter_upper_limits_deg=filter_upper.copy(),
             arm_candidate_solutions_deg=[],
-            branch_solutions=branch_solutions,
+            branch_solutions=list(branch_solution_records.values()),
             all_solutions=all_solutions,
             filtered_solutions=filtered_solutions,
         )
 
     def solve_all_joint_vectors(self, request: IKSolveAllRequest) -> list[np.ndarray]:
-        from .kinematics import (
-            joint_distance_deg as _jd,
-            joints_within_limits,
-            rotation_error_deg,
-        )
-
         numeric, seed_generator = self._solver_and_seed_generator(request.robot_model)
         _, full_seeds = seed_generator.generate_seed_candidates(
             request.target_frame_pose,
             preferred_seed_joints_deg=request.seed_joints_deg,
             periodic_dedup_tolerance_deg=request.periodic_dedup_tolerance_deg,
         )
-
-        filter_lower = np.asarray(request.filter_lower_deg, dtype=float)
-        filter_upper = np.asarray(request.filter_upper_deg, dtype=float)
-        seed = None if request.seed_joints_deg is None else np.asarray(request.seed_joints_deg, dtype=float)
-
-        branch_solutions: list[tuple[int, np.ndarray]] = []
-        seen_joints: list[np.ndarray] = []
-
-        for branch_index, seed_vec in enumerate(full_seeds):
-            fk = request.robot_model.fk_tcp_in_frame(seed_vec)
-            pos_err = float(np.linalg.norm(fk[:3, 3] - request.target_frame_pose[:3, 3]))
-            rot_err = rotation_error_deg(fk, request.target_frame_pose)
-
-            if pos_err > request.pose_position_tolerance_mm:
-                continue
-            if rot_err > request.pose_orientation_tolerance_deg:
-                continue
-            if any(_jd(seed_vec, seen) <= request.periodic_dedup_tolerance_deg for seen in seen_joints):
-                continue
-
-            seen_joints.append(seed_vec)
-            branch_solutions.append((branch_index, seed_vec))
-
-        variant_records: list[tuple[np.ndarray, int, np.ndarray, float | None]] = []
-        for branch_index, branch_joints in branch_solutions:
-            for variant_joints, turn_offsets in numeric.expand_solution_turn_variants(branch_joints):
-                if not joints_within_limits(variant_joints, filter_lower, filter_upper):
-                    continue
-                variant_records.append(
-                    (
-                        variant_joints,
-                        branch_index,
-                        turn_offsets,
-                        None if seed is None else _jd(variant_joints, seed),
-                    )
-                )
-
-        variant_records.sort(
-            key=lambda item: (
-                float("inf") if item[3] is None else item[3],
-                item[1],
-                tuple(item[2].tolist()),
-            )
-        )
-        return [variant_joints.copy() for variant_joints, _branch_index, _turn_offsets, _distance in variant_records]
+        branch_solutions = self._collect_valid_branch_solutions(request, full_seeds)
+        variant_records = self._build_turn_variant_records(request, numeric, branch_solutions)
+        return [
+            variant_record.joints_deg.copy()
+            for variant_record in variant_records
+            if variant_record.within_filter_limits
+        ]
 
     def solve_all_joint_records(
         self,
         request: IKSolveAllRequest,
     ) -> list[tuple[np.ndarray, int, np.ndarray]]:
-        from .kinematics import (
-            joint_distance_deg as _jd,
-            joints_within_limits,
-            rotation_error_deg,
-        )
-
         numeric, seed_generator = self._solver_and_seed_generator(request.robot_model)
         _, full_seeds = seed_generator.generate_seed_candidates(
             request.target_frame_pose,
             preferred_seed_joints_deg=request.seed_joints_deg,
             periodic_dedup_tolerance_deg=request.periodic_dedup_tolerance_deg,
         )
-
-        filter_lower = np.asarray(request.filter_lower_deg, dtype=float)
-        filter_upper = np.asarray(request.filter_upper_deg, dtype=float)
-        seed = None if request.seed_joints_deg is None else np.asarray(request.seed_joints_deg, dtype=float)
-
-        branch_solutions: list[tuple[int, np.ndarray]] = []
-        seen_joints: list[np.ndarray] = []
-
-        for branch_index, seed_vec in enumerate(full_seeds):
-            fk = request.robot_model.fk_tcp_in_frame(seed_vec)
-            pos_err = float(np.linalg.norm(fk[:3, 3] - request.target_frame_pose[:3, 3]))
-            rot_err = rotation_error_deg(fk, request.target_frame_pose)
-
-            if pos_err > request.pose_position_tolerance_mm:
-                continue
-            if rot_err > request.pose_orientation_tolerance_deg:
-                continue
-            if any(_jd(seed_vec, seen) <= request.periodic_dedup_tolerance_deg for seen in seen_joints):
-                continue
-
-            seen_joints.append(seed_vec)
-            branch_solutions.append((branch_index, seed_vec))
-
-        variant_records: list[tuple[np.ndarray, int, np.ndarray, float | None]] = []
-        for branch_index, branch_joints in branch_solutions:
-            for variant_joints, turn_offsets in numeric.expand_solution_turn_variants(branch_joints):
-                if not joints_within_limits(variant_joints, filter_lower, filter_upper):
-                    continue
-                variant_records.append(
-                    (
-                        variant_joints,
-                        branch_index,
-                        turn_offsets,
-                        None if seed is None else _jd(variant_joints, seed),
-                    )
-                )
-
-        variant_records.sort(
-            key=lambda item: (
-                float("inf") if item[3] is None else item[3],
-                item[1],
-                tuple(item[2].tolist()),
-            )
-        )
+        branch_solutions = self._collect_valid_branch_solutions(request, full_seeds)
+        variant_records = self._build_turn_variant_records(request, numeric, branch_solutions)
         return [
-            (variant_joints.copy(), int(branch_index), turn_offsets.copy())
-            for variant_joints, branch_index, turn_offsets, _distance in variant_records
+            (
+                variant_record.joints_deg.copy(),
+                int(variant_record.branch_index),
+                variant_record.turn_offsets.copy(),
+            )
+            for variant_record in variant_records
+            if variant_record.within_filter_limits
         ]
 
 

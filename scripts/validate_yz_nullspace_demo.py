@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -43,6 +44,56 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--run-id", default=None)
     parser.add_argument(
+        "--local-workers",
+        type=int,
+        default=None,
+        help="Override offline exact-profile worker count for this validation run.",
+    )
+    parser.add_argument(
+        "--local-min-batch-size",
+        type=int,
+        default=None,
+        help="Override minimum exact-profile batch size before multiprocessing engages.",
+    )
+    parser.add_argument(
+        "--envelope-schedule",
+        default=None,
+        help="Comma-separated Frame-A Y/Z envelope schedule in mm, e.g. 6,12,24.",
+    )
+    parser.add_argument(
+        "--step-schedule",
+        default=None,
+        help="Comma-separated Frame-A Y/Z step schedule in mm, e.g. 8,4,2.",
+    )
+    parser.add_argument(
+        "--insertion-counts",
+        default=None,
+        help="Comma-separated inserted transition counts, e.g. 4,8,16.",
+    )
+    parser.add_argument(
+        "--disable-joint-space-bridge",
+        action="store_true",
+        help="Disable the final joint-space bridge fallback for residual wrist flips.",
+    )
+    parser.add_argument(
+        "--joint-space-bridge-max-insertions",
+        type=int,
+        default=None,
+        help="Maximum joint-space bridge points inserted per residual segment.",
+    )
+    parser.add_argument(
+        "--joint-space-bridge-max-tcp-deviation-mm",
+        type=float,
+        default=None,
+        help="Maximum allowed TCP deviation before joint-space bridge fallback is rejected.",
+    )
+    parser.add_argument(
+        "--joint-space-bridge-max-tcp-path-ratio",
+        type=float,
+        default=None,
+        help="Maximum allowed TCP path/direct-distance ratio for joint-space bridge fallback.",
+    )
+    parser.add_argument(
         "--output-root",
         default=str(PROJECT_ROOT / "artifacts" / "diagnostics" / "yz_nullspace_demo"),
     )
@@ -69,8 +120,9 @@ def _parse_args() -> argparse.Namespace:
 def main() -> int:
     args = _parse_args()
     run_id = args.run_id or default_yz_nullspace_demo_run_id()
+    settings = _settings_with_overrides(args)
     artifacts = run_yz_nullspace_demo(
-        APP_RUNTIME_SETTINGS,
+        settings,
         start_index=args.start,
         end_index=args.end,
         padding=args.padding,
@@ -126,6 +178,52 @@ def main() -> int:
         f"frame={import_summary.frame_name}"
     )
     return 0
+
+
+def _settings_with_overrides(args: argparse.Namespace):
+    motion_settings = APP_RUNTIME_SETTINGS.motion_settings
+    updates = {}
+    if args.local_workers is not None:
+        updates["local_parallel_workers"] = int(args.local_workers)
+    if args.local_min_batch_size is not None:
+        updates["local_parallel_min_batch_size"] = int(args.local_min_batch_size)
+    if args.envelope_schedule:
+        updates["frame_a_origin_yz_envelope_schedule_mm"] = _parse_float_tuple(
+            args.envelope_schedule
+        )
+    if args.step_schedule:
+        updates["frame_a_origin_yz_step_schedule_mm"] = _parse_float_tuple(
+            args.step_schedule
+        )
+    if args.insertion_counts:
+        updates["frame_a_origin_yz_insertion_counts"] = tuple(
+            int(value) for value in _parse_float_tuple(args.insertion_counts)
+        )
+    if args.disable_joint_space_bridge:
+        updates["enable_joint_space_bridge_repair"] = False
+    if args.joint_space_bridge_max_insertions is not None:
+        updates["joint_space_bridge_max_insertions_per_segment"] = int(
+            args.joint_space_bridge_max_insertions
+        )
+    if args.joint_space_bridge_max_tcp_deviation_mm is not None:
+        updates["joint_space_bridge_max_tcp_deviation_mm"] = float(
+            args.joint_space_bridge_max_tcp_deviation_mm
+        )
+    if args.joint_space_bridge_max_tcp_path_ratio is not None:
+        updates["joint_space_bridge_max_tcp_path_ratio"] = float(
+            args.joint_space_bridge_max_tcp_path_ratio
+        )
+    if updates:
+        motion_settings = replace(motion_settings, **updates)
+        return replace(APP_RUNTIME_SETTINGS, motion_settings=motion_settings)
+    return APP_RUNTIME_SETTINGS
+
+
+def _parse_float_tuple(raw: str) -> tuple[float, ...]:
+    values = tuple(float(part.strip()) for part in raw.split(",") if part.strip())
+    if not values:
+        raise ValueError(f"Expected at least one comma-separated value, got {raw!r}")
+    return values
 
 
 def _print_result_line(label: str, result) -> None:

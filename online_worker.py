@@ -1,4 +1,6 @@
-from src.robodk_runtime.eval_worker import main
+"""Compatibility CLI wrapper for worker role."""
+
+from src.runtime.online.worker import main
 
 
 if __name__ == "__main__":

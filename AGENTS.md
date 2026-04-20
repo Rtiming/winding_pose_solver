@@ -1,198 +1,286 @@
 # AGENTS.md
 
-This repo-level file defines the default rules for coding agents working in `winding_pose_solver`.
+Repo-level guidance for coding agents working in `winding_pose_solver`.
 
-If a deeper directory contains its own `AGENTS.md`, follow the deepest applicable file for code in that subtree and treat this root file as the fallback policy.
+If a deeper directory has its own `AGENTS.md`, follow that file for code in
+that subtree and use this root file as the fallback policy.
 
-## Project Purpose
+## Agent Operating Contract
 
-This repository generates winding-tool poses from centerline data, validates IK feasibility, searches for a continuous joint path, and optionally materializes the final RoboDK program.
+This project is usually edited through short Chinese instructions from the
+user. Agents should infer low-risk details and act, but must keep the following
+project-specific contract:
 
-The root project objective is coordinate-driven, not posture-driven: the winding tool/work frame must visit the target coordinate points in order. The configured `TARGET_FRAME_A_ORIGIN_IN_FRAME2_MM` is the fixed nominal origin, while per-row Frame-A Y/Z offsets are available degrees of freedom for making the robot motion usable. Orientation, configuration flags, bridge-like segments, and worst joint step metrics are diagnostics and optimization signals; they are not the fundamental delivery objective unless the user explicitly promotes one of them to a hard constraint.
+- Start by reading this file and running `git status --short --branch` before
+  broad edits, sync, or online runs.
+- Treat the Windows checkout as the active editing workspace unless the user
+  explicitly says the Linux server is source of truth.
+- Never overwrite, revert, delete, or clean local/remote changes that the agent
+  did not create. Work with dirty files and keep edits scoped.
+- Do not use the retired server path `/home/tzwang/apps/winding_pose_solver`.
+  The canonical server path is `/home/tzwang/program/winding_pose_solver`.
+- Do not turn `main.py` back into a large implementation file. It is a thin
+  user control panel; reusable logic belongs in `src/`.
+- Do not put substantial implementation in root `online_*.py` files. They are
+  compatibility wrappers; online implementation belongs in
+  `src/runtime/online/`.
+- Prefer concrete implementation plus validation over long proposals. Ask the
+  user only when a wrong assumption could cause data loss, expensive compute,
+  or architectural drift.
+- When consulting external assistants or tools, treat them as advisory only and
+  do not claim Kimi, Claude, web research, or RoboDK behavior was checked unless
+  it was actually checked in this run.
+- Keep user-facing responses concise and Chinese-first unless the user asks
+  otherwise. Report commands run, outputs/artifacts, and any validation that
+  could not be performed.
 
-Known motion-quality failure mode: around points such as `372 -> 373`, a valid target sequence can still make the robot joints change configuration in a way that causes the tool/work coordinate frame to draw a small circle or detour during the transition. That violates the practical winding intent even when every target point is IK-reachable. Prefer optimizing the Y/Z freedom, local repair, interpolation strategy, or motion instruction strategy to reduce that physical detour instead of simply blocking output on `config_switches`, `bridge_like_segments`, or `worst_joint_step_deg`.
+## Project Intent
 
-There are two interchangeable IK backends:
+This project generates winding-tool poses from centerline data, evaluates IK
+reachability, searches for a usable joint path, and optionally materializes the
+selected path as a RoboDK program.
 
-- `six_axis_ik`: embedded local analytic backend
-- `robodk`: live RoboDK-backed truth source
+The root objective is coordinate-driven:
 
-Preserve backend interchangeability unless the task explicitly targets one backend only.
+- The tool/work frame must visit the requested target coordinate points in
+  order.
+- `TARGET_FRAME_A_ORIGIN_IN_FRAME2_MM` is the nominal fixed Frame-A origin.
+- Per-row Frame-A Y/Z offsets and origin sweeps are optimization freedoms used
+  to reduce physical detours and joint discontinuities.
+- `config_switches`, `bridge_like_segments`, and `worst_joint_step_deg` are
+  diagnostics and optimization signals unless the user explicitly promotes one
+  to a hard constraint.
 
-## Fast Decision Checklist
+Current user-promoted hard rule for closed winding paths:
 
-Before editing, quickly answer these questions:
+- When the start point is appended as the terminal point, terminal I1-I5 must
+  equal the start I1-I5.
+- Terminal I6 must differ from the start I6 by exactly one full turn
+  (`+360` or `-360` degrees), with the sign chosen from the observed early A6
+  trend when that trend is clear.
+- Do not satisfy this terminal rule by accepting a fake `0` degree A6 closure.
 
-1. Which layer owns the change: `core`, `search`, `runtime`, `robodk_runtime`, `six_axis_ik`, or `scripts`?
-2. Does the change affect both the single-machine flow and the online requester/worker flow?
-3. Is the change backend-agnostic, RoboDK-only, or `six_axis_ik`-only?
-4. Will it change request/result schemas, artifact filenames, or run-directory conventions?
-5. What is the smallest validation that proves the change, and does that validation need Slurm?
+Known motion-quality failure mode:
 
-## Top-Level Files
+- A path can be target-reachable but still practically bad if a segment such as
+  `59->60`, `372->373`, or another wrist/config transition causes a fast
+  configuration jump or a physical detour.
+- Prefer local Y/Z repair, candidate scoring, A6 periodic handling, or
+  insertion strategy to reduce those transitions. Do not hide the problem by
+  deleting diagnostics.
 
-- `main.py`: convenience entrypoint plus frequently tuned local defaults. Keep reusable logic out of this file; move real implementation into `src/runtime/`, `src/core/`, or the relevant package.
-- `app_settings.py`: shared runtime settings and tuning surface. Edit here when changing config wiring or default solver/runtime parameters used across flows.
-- `online_requester.py`: requester-side CLI entrypoint. Keep it thin.
-- `online_worker.py`: worker-side CLI entrypoint. Keep it thin and delegate to `src/robodk_runtime/` or `src/runtime/`.
-- `online_roundtrip.py`: remote orchestration, SSH transport, and end-to-end roundtrip control. Do not bury pure math or search heuristics here.
+## Machines And Paths
+
+- Windows checkout: current local workspace.
+- Canonical Linux server checkout:
+  `/home/tzwang/program/winding_pose_solver`
+- The retired server path `/home/tzwang/apps/winding_pose_solver` must not be
+  used.
+- Windows coordinates online orchestration and RoboDK finalization.
+- The server runs pure compute with the `six_axis_ik` backend; it must not need
+  RoboDK.
+- Live RoboDK behavior stays on Windows and should attach to the already-open
+  station.
 
 ## Repository Map
 
-Main package layout:
+- `main.py`: user-facing run configuration and mode selection. Keep it thin.
+- `src/runtime/main_entrypoint.py`: canonical main-mode implementation.
+- `app_settings.py`: shared solver/runtime tuning defaults.
+- `src/runtime/online/roundtrip.py`: SSH transport, server setup, server role,
+  receiver role, and coordinator flow.
+- `online_roundtrip.py`, `online_requester.py`, `online_worker.py`:
+  root-level compatibility wrappers only.
+- `scripts/`: thin diagnostics and operational wrappers.
+- `src/core/`: math, geometry, schemas, CSV handling, pose solving, and
+  backend-neutral helpers.
+- `src/search/`: IK candidate collection, DP path selection, continuity costs,
+  local repair, and inserted-transition logic.
+- `src/runtime/`: orchestration, request building, run logging, origin search,
+  local retry, and remote-search helpers.
+- `src/runtime/online/`: modular online coordinator/server/receiver entrypoints
+  and sync preflight logic.
+- `src/robodk_runtime/`: live RoboDK station import/program generation and
+  RoboDK-backed evaluation.
+- `src/six_axis_ik/`: embedded IK/FK model and backend-specific kinematics.
 
-- `src/core/`: reusable math, geometry, schemas, CSV handling, pose solving, backend-agnostic helpers
-- `src/search/`: IK candidate collection, DP path selection, repair logic, continuity-focused search
-- `src/runtime/`: orchestration, request building, profiling, run logging, origin sweep utilities
-- `src/robodk_runtime/`: logic that requires a live RoboDK station
-- `src/six_axis_ik/`: embedded IK/FK implementation and backend-specific kinematics behavior
+Recent modular split:
 
-Support directories:
+- Smart Frame-A origin search lives in `src/runtime/origin_sweep.py`.
+- The `main.py --mode origin_search` launcher lives in
+  `src/runtime/origin_search_runner.py`.
+- `scripts/sweep_target_origin_yz.py` is a CLI wrapper around the runtime
+  origin-search code.
 
-- `scripts/`: thin diagnostics and one-off utilities; reusable logic belongs in `src/`
-- `data/`: input CSVs and small checked-in examples
-- `artifacts/`: local runs, online runs, diagnostics, logs, temporary outputs
+## Edit Surface
 
-## Edit Surface Guidance
+Before editing, decide which layer owns the change:
 
-Use these heuristics before touching code:
+- Pure geometry, CSV, schemas, or backend-neutral pose logic: `src/core/`
+- DP costs, config switching, A6 terminal constraints, IK candidates, repair:
+  `src/search/`
+- Request/result orchestration, origin sweep/search, logging, retry:
+  `src/runtime/`
+- RoboDK import, target/program creation, live station behavior:
+  `src/robodk_runtime/`
+- Analytic/numeric IK model details: `src/six_axis_ik/`
+- CLI-only diagnostics: `scripts/`
 
-- If the change is pure math, geometry, CSV/schema, or backend-agnostic pose logic: start in `src/core/`
-- If the change is about continuity, configuration switching, repair heuristics, DP cost design, or inserted transitions: start in `src/search/`
-- If the change is about orchestration, request/result handling, profiling, run logging, or sweep coordination: start in `src/runtime/`
-- If the change requires a live RoboDK station or final program generation: start in `src/robodk_runtime/`
-- If the change is about IK model constants, analytic/numeric solving, FK, or RoboDK parity: start in `src/six_axis_ik/`
-- If the change is only a CLI or thin diagnostic wrapper: start in `scripts/`
+Keep `main.py` as a small control panel. Move reusable logic into the
+appropriate package.
 
-Avoid adding new business logic to the flat compatibility wrappers in `src/`.
+## Documentation Editing Rules
 
-## Cross-Cutting Rules
+Documentation edits must constrain future agents instead of drifting into
+general advice:
 
-- Prefer minimal, local changes over broad refactors.
-- Read the relevant package `README.md` and nearest `AGENTS.md` before editing.
-- Keep the single-machine and online flows aligned. Do not silently fix one path while breaking the other.
-- Keep RoboDK-dependent behavior isolated from backend-agnostic logic where practical.
-- Keep high-level path-search policy out of `src/six_axis_ik/`.
-- Keep live-station behavior out of `src/core/`.
-- Do not do git mutations unless explicitly requested.
-
-## Iteration And Handoff Style
-
-- Assume the user prefers autonomous multi-pass refinement for non-trivial work rather than having to ask for repeated follow-up iterations.
-- Default workflow: short plan, first implementation, self-review of the touched files or diff, smallest relevant validation, then one more refinement pass if there are obvious rough edges or fixable risks.
-- Do not stop after a merely plausible first draft if another cheap pass would likely improve correctness, maintainability, or fit with the existing codebase.
-- Ask the user for guidance only when requirements are genuinely unclear, a tradeoff is high-impact, or validation is blocked or disproportionately expensive.
-- In final reporting, separate what changed, what was validated, and what still remains uncertain.
-
-## Intent Alignment Style
-
-- The user often writes short, informal, or Chinese-first prompts. Internally normalize those requests into a compact task brief before acting.
-- Preserve the user's intent rather than "upgrading" the request into a broader task. Infer missing low-risk details when reasonable, but do not silently add major scope.
-- Keep visible restatement minimal. If the request is clear enough, do not paraphrase it back. If a small alignment check helps, use one short sentence or a few compact points, then proceed.
-- Ask clarifying questions only when ambiguity is genuinely material, or when a wrong assumption could lead to high-cost validation, large edits, or architectural drift.
-- For code search, logs, and external docs, it is fine to expand the user's wording into bilingual or English-heavy internal search terms while continuing to communicate with the user in Chinese.
-
-## Compatibility And Public Surface
-
-Older flat imports in `src/*.py` are still supported through thin wrappers. When adding or moving reusable logic:
-
-- put the implementation in the package directory first
-- only touch the flat wrapper if an import-compatibility surface must remain exposed
-- avoid duplicating logic between wrapper files and package files
-
-If you rename exported symbols or move modules, search for both package imports and legacy flat imports before finishing.
-
-## Environment
-
-There are two main environment targets:
-
-- `environment.server.yml`: Python 3.12
-- `environment.local-worker.yml`: Python 3.10
-
-The shared dependency split is:
-
-- `requirements.shared.txt`
-- `requirements.server.txt`
-- `requirements.local-worker.txt`
-
-When making dependency-sensitive changes, check which runtime target they affect.
-
-## Slurm And Heavy Work
-
-This repo is developed on a shared Slurm-managed server.
-
-- Heavy compute must not run directly on the login node.
-- Any training, benchmark, large sweep, large batch evaluation, compilation, or substantial data processing must go through Slurm.
-- Lightweight inspection, searching, reading, and small edits may run directly.
-- Follow the Slurm policy defined in `/home/tzwang/.codex/skills/slurm-run/SKILL.md`.
-
-If you need to run an expensive sweep, batch evaluation, or profile search experiment, prefer `srun` or `sbatch` sized from current free capacity.
+- Keep docs project-specific. Mention only paths, commands, modes, and
+  constraints that are valid for this repository.
+- Preserve the current architecture: thin `main.py`, compatibility root
+  wrappers, implementation under `src/core`, `src/search`, `src/runtime`,
+  `src/runtime/online`, `src/robodk_runtime`, and `src/six_axis_ik`.
+- Do not rewrite large documents from scratch unless the user explicitly asks.
+  Prefer focused sections that update the stale rule or command.
+- Do not invent validation results, benchmark numbers, RoboDK output, Slurm
+  availability, or server sync status. State "not run" when validation was not
+  run.
+- Keep command examples copy-pasteable for PowerShell on Windows unless the
+  section is explicitly about the Linux server.
+- Any server command in docs must use
+  `/home/tzwang/program/winding_pose_solver`; never document the retired path.
+- When documenting online behavior, include the sync preflight mode
+  (`REMOTE_SYNC_MODE` / `--remote-sync-mode`) and whether RoboDK finalization is
+  skipped or expected.
+- When documenting motion quality, preserve both sides of the rule:
+  coordinate order and closed-winding terminal constraints are hard; config
+  switches and continuity metrics are diagnostics unless explicitly promoted.
+- Add comments in code only around non-obvious algorithms, hard constraints,
+  sync boundaries, or RoboDK/server separation. Do not add noisy line-by-line
+  comments.
+- Keep generated artifacts, logs, cache directories, and one-off run outputs out
+  of documentation examples unless they are part of the stable artifact
+  contract below.
 
 ## Operational Defaults
 
-- Default single-machine work should remain solve-first unless the task explicitly needs RoboDK program generation.
-- `six_axis_ik` should stay usable for offline evaluation workflows.
-- The final RoboDK program-generation step should remain local unless the task explicitly changes that architecture.
-- If a schema or artifact change crosses local and online flows, update the relevant docs and all affected producers and consumers together.
+- Default `TARGET_FRAME_A_ORIGIN_IN_FRAME2_MM` is configured in `main.py`.
+- Default backend is expected to remain `six_axis_ik` for server-safe compute.
+- Default online final program generation remains local on Windows.
+- Online coordinator preflight sync supports `off|guard|push` mode.
+- Default online retry/repair should stay conservative; expensive repair must
+  be explicitly enabled.
+- Smart origin search is available through `main.py --mode origin_search` or
+  `python scripts/sweep_target_origin_yz.py --mode smart-square ...`.
 
-## Diagnostics And Artifacts
+## Delivery Semantics
 
-Important run outputs often include:
+Official delivery currently requires target reachability plus the user-promoted
+motion-quality gate. Debug/diagnostic artifacts may still be produced for
+analysis, but they must not be treated as ready-to-run production RoboDK
+programs.
+
+Official delivery requires:
+
+- `invalid_row_count == 0`
+- `ik_empty_row_count == 0`
+- a complete non-empty `selected_path`
+- for closed winding payloads, terminal I1-I5/I6 hard constraints must pass
+- `bridge_like_segments == 0`
+- `big_circle_step_count == 0`
+- `worst_joint_step_deg <= 60`
+
+Continuity warnings should be reported clearly:
+
+- `config_switches`
+- `bridge_like_segments`
+- `big_circle_step_count`
+- `worst_joint_step_deg`
+- focused problem segments
+
+`config_switches` remains a diagnostic signal rather than a standalone official
+delivery blocker. A config label change can be benign near singularity if the
+joint path and TCP motion stay continuous.
+
+## Remote And Slurm Rules
+
+When actively running work on `master` under `/home/tzwang`, follow the
+`slurm-run` skill:
+
+- Lightweight inspection is fine on the login node.
+- Heavy sweeps, repeated evaluations, benchmarking, large repair runs, or
+  broad tests must use Slurm.
+- Inspect live Slurm resources before launching heavy work.
+- Use `srun` for interactive compute and `sbatch` for long detached work.
+
+For source synchronization with master, use the `winding-master-sync` skill or
+careful targeted `scp` after backing up remote files. Do not delete local-only
+or remote-only files unless explicitly asked.
+
+## Dirty Worktree Policy
+
+Assume the worktree can contain user changes.
+
+- Always check `git status --short --branch` before broad edits or sync.
+- Never revert changes you did not make unless the user explicitly asks.
+- If touching a dirty file, read the relevant section and work with existing
+  edits.
+- Keep edits scoped to the requested task.
+
+## Validation
+
+Use the smallest validation that proves the change:
+
+```powershell
+python -m py_compile main.py online_roundtrip.py src/runtime/origin_sweep.py scripts/sweep_target_origin_yz.py
+python main.py --help
+python scripts/sweep_target_origin_yz.py --help
+```
+
+For online compute smoke:
+
+```powershell
+python main.py --mode online --online-role coordinator --run-id smoke --skip-final-generate
+```
+
+For origin search smoke:
+
+```powershell
+python scripts/sweep_target_origin_yz.py --mode smart-square --seed-origin 1126,-400,1130 --square-size-mm 300 --smart-max-iters 1 --workers 1 --skip-window-repair --skip-inserted-repair
+```
+
+For receiver/RoboDK finalization, run only when the correct station is open:
+
+```powershell
+python online_roundtrip.py run-receiver --handoff artifacts/online_runs/<run_id>/handoff_package.json --run-id <run_id>_receiver
+```
+
+## Artifacts
+
+Preserve these conventions unless explicitly redesigning them:
 
 - `artifacts/local_runs/<run_id>/request.json`
 - `artifacts/local_runs/<run_id>/eval_result.json`
 - `artifacts/local_runs/<run_id>/selected_joint_path.csv`
 - `artifacts/local_runs/<run_id>/run_archive.json`
-- `artifacts/local_runs/<run_id>/profile_retry_summary.json`
 - `artifacts/online_runs/<run_id>/request.json`
 - `artifacts/online_runs/<run_id>/results.json`
-- `artifacts/diagnostics/`
+- `artifacts/online_runs/<run_id>/handoff_package.json`
+- `artifacts/online_runs/<run_id>/origin_yz_search_results.json`
 - `artifacts/run_logs/`
 - `artifacts/tmp/`
 
-When changing run behavior or diagnostics, preserve these conventions unless the task explicitly asks to redesign them.
+## Communication And Iteration
 
-If you modify output schemas, filenames, or run directory structure, update the user-facing README and the relevant `AGENTS.md` files.
+The user often gives compressed Chinese-first instructions. Infer low-risk
+details, keep visible restatement short, and proceed. Prefer autonomous
+multi-pass refinement for non-trivial work:
 
-## Validation Expectations
+1. Understand the relevant layer.
+2. Implement a focused first pass.
+3. Self-review the diff.
+4. Run the smallest useful validation.
+5. Do one cheap cleanup/refinement pass if it materially improves correctness
+   or readability.
 
-There is no obvious centralized root test suite, so validation is task-specific.
-
-Prefer the smallest relevant validation:
-
-- import-level or module-level checks for pure refactors
-- focused diagnostic scripts for search or IK behavior
-- targeted single-machine solve runs for pipeline changes
-- online requester/worker smoke flows for remote orchestration changes
-
-If validation is expensive, use Slurm.
-
-When reporting results, separate:
-
-- what changed
-- what was validated
-- what was not validated
-
-## Kimi Consultation
-
-Codex may consult the local Kimi CLI for advisory-only second opinions.
-
-- Use it only when it materially improves confidence.
-- Good fits: design review, public-web cross-checking, risk review, Chinese-language synthesis.
-- Do not treat Kimi as the primary executor for this repo.
-- Do not use Kimi to make direct local file changes or Slurm decisions.
-
-The wrapper is:
-
-- `/home/tzwang/.codex/skills/kimi-consult/scripts/ask_kimi.sh`
-
-## When To Update This File
-
-Update this file when you change:
-
-- the recommended edit surface
-- primary entrypoints or package responsibilities
-- artifact conventions
-- environment/runtime expectations
-- Slurm execution policy for this repo
-- backend architecture in a way future agents should know
+Ask only when requirements are materially ambiguous or a wrong assumption would
+cause high-cost validation, data loss, or architectural drift.

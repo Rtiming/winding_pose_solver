@@ -17,11 +17,30 @@ STRICT_DELIVERY_GATE: dict[str, object] = {
     "required_invalid_row_count": 0,
     "required_ik_empty_row_count": 0,
     "requires_selected_joint_path": True,
-    "treats_status_as_diagnostic": True,
+    "requires_status_valid": True,
+    "requires_closed_winding_terminal_if_closed_path": True,
+    "required_bridge_like_segments": 0,
+    "required_big_circle_step_count": 0,
+    "required_worst_joint_step_deg_limit": 60.0,
     "treats_config_switches_as_warning": True,
-    "treats_bridge_like_segments_as_warning": True,
-    "treats_worst_joint_step_as_warning": True,
+    "treats_bridge_like_segments_as_warning": False,
+    "treats_big_circle_step_as_warning": False,
+    "treats_worst_joint_step_as_warning": False,
 }
+
+
+def _safe_int(value: object, default_value: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return int(default_value)
+
+
+def _safe_float(value: object, default_value: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float(default_value)
 
 
 def _result_has_selected_path(result: object) -> bool:
@@ -43,22 +62,6 @@ def _result_has_selected_path(result: object) -> bool:
         return True
 
 
-def result_is_strictly_valid(result: object | None) -> bool:
-    """Return whether a result is deliverable for the user's target objective.
-
-    Historical callers use the "strict" name, but the current delivery policy
-    intentionally treats continuity diagnostics as warnings. The hard gate is
-    whether every target row has an IK solution and a complete selected path.
-    """
-    if result is None:
-        return False
-    return (
-        int(getattr(result, "invalid_row_count", 0)) == 0
-        and int(getattr(result, "ik_empty_row_count", 0)) == 0
-        and _result_has_selected_path(result)
-    )
-
-
 def _payload_has_selected_path(payload: dict[str, object]) -> bool:
     selected_path = payload.get("selected_path")
     row_labels = payload.get("row_labels")
@@ -69,14 +72,248 @@ def _payload_has_selected_path(payload: dict[str, object]) -> bool:
     return True
 
 
-def result_payload_is_strictly_valid(payload: dict[str, object] | None) -> bool:
-    if payload is None:
-        return False
-    return (
-        int(payload.get("invalid_row_count", 0)) == 0
-        and int(payload.get("ik_empty_row_count", 0)) == 0
-        and _payload_has_selected_path(payload)
+def _result_passes_closed_winding_terminal_if_needed(result: object) -> bool:
+    metadata = getattr(result, "metadata", None)
+    if not isinstance(metadata, dict):
+        return True
+    report = metadata.get("closed_winding_terminal")
+    if not isinstance(report, dict):
+        return True
+    if not bool(report.get("closed_path", False)):
+        return True
+    return bool(report.get("passed", False))
+
+
+def _payload_passes_closed_winding_terminal_if_needed(payload: dict[str, object]) -> bool:
+    metadata = payload.get("metadata", {})
+    if not isinstance(metadata, dict):
+        return True
+    report = metadata.get("closed_winding_terminal")
+    if not isinstance(report, dict):
+        return True
+    if not bool(report.get("closed_path", False)):
+        return True
+    return bool(report.get("passed", False))
+
+
+def _delivery_gate_details_from_metrics(
+    *,
+    status_value: object,
+    invalid_row_count: int,
+    ik_empty_row_count: int,
+    has_selected_path: bool,
+    passes_closed_terminal: bool,
+    bridge_like_segments: int,
+    big_circle_step_count: int,
+    worst_joint_step_deg: float,
+    worst_step_limit: float,
+) -> dict[str, object]:
+    status_text = str(status_value)
+    status_valid = status_text == "valid"
+    objective_reachable = (
+        status_valid
+        and invalid_row_count == int(STRICT_DELIVERY_GATE["required_invalid_row_count"])
+        and ik_empty_row_count == int(STRICT_DELIVERY_GATE["required_ik_empty_row_count"])
+        and has_selected_path
+        and passes_closed_terminal
     )
+
+    strictly_valid = (
+        objective_reachable
+        and bridge_like_segments == int(STRICT_DELIVERY_GATE["required_bridge_like_segments"])
+        and big_circle_step_count == int(STRICT_DELIVERY_GATE["required_big_circle_step_count"])
+        and worst_joint_step_deg <= float(worst_step_limit) + 1e-9
+    )
+
+    block_reasons: list[dict[str, object]] = []
+    if not status_valid:
+        block_reasons.append(
+            {
+                "code": "status_not_valid",
+                "message": "result.status is not 'valid'",
+                "value": status_text,
+            }
+        )
+    if invalid_row_count != int(STRICT_DELIVERY_GATE["required_invalid_row_count"]):
+        block_reasons.append(
+            {
+                "code": "invalid_row_count_nonzero",
+                "message": "invalid_row_count must be zero",
+                "value": int(invalid_row_count),
+            }
+        )
+    if ik_empty_row_count != int(STRICT_DELIVERY_GATE["required_ik_empty_row_count"]):
+        block_reasons.append(
+            {
+                "code": "ik_empty_row_count_nonzero",
+                "message": "ik_empty_row_count must be zero",
+                "value": int(ik_empty_row_count),
+            }
+        )
+    if not has_selected_path:
+        block_reasons.append(
+            {
+                "code": "selected_path_missing_or_incomplete",
+                "message": "selected_path must exist and match row_labels length",
+            }
+        )
+    if not passes_closed_terminal:
+        block_reasons.append(
+            {
+                "code": "closed_winding_terminal_failed",
+                "message": "closed winding terminal hard rule failed",
+            }
+        )
+    if bridge_like_segments > int(STRICT_DELIVERY_GATE["required_bridge_like_segments"]):
+        block_reasons.append(
+            {
+                "code": "bridge_like_segments_nonzero",
+                "message": "bridge_like_segments must be zero for official delivery",
+                "value": int(bridge_like_segments),
+            }
+        )
+    if big_circle_step_count > int(STRICT_DELIVERY_GATE["required_big_circle_step_count"]):
+        block_reasons.append(
+            {
+                "code": "big_circle_step_detected",
+                "message": "big_circle_step_count must be zero for official delivery",
+                "value": int(big_circle_step_count),
+            }
+        )
+    if worst_joint_step_deg > float(worst_step_limit) + 1e-9:
+        block_reasons.append(
+            {
+                "code": "worst_joint_step_exceeds_limit",
+                "message": "worst_joint_step_deg exceeds official limit",
+                "value": float(worst_joint_step_deg),
+                "limit": float(worst_step_limit),
+            }
+        )
+
+    gate_tier = "official" if strictly_valid else ("debug" if objective_reachable else "diagnostic")
+    return {
+        "strictly_valid": bool(strictly_valid),
+        "objective_reachable": bool(objective_reachable),
+        "official_delivery_allowed": bool(strictly_valid),
+        "gate_tier": gate_tier,
+        "block_reasons": block_reasons,
+    }
+
+
+def _result_delivery_gate_details(result: object | None) -> dict[str, object]:
+    if result is None:
+        return {
+            "strictly_valid": False,
+            "objective_reachable": False,
+            "official_delivery_allowed": False,
+            "gate_tier": "diagnostic",
+            "block_reasons": [
+                {
+                    "code": "missing_result",
+                    "message": "result is None",
+                }
+            ],
+        }
+
+    invalid_row_count = _safe_int(getattr(result, "invalid_row_count", 0))
+    ik_empty_row_count = _safe_int(getattr(result, "ik_empty_row_count", 0))
+    has_selected_path = _result_has_selected_path(result)
+    passes_closed_terminal = _result_passes_closed_winding_terminal_if_needed(result)
+    bridge_like_segments = _safe_int(getattr(result, "bridge_like_segments", 0))
+    big_circle_step_count = _safe_int(getattr(result, "big_circle_step_count", 0))
+    worst_joint_step_deg = _safe_float(getattr(result, "worst_joint_step_deg", 0.0))
+    worst_step_limit = _safe_float(
+        getattr(
+            result,
+            "motion_settings",
+            {},
+        ).get(
+            "official_worst_joint_step_deg_limit",
+            STRICT_DELIVERY_GATE["required_worst_joint_step_deg_limit"],
+        )
+        if isinstance(getattr(result, "motion_settings", {}), dict)
+        else STRICT_DELIVERY_GATE["required_worst_joint_step_deg_limit"]
+    )
+
+    return _delivery_gate_details_from_metrics(
+        status_value=getattr(result, "status", "unknown"),
+        invalid_row_count=invalid_row_count,
+        ik_empty_row_count=ik_empty_row_count,
+        has_selected_path=has_selected_path,
+        passes_closed_terminal=passes_closed_terminal,
+        bridge_like_segments=bridge_like_segments,
+        big_circle_step_count=big_circle_step_count,
+        worst_joint_step_deg=worst_joint_step_deg,
+        worst_step_limit=worst_step_limit,
+    )
+
+
+def summary_metrics_delivery_gate_details(row: dict[str, object]) -> dict[str, object]:
+    """Apply the official quality gate to compact metric-only summary rows.
+
+    Origin-search result rows intentionally do not carry selected_path or the
+    closed-terminal report because they are compact search summaries.  The
+    full handoff path is still validated later through result_quality_summary()
+    and load_handoff_package().
+    """
+    worst_step_limit = _safe_float(
+        row.get(
+            "official_worst_joint_step_deg_limit",
+            STRICT_DELIVERY_GATE["required_worst_joint_step_deg_limit"],
+        )
+    )
+    return _delivery_gate_details_from_metrics(
+        status_value=row.get("status", "invalid"),
+        invalid_row_count=_safe_int(row.get("invalid_row_count", 0)),
+        ik_empty_row_count=_safe_int(row.get("ik_empty_row_count", 0)),
+        has_selected_path=True,
+        passes_closed_terminal=True,
+        bridge_like_segments=_safe_int(row.get("bridge_like_segments", 0)),
+        big_circle_step_count=_safe_int(row.get("big_circle_step_count", 0)),
+        worst_joint_step_deg=_safe_float(row.get("worst_joint_step_deg", 0.0)),
+        worst_step_limit=worst_step_limit,
+    )
+
+
+def _payload_delivery_gate_details(payload: dict[str, object] | None) -> dict[str, object]:
+    if payload is None:
+        return {
+            "strictly_valid": False,
+            "objective_reachable": False,
+            "official_delivery_allowed": False,
+            "gate_tier": "diagnostic",
+            "block_reasons": [
+                {
+                    "code": "missing_payload",
+                    "message": "payload is None",
+                }
+            ],
+        }
+
+    pseudo_result = type("PayloadResult", (), {})()
+    setattr(pseudo_result, "status", payload.get("status"))
+    setattr(pseudo_result, "invalid_row_count", payload.get("invalid_row_count"))
+    setattr(pseudo_result, "ik_empty_row_count", payload.get("ik_empty_row_count"))
+    setattr(pseudo_result, "selected_path", payload.get("selected_path"))
+    setattr(pseudo_result, "row_labels", payload.get("row_labels"))
+    setattr(pseudo_result, "metadata", payload.get("metadata", {}))
+    setattr(pseudo_result, "bridge_like_segments", payload.get("bridge_like_segments"))
+    setattr(pseudo_result, "big_circle_step_count", payload.get("big_circle_step_count"))
+    setattr(pseudo_result, "worst_joint_step_deg", payload.get("worst_joint_step_deg"))
+    setattr(
+        pseudo_result,
+        "motion_settings",
+        payload.get("motion_settings", {}),
+    )
+    return _result_delivery_gate_details(pseudo_result)
+
+
+def result_is_strictly_valid(result: object | None) -> bool:
+    return bool(_result_delivery_gate_details(result).get("strictly_valid"))
+
+
+def result_payload_is_strictly_valid(payload: dict[str, object] | None) -> bool:
+    return bool(_payload_delivery_gate_details(payload).get("strictly_valid"))
 
 
 def result_semantic_status(result: object | None) -> str:
@@ -89,34 +326,53 @@ def result_has_continuity_warnings(result: object | None) -> bool:
     if result is None:
         return False
     failing_segments = getattr(result, "failing_segments", ())
+    worst_joint_step_deg = _safe_float(getattr(result, "worst_joint_step_deg", 0.0))
+    worst_step_limit = _safe_float(
+        getattr(result, "motion_settings", {}).get(
+            "official_worst_joint_step_deg_limit",
+            STRICT_DELIVERY_GATE["required_worst_joint_step_deg_limit"],
+        )
+        if isinstance(getattr(result, "motion_settings", {}), dict)
+        else STRICT_DELIVERY_GATE["required_worst_joint_step_deg_limit"]
+    )
     return (
-        int(getattr(result, "config_switches", 0)) > 0
-        or int(getattr(result, "bridge_like_segments", 0)) > 0
+        _safe_int(getattr(result, "bridge_like_segments", 0)) > 0
+        or _safe_int(getattr(result, "big_circle_step_count", 0)) > 0
+        or worst_joint_step_deg > worst_step_limit + 1e-9
         or bool(failing_segments)
     )
 
 
 def result_quality_summary(result: ProfileEvaluationResult) -> dict[str, object]:
-    return {
+    gate = _result_delivery_gate_details(result)
+    summary = {
         "request_id": str(result.request_id),
         "status": str(result.status),
         "ik_empty_row_count": int(result.ik_empty_row_count),
         "config_switches": int(result.config_switches),
         "bridge_like_segments": int(result.bridge_like_segments),
+        "big_circle_step_count": int(result.big_circle_step_count),
+        "branch_flip_ratio": float(result.branch_flip_ratio),
+        "violent_branch_segments": [dict(item) for item in result.violent_branch_segments],
         "invalid_row_count": int(result.invalid_row_count),
         "worst_joint_step_deg": float(result.worst_joint_step_deg),
         "mean_joint_step_deg": float(result.mean_joint_step_deg),
         "total_cost": float(result.total_cost),
-        "objective_reachable": bool(result_is_strictly_valid(result)),
-        "official_delivery_allowed": bool(result_is_strictly_valid(result)),
-        "strictly_valid": bool(result_is_strictly_valid(result)),
+        "objective_reachable": bool(gate["objective_reachable"]),
+        "official_delivery_allowed": bool(gate["official_delivery_allowed"]),
+        "strictly_valid": bool(gate["strictly_valid"]),
+        "gate_tier": str(gate["gate_tier"]),
+        "block_reasons": [dict(item) for item in gate["block_reasons"]],
         "continuity_warnings": {
             "status": str(result.status),
             "config_switches": int(result.config_switches),
             "bridge_like_segments": int(result.bridge_like_segments),
+            "big_circle_step_count": int(result.big_circle_step_count),
             "worst_joint_step_deg": float(result.worst_joint_step_deg),
+            "branch_flip_ratio": float(result.branch_flip_ratio),
         },
     }
+    return summary
 
 
 def selected_joint_path_rows(result: ProfileEvaluationResult) -> list[dict[str, object]]:
@@ -158,7 +414,8 @@ def build_handoff_payload(
     allow_invalid: bool = False,
     package_kind: str = "official_handoff",
 ) -> dict[str, object]:
-    delivery_allowed = result_is_strictly_valid(selected_result)
+    gate = _result_delivery_gate_details(selected_result)
+    delivery_allowed = bool(gate["official_delivery_allowed"])
     if not delivery_allowed and not allow_invalid:
         raise ValueError("Refusing to build a handoff package for a non-deliverable result.")
 
@@ -171,16 +428,20 @@ def build_handoff_payload(
         "consumer_role": consumer_role,
         "delivery_gate": {
             **STRICT_DELIVERY_GATE,
-            "objective_reachable": bool(delivery_allowed),
-            "official_delivery_allowed": bool(delivery_allowed),
+            "objective_reachable": bool(gate["objective_reachable"]),
+            "official_delivery_allowed": bool(gate["official_delivery_allowed"]),
             "debug_invalid_output": bool(not delivery_allowed),
+            "gate_tier": str(gate["gate_tier"]),
+            "block_reasons": [dict(item) for item in gate["block_reasons"]],
         },
         "strict_quality_gate": {
             **STRICT_DELIVERY_GATE,
-            "strictly_valid": bool(delivery_allowed),
-            "objective_reachable": bool(delivery_allowed),
-            "official_delivery_allowed": bool(delivery_allowed),
+            "strictly_valid": bool(gate["strictly_valid"]),
+            "objective_reachable": bool(gate["objective_reachable"]),
+            "official_delivery_allowed": bool(gate["official_delivery_allowed"]),
             "debug_invalid_output": bool(not delivery_allowed),
+            "gate_tier": str(gate["gate_tier"]),
+            "block_reasons": [dict(item) for item in gate["block_reasons"]],
         },
         "selection": result_quality_summary(selected_result),
         "selected_profile": {

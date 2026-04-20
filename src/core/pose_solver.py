@@ -7,6 +7,7 @@ import pandas as pd
 
 from .geometry import _rotation_matrix_from_xyz_offset_deg
 from .frame_math import (
+    CenterlineDataset,
     FrameBuildOptions,
     FrameRecord,
     default_verification_row_ids,
@@ -18,7 +19,7 @@ from .frame_math import (
 
 def solve_tool_poses(
     input_csv_path: str | Path,
-    output_csv_path: str | Path,
+    output_csv_path: str | Path | None,
     *,
     build_options: FrameBuildOptions,
     append_start_as_terminal: bool = False,
@@ -36,6 +37,29 @@ def solve_tool_poses(
         build_options=build_options,
         append_start_as_terminal=append_start_as_terminal,
     )
+    return solve_tool_poses_from_dataset(
+        dataset,
+        output_csv_path,
+        target_frame_origin_mm=target_frame_origin_mm,
+        target_frame_rotation_xyz_deg=target_frame_rotation_xyz_deg,
+        verify_solution=verify_solution,
+        verification_row_ids=verification_row_ids,
+        verification_tolerance=verification_tolerance,
+    )
+
+
+def solve_tool_poses_from_dataset(
+    dataset: CenterlineDataset,
+    output_csv_path: str | Path | None,
+    *,
+    target_frame_origin_mm: tuple[float, float, float] | np.ndarray,
+    target_frame_rotation_xyz_deg: tuple[float, float, float] | np.ndarray,
+    verify_solution: bool,
+    verification_row_ids: list[int] | None,
+    verification_tolerance: float,
+) -> pd.DataFrame:
+    """Build tool pose rows from an already-loaded centerline dataset."""
+
     print(format_issue_report(dataset.records))
 
     # 目标坐标系 A 固定在 Frame 2 中。
@@ -120,12 +144,14 @@ def solve_tool_poses(
 
     # 生成结果表，并确保输出目录存在。
     result = pd.DataFrame(output_rows)
-    output_csv_path = Path(output_csv_path)
-    output_csv_path.parent.mkdir(parents=True, exist_ok=True)
-    result.to_csv(output_csv_path, index=False)
-
     valid_count = int(result["valid"].sum())
-    print(f"Wrote {output_csv_path} with {valid_count} valid row(s) out of {len(result)}.")
+    if output_csv_path is not None:
+        output_csv_path = Path(output_csv_path)
+        output_csv_path.parent.mkdir(parents=True, exist_ok=True)
+        result.to_csv(output_csv_path, index=False)
+        print(f"Wrote {output_csv_path} with {valid_count} valid row(s) out of {len(result)}.")
+    else:
+        print(f"Built {valid_count} valid pose row(s) out of {len(result)} without writing CSV.")
 
     # 可选验证：随机或按指定行检查闭环误差。
     if verify_solution:

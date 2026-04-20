@@ -1,6 +1,7 @@
 # Repository Instructions
 
 - Read the nearest `AGENTS.md` before making non-trivial changes. If you are working in a subdirectory with its own `AGENTS.md`, that more specific file takes precedence.
+- Canonical server path is `/home/tzwang/program/winding_pose_solver`; do not use the retired `/home/tzwang/apps/winding_pose_solver` copy.
 - Keep top-level entrypoints thin. New implementation usually belongs in `src/core/`, `src/search/`, `src/runtime/`, `src/robodk_runtime/`, or `src/six_axis_ik/` rather than in flat wrapper modules.
 - The user prefers autonomous multi-pass refinement for non-trivial tasks. Default to a short plan, first implementation, self-review, focused validation, and one refinement pass before handing back results.
 - Do not stop at a merely plausible first draft if another cheap pass would likely improve correctness, maintainability, or consistency with the existing codebase.

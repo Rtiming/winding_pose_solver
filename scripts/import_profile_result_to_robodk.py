@@ -34,6 +34,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--focus-end-label", default=None)
     parser.add_argument("--move-type", choices=("MoveJ", "MoveL"), default=None)
     parser.add_argument("--no-program", action="store_true")
+    parser.add_argument(
+        "--cartesian-markers",
+        action="store_true",
+        help="Also create visible Cartesian marker targets for diagnostics.",
+    )
     parser.add_argument("--no-cartesian-markers", action="store_true")
     parser.add_argument("--keep-existing", action="store_true")
     return parser.parse_args()
@@ -50,7 +55,7 @@ def main() -> int:
         prefix=args.prefix,
         clear_prefix=not args.keep_existing,
         create_program=not args.no_program,
-        create_cartesian_markers=not args.no_cartesian_markers,
+        create_cartesian_markers=bool(args.cartesian_markers and not args.no_cartesian_markers),
         focus_start_label=args.focus_start_label,
         focus_end_label=args.focus_end_label,
         move_type=args.move_type,

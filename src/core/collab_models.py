@@ -178,6 +178,11 @@ class ProfileEvaluationResult:
     diagnostics: str | None
     error_message: str | None
     profiling: dict[str, dict[str, float | int]]
+    big_circle_step_count: int = 0
+    branch_flip_ratio: float = 0.0
+    violent_branch_segments: tuple[dict[str, Any], ...] = field(default_factory=tuple)
+    gate_tier: str = "diagnostic"
+    block_reasons: tuple[dict[str, Any], ...] = field(default_factory=tuple)
     metadata: dict[str, Any] = field(default_factory=dict)
     pose_rows: tuple[dict[str, float], ...] | None = None
 
@@ -220,6 +225,25 @@ class ProfileEvaluationResult:
                 }
                 for name, stats in dict(payload.get("profiling", {})).items()
             },
+            big_circle_step_count=int(payload.get("big_circle_step_count", 0)),
+            branch_flip_ratio=float(payload.get("branch_flip_ratio", 0.0)),
+            violent_branch_segments=tuple(
+                (
+                    dict(item)
+                    if isinstance(item, dict)
+                    else {"value": item}
+                )
+                for item in payload.get("violent_branch_segments", ())
+            ),
+            gate_tier=str(payload.get("gate_tier", "diagnostic")),
+            block_reasons=tuple(
+                (
+                    dict(item)
+                    if isinstance(item, dict)
+                    else {"code": "legacy_reason", "message": str(item)}
+                )
+                for item in payload.get("block_reasons", ())
+            ),
             metadata=dict(payload.get("metadata", {})),
             pose_rows=None if pose_rows_payload is None else _normalize_pose_rows(pose_rows_payload),
         )
