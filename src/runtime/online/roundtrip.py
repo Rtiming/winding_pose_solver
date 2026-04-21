@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import os
 import shlex
 import subprocess
 import sys
@@ -54,6 +55,23 @@ SYNC_GUARD_FILES: tuple[str, ...] = (
 SYNC_MODE_OFF = "off"
 SYNC_MODE_GUARD = "guard"
 SYNC_MODE_PUSH = "push"
+SYNC_BUNDLE_TREE_PATHS: tuple[str, ...] = (
+    "src",
+    "scripts",
+)
+SYNC_BUNDLE_ROOT_FILES: tuple[str, ...] = (
+    "online_roundtrip.py",
+    "online_requester.py",
+    "online_worker.py",
+    "main.py",
+    "app_settings.py",
+    "requirements.shared.txt",
+    "requirements.server.txt",
+    "environment.server.yml",
+    "README.md",
+    "AGENTS.md",
+)
+SYNC_BUNDLE_HASH_RELATIVE_PATH = "artifacts/tmp/runtime_bundle.sha256"
 
 
 @dataclass(frozen=True)
@@ -228,11 +246,21 @@ def _run_local_command_with_retries(
     cwd: Path | None = None,
     log_options: CommandLogOptions,
     echo_output: bool,
-    attempts: int = 3,
-    delay_seconds: float = 1.0,
+    attempts: int | None = None,
+    delay_seconds: float | None = None,
 ) -> subprocess.CompletedProcess[str]:
+    resolved_attempts = (
+        max(1, int(attempts))
+        if attempts is not None
+        else _positive_int_from_env("WPS_LOCAL_CMD_RETRY_ATTEMPTS", 3)
+    )
+    resolved_delay_seconds = (
+        max(0.0, float(delay_seconds))
+        if delay_seconds is not None
+        else _non_negative_float_from_env("WPS_LOCAL_CMD_RETRY_DELAY_SECONDS", 1.0)
+    )
     last_error: subprocess.CalledProcessError | None = None
-    for attempt_index in range(1, max(1, int(attempts)) + 1):
+    for attempt_index in range(1, resolved_attempts + 1):
         try:
             return _run_local_command(
                 args,
@@ -242,15 +270,15 @@ def _run_local_command_with_retries(
             )
         except subprocess.CalledProcessError as exc:
             last_error = exc
-            if attempt_index >= max(1, int(attempts)):
+            if attempt_index >= resolved_attempts:
                 break
             message = (
-                f"[retry] local command failed on attempt {attempt_index}/{attempts}; "
-                f"retrying in {delay_seconds:.1f}s."
+                f"[retry] local command failed on attempt {attempt_index}/{resolved_attempts}; "
+                f"retrying in {resolved_delay_seconds:.1f}s."
             )
             print(message)
             _append_log(log_options.log_path, message)
-            sleep(max(0.0, float(delay_seconds)))
+            sleep(resolved_delay_seconds)
     assert last_error is not None
     raise last_error
 
@@ -278,11 +306,21 @@ def _run_remote_bash_with_retries(
     *,
     log_options: CommandLogOptions,
     echo_output: bool,
-    attempts: int = 3,
-    delay_seconds: float = 1.0,
+    attempts: int | None = None,
+    delay_seconds: float | None = None,
 ) -> subprocess.CompletedProcess[str]:
+    resolved_attempts = (
+        max(1, int(attempts))
+        if attempts is not None
+        else _positive_int_from_env("WPS_REMOTE_CMD_RETRY_ATTEMPTS", 3)
+    )
+    resolved_delay_seconds = (
+        max(0.0, float(delay_seconds))
+        if delay_seconds is not None
+        else _non_negative_float_from_env("WPS_REMOTE_CMD_RETRY_DELAY_SECONDS", 1.0)
+    )
     last_error: subprocess.CalledProcessError | None = None
-    for attempt_index in range(1, max(1, int(attempts)) + 1):
+    for attempt_index in range(1, resolved_attempts + 1):
         try:
             return _run_remote_bash(
                 host,
@@ -292,15 +330,15 @@ def _run_remote_bash_with_retries(
             )
         except subprocess.CalledProcessError as exc:
             last_error = exc
-            if attempt_index >= max(1, int(attempts)):
+            if attempt_index >= resolved_attempts:
                 break
             message = (
-                f"[retry] remote command failed on attempt {attempt_index}/{attempts}; "
-                f"retrying in {delay_seconds:.1f}s."
+                f"[retry] remote command failed on attempt {attempt_index}/{resolved_attempts}; "
+                f"retrying in {resolved_delay_seconds:.1f}s."
             )
             print(message)
             _append_log(log_options.log_path, message)
-            sleep(max(0.0, float(delay_seconds)))
+            sleep(resolved_delay_seconds)
     assert last_error is not None
     raise last_error
 
@@ -318,6 +356,42 @@ def _summarize_subprocess_failure(exc: subprocess.CalledProcessError) -> str:
 
 def _subprocess_text(exc: subprocess.CalledProcessError) -> str:
     return "\n".join(text for text in (exc.stderr, exc.output) if text)
+
+
+def _positive_int_from_env(name: str, default: int) -> int:
+    fallback = max(1, int(default))
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        return fallback
+    try:
+        parsed_value = int(str(raw_value).strip())
+    except ValueError:
+        return fallback
+    return max(1, parsed_value)
+
+
+def _non_negative_float_from_env(name: str, default: float) -> float:
+    fallback = max(0.0, float(default))
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        return fallback
+    try:
+        parsed_value = float(str(raw_value).strip())
+    except ValueError:
+        return fallback
+    return max(0.0, parsed_value)
+
+
+def _env_flag(name: str, *, default: bool = False) -> bool:
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        return bool(default)
+    normalized = str(raw_value).strip().lower()
+    if normalized in {"", "0", "false", "no", "off"}:
+        return False
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    return bool(default)
 
 
 def _looks_like_missing_remote_artifact(exc: subprocess.CalledProcessError) -> bool:
@@ -341,6 +415,104 @@ def _sha256_file(path: Path) -> str:
                 break
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _sync_bundle_local_paths() -> tuple[Path, ...]:
+    return tuple(
+        (REPO_ROOT / relative_path)
+        for relative_path in (
+            *SYNC_BUNDLE_TREE_PATHS,
+            *SYNC_BUNDLE_ROOT_FILES,
+        )
+    )
+
+
+def _iter_sync_bundle_local_files() -> tuple[Path, ...]:
+    collected_files: list[Path] = []
+    for path in _sync_bundle_local_paths():
+        if not path.exists():
+            raise FileNotFoundError(f"Sync bundle path does not exist: {path}")
+        if path.is_file():
+            collected_files.append(path)
+            continue
+        if path.is_dir():
+            collected_files.extend(
+                child_path
+                for child_path in sorted(path.rglob("*"))
+                if child_path.is_file()
+            )
+            continue
+        raise RuntimeError(f"Unsupported sync bundle path type: {path}")
+    return tuple(collected_files)
+
+
+def _compute_sync_bundle_sha256() -> str:
+    digest = hashlib.sha256()
+    seen_relative_paths: set[str] = set()
+    for local_path in _iter_sync_bundle_local_files():
+        relative_path = local_path.relative_to(REPO_ROOT).as_posix()
+        if relative_path in seen_relative_paths:
+            continue
+        seen_relative_paths.add(relative_path)
+        digest.update(relative_path.encode("utf-8"))
+        digest.update(b"\0")
+        with local_path.open("rb") as handle:
+            while True:
+                chunk = handle.read(1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def _read_remote_sync_bundle_sha256(
+    *,
+    host: str,
+    server_dir: str,
+    log_options: CommandLogOptions,
+) -> str | None:
+    remote_shell_dir = _remote_dir_for_shell(server_dir)
+    remote_script = f"""
+set -e
+cd "{remote_shell_dir}"
+if [ -f "{SYNC_BUNDLE_HASH_RELATIVE_PATH}" ]; then
+    cat "{SYNC_BUNDLE_HASH_RELATIVE_PATH}"
+fi
+"""
+    result = _run_remote_bash_with_retries(
+        host,
+        remote_script,
+        log_options=log_options,
+        echo_output=False,
+    )
+    digest = (result.stdout or "").strip().lower()
+    if len(digest) == 64 and all(char in "0123456789abcdef" for char in digest):
+        return digest
+    return None
+
+
+def _write_remote_sync_bundle_sha256(
+    *,
+    host: str,
+    server_dir: str,
+    digest: str,
+    log_options: CommandLogOptions,
+) -> None:
+    remote_shell_dir = _remote_dir_for_shell(server_dir)
+    quoted_digest = shlex.quote(str(digest).strip())
+    remote_script = f"""
+set -e
+cd "{remote_shell_dir}"
+mkdir -p "$(dirname "{SYNC_BUNDLE_HASH_RELATIVE_PATH}")"
+printf '%s\\n' {quoted_digest} > "{SYNC_BUNDLE_HASH_RELATIVE_PATH}"
+"""
+    _run_remote_bash_with_retries(
+        host,
+        remote_script,
+        log_options=log_options,
+        echo_output=False,
+    )
 
 
 def _remote_file_sha256(
@@ -498,43 +670,53 @@ def _sync_source_tree_to_server(
         ),
         log_options=log_options,
     )
-    _run_stage(
-        "[online/sync] Uploading src/ ...",
-        lambda: _run_local_command_with_retries(
-            ["scp", "-r", str(REPO_ROOT / "src"), f"{host}:{server_dir}/"],
-            log_options=log_options,
-            echo_output=False,
-        ),
+    local_bundle_hash = _compute_sync_bundle_sha256()
+    remote_bundle_hash = _read_remote_sync_bundle_sha256(
+        host=host,
+        server_dir=server_dir,
         log_options=log_options,
     )
+    force_bundle_sync = _env_flag("WPS_FORCE_BUNDLE_SYNC", default=False)
+    if not force_bundle_sync and remote_bundle_hash == local_bundle_hash:
+        message = (
+            "[online/sync] Runtime bundle unchanged; upload skipped "
+            f"(hash={local_bundle_hash[:12]})."
+        )
+        print(message)
+        _append_log(log_options.log_path, message)
+        return
+    if force_bundle_sync:
+        force_message = "[online/sync] WPS_FORCE_BUNDLE_SYNC=1; forcing runtime bundle upload."
+        print(force_message)
+        _append_log(log_options.log_path, force_message)
+
+    upload_sources = [
+        *(str(REPO_ROOT / relative_path) for relative_path in SYNC_BUNDLE_TREE_PATHS),
+        *(str(REPO_ROOT / relative_path) for relative_path in SYNC_BUNDLE_ROOT_FILES),
+    ]
     _run_stage(
-        "[online/sync] Uploading scripts/ ...",
-        lambda: _run_local_command_with_retries(
-            ["scp", "-r", str(REPO_ROOT / "scripts"), f"{host}:{server_dir}/"],
-            log_options=log_options,
-            echo_output=False,
-        ),
-        log_options=log_options,
-    )
-    _run_stage(
-        "[online/sync] Uploading root entry files ...",
+        "[online/sync] Uploading runtime bundle ...",
         lambda: _run_local_command_with_retries(
             [
                 "scp",
-                str(REPO_ROOT / "online_roundtrip.py"),
-                str(REPO_ROOT / "online_requester.py"),
-                str(REPO_ROOT / "online_worker.py"),
-                str(REPO_ROOT / "main.py"),
-                str(REPO_ROOT / "app_settings.py"),
-                str(REPO_ROOT / "requirements.shared.txt"),
-                str(REPO_ROOT / "requirements.server.txt"),
-                str(REPO_ROOT / "environment.server.yml"),
-                str(REPO_ROOT / "README.md"),
-                str(REPO_ROOT / "AGENTS.md"),
+                "-r",
+                *upload_sources,
                 f"{host}:{server_dir}/",
             ],
             log_options=log_options,
             echo_output=False,
+            attempts=4,
+            delay_seconds=1.5,
+        ),
+        log_options=log_options,
+    )
+    _run_stage(
+        "[online/sync] Recording runtime bundle hash ...",
+        lambda: _write_remote_sync_bundle_sha256(
+            host=host,
+            server_dir=server_dir,
+            digest=local_bundle_hash,
+            log_options=log_options,
         ),
         log_options=log_options,
     )
@@ -576,6 +758,33 @@ def _run_coordinator_sync_preflight(
         )
     else:
         print("[online/coordinator] Remote sync guard disabled by configuration.")
+
+
+def _remote_server_env_export_block() -> str:
+    override_names = (
+        "WPS_SERVER_PARTITION",
+        "WPS_SERVER_CPUS",
+        "WPS_SERVER_MEM_MB",
+        "WPS_OFFLINE_BATCH_WORKERS",
+        "WPS_SERVER_PROFILE_WORKERS",
+        "WPS_SERVER_PROFILE_WORKERS_MAX",
+        "WPS_SERVER_PROFILE_MIN_BATCH_SIZE",
+        "WPS_SERVER_PROFILE_MIN_BATCH_SIZE_CAP",
+        "WPS_SERVER_PROFILE_ALLOW_HIGH_MIN_BATCH",
+        "WPS_LOCAL_RETRY_REPAIR_EVAL_MODE",
+        "WPS_RUNTIME_PROFILE_LEVEL",
+        "WPS_ALLOW_LOGIN_NODE_SERVER",
+    )
+    export_lines: list[str] = []
+    for name in override_names:
+        value = os.getenv(name)
+        if value is None:
+            continue
+        stripped = str(value).strip()
+        if not stripped:
+            continue
+        export_lines.append(f"export {name}={shlex.quote(stripped)}")
+    return "\n".join(export_lines)
 
 
 def _run_stage(
@@ -958,9 +1167,20 @@ def run_server_role(
             "(ik_backend='six_axis_ik', create_program=False)."
         )
 
-    def _evaluate_candidates() -> EvaluationBatchResult:
-        from src.robodk_runtime.eval_worker import evaluate_batch_request
+    selected_search_result_holder: dict[str, Any] = {"value": None}
 
+    def _evaluate_candidates() -> EvaluationBatchResult:
+        from src.robodk_runtime.eval_worker import (
+            evaluate_batch_request,
+            evaluate_single_request,
+        )
+
+        if len(candidate_batch.evaluations) == 1:
+            single_result, single_search_result = evaluate_single_request(
+                candidate_batch.evaluations[0]
+            )
+            selected_search_result_holder["value"] = single_search_result
+            return EvaluationBatchResult(results=(single_result,))
         return evaluate_batch_request(candidate_batch)
 
     batch_result = _run_stage(
@@ -996,6 +1216,28 @@ def run_server_role(
     if selected_result is not None and not result_is_strictly_valid(selected_result) and retry_enabled:
         def _retry():
             from src.runtime.local_retry import run_local_profile_retry
+            baseline_search_result = selected_search_result_holder.get("value")
+            selected_request = next(
+                (
+                    request
+                    for request in candidate_batch.evaluations
+                    if str(request.request_id) == str(selected_result.request_id)
+                ),
+                None,
+            )
+            if selected_request is not None and baseline_search_result is None:
+                try:
+                    from src.robodk_runtime.eval_worker import evaluate_single_request
+
+                    _replayed_result, baseline_search_result = evaluate_single_request(
+                        selected_request
+                    )
+                except Exception as exc:
+                    print(
+                        "[online/server] Retry baseline exact-search reuse unavailable: "
+                        f"{exc}"
+                    )
+                    baseline_search_result = None
 
             return run_local_profile_retry(
                 remote_request.base_request,
@@ -1003,7 +1245,7 @@ def run_server_role(
                 candidate_limit=retry_candidate_budget,
                 repair_retry_limit=retry_repair_budget,
                 max_rounds=retry_round_budget,
-                baseline_search_result=None,
+                baseline_search_result=baseline_search_result,
             )
 
         retry_outcome = _run_stage(
@@ -1475,12 +1717,18 @@ def run_online_coordinator(
     if optimized_csv_path:
         remote_server_args.extend(["--optimized-csv-path", optimized_csv_path])
 
+    remote_env_exports = _remote_server_env_export_block()
+    remote_env_exports_block = (
+        f"{remote_env_exports}\n" if remote_env_exports else ""
+    )
+
     remote_server_script = f"""
 set -e
 cd "{remote_shell_dir}"
 CONDA_BASE="$(conda info --base)"
 source "$CONDA_BASE/etc/profile.d/conda.sh"
 conda activate "{env_name}"
+{remote_env_exports_block}
 export OMP_NUM_THREADS="${{OMP_NUM_THREADS:-1}}"
 export OPENBLAS_NUM_THREADS="${{OPENBLAS_NUM_THREADS:-1}}"
 export MKL_NUM_THREADS="${{MKL_NUM_THREADS:-1}}"
@@ -1529,18 +1777,47 @@ if command -v srun >/dev/null 2>&1 && command -v sinfo >/dev/null 2>&1; then
     case "$profile_workers" in
         ''|*[!0-9]*) profile_workers="$cpu_req" ;;
     esac
+    profile_workers_cap="${{WPS_SERVER_PROFILE_WORKERS_MAX:-16}}"
+    case "$profile_workers_cap" in
+        ''|*[!0-9]*) profile_workers_cap=16 ;;
+    esac
+    if [ "$profile_workers_cap" -lt 1 ]; then
+        profile_workers_cap=1
+    fi
+    if [ "$profile_workers_cap" -gt "$cpu_req" ]; then
+        profile_workers_cap="$cpu_req"
+    fi
     if [ "$profile_workers" -gt "$cpu_req" ]; then
         profile_workers="$cpu_req"
     fi
-    if [ "$profile_workers" -gt 8 ]; then
-        profile_workers=8
+    if [ "$profile_workers" -gt "$profile_workers_cap" ]; then
+        profile_workers="$profile_workers_cap"
     fi
     if [ "$profile_workers" -lt 1 ]; then
         profile_workers=1
     fi
+    profile_min_batch="${{WPS_SERVER_PROFILE_MIN_BATCH_SIZE:-4}}"
+    case "$profile_min_batch" in
+        ''|*[!0-9]*) profile_min_batch=4 ;;
+    esac
+    if [ "$profile_min_batch" -lt 1 ]; then
+        profile_min_batch=1
+    fi
+    profile_min_batch_cap="${{WPS_SERVER_PROFILE_MIN_BATCH_SIZE_CAP:-4}}"
+    case "$profile_min_batch_cap" in
+        ''|*[!0-9]*) profile_min_batch_cap=4 ;;
+    esac
+    if [ "$profile_min_batch_cap" -lt 1 ]; then
+        profile_min_batch_cap=1
+    fi
+    if [ "${{WPS_SERVER_PROFILE_ALLOW_HIGH_MIN_BATCH:-0}}" != "1" ] && [ "$profile_min_batch" -gt "$profile_min_batch_cap" ]; then
+        echo "[online/coordinator] Clamping WPS_SERVER_PROFILE_MIN_BATCH_SIZE from $profile_min_batch to $profile_min_batch_cap"
+        profile_min_batch="$profile_min_batch_cap"
+    fi
     export WPS_OFFLINE_BATCH_WORKERS="${{WPS_OFFLINE_BATCH_WORKERS:-$cpu_req}}"
     export WPS_SERVER_PROFILE_WORKERS="$profile_workers"
-    export WPS_SERVER_PROFILE_MIN_BATCH_SIZE="${{WPS_SERVER_PROFILE_MIN_BATCH_SIZE:-4}}"
+    export WPS_SERVER_PROFILE_MIN_BATCH_SIZE="$profile_min_batch"
+    export WPS_LOCAL_RETRY_REPAIR_EVAL_MODE="${{WPS_LOCAL_RETRY_REPAIR_EVAL_MODE:-exact_reuse}}"
     echo "[online/coordinator] Slurm allocation: partition=$partition cpus=$cpu_req mem=${{mem_req_mb}}M profile_workers=$WPS_SERVER_PROFILE_WORKERS"
     set +e
     srun -p "$partition" -c "$cpu_req" --mem="${{mem_req_mb}}M" {_render_command(remote_server_args)}

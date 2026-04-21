@@ -103,9 +103,24 @@ def _wrap_profiled(section_name: str, function: Callable[..., Any]) -> Callable[
     return wrapped
 
 
+def _resolve_runtime_profile_level() -> str:
+    raw_value = os.getenv("WPS_RUNTIME_PROFILE_LEVEL", "minimal")
+    profile_level = raw_value.strip().lower()
+    if profile_level in {"off", "none", "0", "false"}:
+        return "off"
+    if profile_level in {"full", "all", "2"}:
+        return "full"
+    return "minimal"
+
+
 def install_runtime_profile_hooks() -> None:
     global _PROFILE_HOOKS_INSTALLED
     if _PROFILE_HOOKS_INSTALLED:
+        return
+
+    profile_level = _resolve_runtime_profile_level()
+    if profile_level == "off":
+        _PROFILE_HOOKS_INSTALLED = True
         return
 
     path_optimizer_module._optimize_joint_path = _wrap_profiled(
@@ -120,20 +135,23 @@ def install_runtime_profile_hooks() -> None:
         "inserted_repair",
         local_repair_module._attempt_inserted_transition_repair,
     )
-    path_optimizer_module._joint_limit_penalty = _wrap_profiled(
-        "config_singularity",
-        path_optimizer_module._joint_limit_penalty,
-    )
-    path_optimizer_module._singularity_penalty = _wrap_profiled(
-        "config_singularity",
-        path_optimizer_module._singularity_penalty,
-    )
+
+    if profile_level == "full":
+        path_optimizer_module._joint_limit_penalty = _wrap_profiled(
+            "config_singularity",
+            path_optimizer_module._joint_limit_penalty,
+        )
+        path_optimizer_module._singularity_penalty = _wrap_profiled(
+            "config_singularity",
+            path_optimizer_module._singularity_penalty,
+        )
+        ik_collection_module._collect_ik_candidates = _wrap_profiled(
+            "ik_collection",
+            ik_collection_module._collect_ik_candidates,
+        )
+
     ik_collection_module._joint_limit_penalty = path_optimizer_module._joint_limit_penalty
     ik_collection_module._singularity_penalty = path_optimizer_module._singularity_penalty
-    ik_collection_module._collect_ik_candidates = _wrap_profiled(
-        "ik_collection",
-        ik_collection_module._collect_ik_candidates,
-    )
     global_search_module._collect_ik_candidates = ik_collection_module._collect_ik_candidates
     local_repair_module._collect_ik_candidates = ik_collection_module._collect_ik_candidates
     _PROFILE_HOOKS_INSTALLED = True
@@ -363,6 +381,8 @@ def _apply_optional_repairs(
     context: LiveStationContext,
     resources: PreparedEvaluationResources,
     search_result,
+    *,
+    shared_profile_result_cache: dict[tuple[tuple[float, float], ...], Any] | None = None,
 ) -> tuple[object, dict[str, Any]]:
     updated_result = search_result
     repair_metadata: dict[str, Any] = {}
@@ -384,6 +404,7 @@ def _apply_optional_repairs(
             a1_upper_deg=resources.a1_upper_deg,
             a2_max_deg=resources.settings.a2_max_deg,
             joint_constraint_tolerance_deg=resources.settings.joint_constraint_tolerance_deg,
+            profile_result_cache=shared_profile_result_cache,
         )
 
     if request.run_inserted_repair:

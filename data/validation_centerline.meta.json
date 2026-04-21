@@ -1,0 +1,51 @@
+{
+  "exported_at": "2026-04-21T04:31:09",
+  "model": {
+    "step_file_path": "C:\\Users\\22290\\Desktop\\机械臂\\仿真\\groove_centerline\\data\\test.step"
+  },
+  "selection": {
+    "selected_face_indices": [
+      271,
+      291,
+      297,
+      298
+    ],
+    "orientation_start_index": null,
+    "orientation_reference_index": null
+  },
+  "analysis_options": {
+    "sample_spacing_mm": 2.0,
+    "long_edge_sample_count": 160,
+    "midline_station_count": 180,
+    "midline_smoothing_strength": 0.18,
+    "max_pairing_sample_count": 1024,
+    "major_chain_min_length_ratio": 0.12,
+    "pairing_score_weights": {
+      "length_balance": 0.2,
+      "width_stability": 0.23,
+      "tangent_alignment": 0.2,
+      "transverse_orthogonality": 0.14,
+      "midpoint_continuity": 0.11,
+      "span_continuity": 0.08,
+      "coverage_ratio": 0.04,
+      "endpoint_bonus": 0.04
+    },
+    "normal_arrow_length": null,
+    "ignore_inner_holes_for_midline": false,
+    "display_normals": true,
+    "display_width_dirs": true,
+    "display_tangents": true,
+    "show_long_boundaries": true
+  },
+  "analysis_summary": {
+    "analysis_kind": "multi_face_region",
+    "sample_count": 496,
+    "midline_length": 992.3981031973392,
+    "is_closed_centerline": true
+  },
+  "handoff": {
+    "target_csv_path": "C:\\Users\\22290\\Desktop\\机械臂\\仿真\\winding_pose_solver\\data\\validation_centerline.csv",
+    "consumer": "winding_pose_solver"
+  },
+  "export_source": "web_ui"
+}

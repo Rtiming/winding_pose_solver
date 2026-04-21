@@ -15,22 +15,21 @@ The top-level `main.py` is now a thin control panel. Implementation is in
 `src/runtime/main_entrypoint.py`.
 
 ```python
-TARGET_FRAME_A_ORIGIN_IN_FRAME2_MM = (1126.0, -447.5, 1077.5)
+TARGET_FRAME_A_ORIGIN_IN_FRAME2_MM = (1126.0, -247.5, 977.5)
 RUN_MODE = "online"
 SINGLE_ACTION = "program"
 ONLINE_ROLE = "coordinator"
 ONLINE_SERVER_DIR = "/home/tzwang/program/winding_pose_solver"
 REMOTE_SYNC_MODE = "push"  # off | guard | push
-ENABLE_TARGET_ORIGIN_YZ_SEARCH = True
+ENABLE_TARGET_ORIGIN_YZ_SEARCH = False
 ```
 
 `main.py` is intentionally a commented control panel. Edit those top-level
 parameters first; deeper defaults and advanced tuning stay in
 `src/runtime/main_entrypoint.py` and `app_settings.py`.
 
-Because `ENABLE_TARGET_ORIGIN_YZ_SEARCH=True`, a plain `python main.py` starts
-with origin search before any post-dispatch flow. Set it to `False` when you
-want `RUN_MODE="online"` or `RUN_MODE="single"` to run directly.
+When `ENABLE_TARGET_ORIGIN_YZ_SEARCH=True`, a plain `python main.py` starts
+with origin search before any post-dispatch flow.
 
 Closed winding rule currently enforced by the search/import path:
 
@@ -316,6 +315,30 @@ Built-in online coordinator preflight modes:
 - `off`: skip preflight sync checks.
 - `guard`: hash-check key files and fail-fast if local/remote differ.
 - `push`: upload local source tree first, then run the hash guard.
+
+`push` cadence details:
+
+- Upload source is now a single runtime bundle (`src/`, `scripts/`, and root
+  entry files) to reduce SSH/SCP round trips.
+- Coordinator writes/reads a remote bundle hash marker at
+  `artifacts/tmp/runtime_bundle.sha256`.
+- If local and remote bundle hashes match, `push` skips upload automatically.
+- Force full upload with `WPS_FORCE_BUNDLE_SYNC=1`.
+
+Network retry pacing env vars:
+
+- `WPS_LOCAL_CMD_RETRY_ATTEMPTS` (default `3`)
+- `WPS_LOCAL_CMD_RETRY_DELAY_SECONDS` (default `1.0`)
+- `WPS_REMOTE_CMD_RETRY_ATTEMPTS` (default `3`)
+- `WPS_REMOTE_CMD_RETRY_DELAY_SECONDS` (default `1.0`)
+
+Online repair pacing guardrail:
+
+- `WPS_SERVER_PROFILE_MIN_BATCH_SIZE` is clamped by default to
+  `WPS_SERVER_PROFILE_MIN_BATCH_SIZE_CAP` (default `4`) to avoid severe
+  performance regressions from oversized batch thresholds.
+- Allow higher values only for benchmarking:
+  `WPS_SERVER_PROFILE_ALLOW_HIGH_MIN_BATCH=1`.
 
 When syncing manually, back up remote files before overwriting them and avoid
 deleting local-only or remote-only work unless explicitly requested.

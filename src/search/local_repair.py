@@ -268,6 +268,7 @@ def _refine_path_with_frame_a_origin_profile(
     a1_upper_deg: float,
     a2_max_deg: float,
     joint_constraint_tolerance_deg: float,
+    profile_result_cache: dict[tuple[tuple[float, float], ...], _PathSearchResult] | None = None,
 ) -> _PathSearchResult:
     best_result = search_result
     if not best_result.selected_path:
@@ -276,9 +277,12 @@ def _refine_path_with_frame_a_origin_profile(
     lower_limits_tuple = tuple(float(value) for value in lower_limits[:joint_count])
     upper_limits_tuple = tuple(float(value) for value in upper_limits[:joint_count])
     continuity_step_limit_mm = _resolve_profile_continuity_step_limit(motion_settings)
-    profile_result_cache: dict[tuple[tuple[float, float], ...], _PathSearchResult] = {
-        _profile_cache_key(best_result.frame_a_origin_yz_profile_mm): best_result
-    }
+    if profile_result_cache is None:
+        profile_result_cache = {}
+    profile_result_cache.setdefault(
+        _profile_cache_key(best_result.frame_a_origin_yz_profile_mm),
+        best_result,
+    )
     best_result = _refine_path_with_global_continuous_profile(
         best_result,
         robot=robot,

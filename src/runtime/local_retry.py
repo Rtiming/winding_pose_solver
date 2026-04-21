@@ -41,6 +41,43 @@ def _profile_cache_key(
     )
 
 
+def _search_result_repair_signature(search_result: Any) -> tuple[Any, ...] | None:
+    if search_result is None:
+        return None
+    profile = getattr(search_result, "frame_a_origin_yz_profile_mm", None)
+    selected_path = getattr(search_result, "selected_path", None)
+    if profile is None or selected_path is None:
+        return None
+
+    try:
+        profile_signature = tuple(
+            (round(float(dy_mm), 6), round(float(dz_mm), 6))
+            for dy_mm, dz_mm in profile
+        )
+    except Exception:
+        return None
+
+    path_signature: list[tuple[tuple[float, ...], tuple[int, ...]]] = []
+    try:
+        for candidate in selected_path:
+            joints = tuple(
+                round(float(value), 6)
+                for value in getattr(candidate, "joints", ())
+            )
+            config_flags = tuple(
+                int(flag)
+                for flag in getattr(candidate, "config_flags", ())
+            )
+            path_signature.append((joints, config_flags))
+    except Exception:
+        return None
+
+    return (
+        profile_signature,
+        tuple(path_signature),
+    )
+
+
 def _result_sort_key(result: ProfileEvaluationResult) -> tuple[float, ...]:
     return (
         float(result.invalid_row_count),
@@ -70,13 +107,15 @@ def _positive_int_from_env(name: str) -> int | None:
 
 def _force_single_process_request(
     request: ProfileEvaluationRequest,
+    *,
+    allow_env_override: bool = True,
 ) -> ProfileEvaluationRequest:
     motion_settings = dict(request.motion_settings)
     motion_settings["local_parallel_workers"] = 1
     motion_settings["local_parallel_min_batch_size"] = 999999
     metadata = dict(request.metadata)
     profile_worker_override = _positive_int_from_env("WPS_SERVER_PROFILE_WORKERS")
-    if profile_worker_override is not None:
+    if allow_env_override and profile_worker_override is not None:
         min_batch_override = _positive_int_from_env("WPS_SERVER_PROFILE_MIN_BATCH_SIZE") or 4
         motion_settings["local_parallel_workers"] = profile_worker_override
         motion_settings["local_parallel_min_batch_size"] = min_batch_override
@@ -368,6 +407,7 @@ def _evaluate_repair_requests_from_exact_results(
         frame_name=base_request.frame_name,
     )
     resource_cache: dict[tuple[tuple[str, str], ...], Any] = {}
+    shared_repair_profile_result_cache: dict[tuple[tuple[float, float], ...], Any] = {}
 
     def _resources_for(request: ProfileEvaluationRequest):
         settings_key = tuple(
@@ -410,6 +450,7 @@ def _evaluate_repair_requests_from_exact_results(
             context,
             resources,
             exact_search_result,
+            shared_profile_result_cache=shared_repair_profile_result_cache,
         )
         repaired_result = _finalize_request_result(
             request=request,
@@ -607,8 +648,27 @@ def run_local_profile_retry(
                 }
                 for pair in selected_repair_pairs
             ]
-            repair_requests = tuple(
-                _force_single_process_request(
+            repair_request_list: list[ProfileEvaluationRequest] = []
+            seen_repair_profile_keys: set[tuple[tuple[float, float], ...]] = set()
+            seen_repair_search_signatures: set[tuple[Any, ...]] = set()
+            duplicate_repair_request_count = 0
+            duplicate_repair_search_result_count = 0
+            for retry_rank, (candidate_request, _candidate_result) in enumerate(
+                selected_repair_pairs,
+                start=1,
+            ):
+                candidate_search_signature = _search_result_repair_signature(
+                    candidate_search_by_request_id.get(candidate_request.request_id)
+                )
+                if (
+                    candidate_search_signature is not None
+                    and candidate_search_signature in seen_repair_search_signatures
+                ):
+                    duplicate_repair_search_result_count += 1
+                    continue
+                if candidate_search_signature is not None:
+                    seen_repair_search_signatures.add(candidate_search_signature)
+                repair_request = _force_single_process_request(
                     _build_repair_request(
                         candidate_request=candidate_request,
                         base_request=base_request,
@@ -616,11 +676,21 @@ def run_local_profile_retry(
                         retry_rank=retry_rank,
                     )
                 )
-                for retry_rank, (candidate_request, _candidate_result) in enumerate(
-                    selected_repair_pairs,
-                    start=1,
+                repair_profile_key = _profile_cache_key(repair_request)
+                if repair_profile_key in seen_repair_profile_keys:
+                    duplicate_repair_request_count += 1
+                    continue
+                seen_repair_profile_keys.add(repair_profile_key)
+                repair_request_list.append(repair_request)
+            repair_requests = tuple(repair_request_list)
+            if duplicate_repair_request_count > 0:
+                round_summary["deduplicated_repair_request_count"] = int(
+                    duplicate_repair_request_count
                 )
-            )
+            if duplicate_repair_search_result_count > 0:
+                round_summary["deduplicated_repair_search_result_count"] = int(
+                    duplicate_repair_search_result_count
+                )
 
         best_repair_result = None
         best_repair_request_id = None
@@ -628,7 +698,17 @@ def run_local_profile_retry(
         repair_eval_seconds = 0.0
         if repair_requests:
             repair_eval_started = perf_counter()
-            if _can_use_internal_exact_retry(base_request, working_baseline_search_result):
+            repair_eval_mode = os.getenv(
+                "WPS_LOCAL_RETRY_REPAIR_EVAL_MODE",
+                "exact_reuse",
+            ).strip().lower()
+            use_batch_parallel_repair_eval = (
+                repair_eval_mode == "batch_parallel" and len(repair_requests) > 1
+            )
+            if (
+                _can_use_internal_exact_retry(base_request, working_baseline_search_result)
+                and not use_batch_parallel_repair_eval
+            ):
                 repair_pairs_with_search = _evaluate_repair_requests_from_exact_results(
                     repair_requests,
                     base_request=base_request,
@@ -647,8 +727,19 @@ def run_local_profile_retry(
                     if search_result is not None
                 }
             else:
+                batch_parallel_repair_requests = (
+                    tuple(
+                        _force_single_process_request(
+                            request,
+                            allow_env_override=False,
+                        )
+                        for request in repair_requests
+                    )
+                    if use_batch_parallel_repair_eval
+                    else repair_requests
+                )
                 repair_results = _evaluate_requests_with_batch_fallback(
-                    repair_requests,
+                    batch_parallel_repair_requests,
                     result_cache=repair_result_cache,
                     cache_metrics=cache_metrics,
                 )

@@ -172,6 +172,21 @@ general advice:
 - Smart origin search is available through `main.py --mode origin_search` or
   `python scripts/sweep_target_origin_yz.py --mode smart-square ...`.
 
+Online cadence and sync rhythm defaults:
+
+- `REMOTE_SYNC_MODE=push` now uploads a single runtime bundle and records a
+  bundle hash marker at `artifacts/tmp/runtime_bundle.sha256` on the server.
+- If the local runtime bundle hash equals the remote marker hash, `push` skips
+  upload and proceeds to sync guard directly.
+- Force upload even when hashes match only when explicitly needed:
+  `WPS_FORCE_BUNDLE_SYNC=1`.
+- Network retry pacing can be tuned (without editing code):
+  `WPS_LOCAL_CMD_RETRY_ATTEMPTS`, `WPS_LOCAL_CMD_RETRY_DELAY_SECONDS`,
+  `WPS_REMOTE_CMD_RETRY_ATTEMPTS`, `WPS_REMOTE_CMD_RETRY_DELAY_SECONDS`.
+- Keep `WPS_SERVER_PROFILE_MIN_BATCH_SIZE` conservative for online retry/repair.
+  Large values can cause major slowdowns; raise it only for controlled
+  experiments and only with `WPS_SERVER_PROFILE_ALLOW_HIGH_MIN_BATCH=1`.
+
 ## Delivery Semantics
 
 Official delivery currently requires target reachability plus the user-promoted

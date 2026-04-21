@@ -18,6 +18,8 @@ from src.runtime import main_entrypoint as _entry
 # Frame-A origin in Frame 2, in millimeters: (X, Y, Z).
 # When origin search is enabled, this is also the smart-square search center.
 TARGET_FRAME_A_ORIGIN_IN_FRAME2_MM = (1126.0, -247.5, 977.5)
+# Frame-A rotation in Frame 2, in degrees: (Rx, Ry, Rz).
+TARGET_FRAME_A_ROTATION_IN_FRAME2_XYZ_DEG = (0.0, 0.0, -180.0)
 
 # Main mode: "single" | "online" | "origin_search".
 # ENABLE_TARGET_ORIGIN_YZ_SEARCH=True takes priority and enters origin_search first.
@@ -32,6 +34,12 @@ ONLINE_HOST = "master"
 ONLINE_SERVER_DIR = "/home/tzwang/program/winding_pose_solver"
 ONLINE_ENV_NAME = "winding_pose_solver"
 ONLINE_FINAL_GENERATE_PROGRAM = True
+
+# Local exact-profile evaluation parallelism (six_axis_ik only).
+# Keep enabled for heavy continuity repair workloads.
+ENABLE_LOCAL_MULTIPROCESS_PARALLEL = True
+LOCAL_PARALLEL_WORKERS = 0  # 0 = auto
+LOCAL_PARALLEL_MIN_BATCH_SIZE = 8
 
 # Endpoint-locked path fallback:
 # keep the configured Frame-A origin at the first and terminal winding rows,
@@ -51,8 +59,8 @@ ENFORCE_REMOTE_SYNC_GUARD = True
 STRICT_EXIT_ON_INVALID = False
 
 # Run smart-square Y/Z search before SINGLE_ACTION / ONLINE_ROLE.
-ENABLE_TARGET_ORIGIN_YZ_SEARCH = False
-TARGET_ORIGIN_YZ_SEARCH_SQUARE_SIZE_MM = 300.0
+ENABLE_TARGET_ORIGIN_YZ_SEARCH = True
+TARGET_ORIGIN_YZ_SEARCH_SQUARE_SIZE_MM = 400.0
 TARGET_ORIGIN_YZ_SEARCH_INITIAL_STEP_MM = 100.0
 TARGET_ORIGIN_YZ_SEARCH_MIN_STEP_MM = 5.0
 TARGET_ORIGIN_YZ_SEARCH_MAX_ITERS = 5
@@ -81,6 +89,9 @@ TARGET_ORIGIN_YZ_OUTSIDE_FALLBACK_EDGE_STEP_MM = 75.0
 def _override_map() -> dict[str, object]:
     return {
         "TARGET_FRAME_A_ORIGIN_IN_FRAME2_MM": TARGET_FRAME_A_ORIGIN_IN_FRAME2_MM,
+        "TARGET_FRAME_A_ROTATION_IN_FRAME2_XYZ_DEG": (
+            TARGET_FRAME_A_ROTATION_IN_FRAME2_XYZ_DEG
+        ),
         "RUN_MODE": RUN_MODE,
         "SINGLE_ACTION": SINGLE_ACTION,
         "ONLINE_ROLE": ONLINE_ROLE,
@@ -89,6 +100,9 @@ def _override_map() -> dict[str, object]:
         "ONLINE_SERVER_DIR": ONLINE_SERVER_DIR,
         "ONLINE_ENV_NAME": ONLINE_ENV_NAME,
         "ONLINE_FINAL_GENERATE_PROGRAM": ONLINE_FINAL_GENERATE_PROGRAM,
+        "ENABLE_LOCAL_MULTIPROCESS_PARALLEL": ENABLE_LOCAL_MULTIPROCESS_PARALLEL,
+        "LOCAL_PARALLEL_WORKERS": LOCAL_PARALLEL_WORKERS,
+        "LOCAL_PARALLEL_MIN_BATCH_SIZE": LOCAL_PARALLEL_MIN_BATCH_SIZE,
         "LOCK_FRAME_A_ORIGIN_YZ_PROFILE_ENDPOINTS": (
             LOCK_FRAME_A_ORIGIN_YZ_PROFILE_ENDPOINTS
         ),
