@@ -4,6 +4,14 @@
 evaluates IK reachability, searches for a usable robot joint path, and can
 materialize the selected path as a RoboDK program.
 
+Longer term, this repository is the solver-owned runtime for a RoboDK-class
+winding workbench: visual playback, animation control, instruction insertion,
+RoboDK station materialization, and KUKA C5 ecosystem export should all consume
+the selected solver path and shared program IR instead of re-running IK/search
+outside this repository. The first KUKA C5 export target is KRL `.src/.dat`
+style output for KR C5 / KSS 8.7, with reserved extension points for
+mxAutomation and SRCI planning.
+
 The project is coordinate-driven: the winding tool/work frame must visit the
 target coordinate points in order. Posture quality metrics such as config
 switches and worst joint step are diagnostics and optimization targets, not the
@@ -83,6 +91,37 @@ data/                           input CSVs and small generated pose CSVs
 
 Keep reusable logic out of `main.py`. When adding behavior, put it in the
 owning package and keep `main.py` as a small switchboard.
+
+## External API (FastAPI)
+
+正式 HTTP 服务入口：
+
+```powershell
+python -m src.runtime.http_service --host 127.0.0.1 --port 8898
+```
+
+兼容入口（旧脚本，薄包装）：
+
+```powershell
+python scripts/model_demo_solver_api.py --host 127.0.0.1 --port 8898
+```
+
+核心端点：
+
+- `GET /health`（标准健康检查）
+- `GET /api/health`（兼容路径）
+- `POST /api/configure`
+- `POST /api/fk`
+- `POST /api/ik`
+- `POST /api/path/solve`
+- `POST /api/path/solve-batch`
+
+详细契约见：
+
+- [docs/external_api_contract.md](docs/external_api_contract.md)
+- [docs/winding_motion_module_integration.md](docs/winding_motion_module_integration.md)
+- [docs/model_assets_and_collision.md](docs/model_assets_and_collision.md)
+- [docs/robodk_parity_and_kuka_c5.md](docs/robodk_parity_and_kuka_c5.md)
 
 ## Main Workflows
 
@@ -168,6 +207,17 @@ Use program mode only when the correct RoboDK station is open:
 ```powershell
 python main.py --mode single --single-action program --run-id local_program
 ```
+
+## External Reuse Boundary
+
+`winding_pose_solver` 是唯一求解内核。外部适配层（例如 `winding-motion-module`）应仅做：
+
+- 模块门面与协议适配
+- 播放状态机与暂停/恢复/停止
+- 请求编排和结果展示
+
+外部项目不得重写 IK/FK、候选搜索、路径连续性优化、Frame-A Y/Z repair、RoboDK 导入等求解逻辑。
+这些能力必须通过本仓库正式入口调用。
 
 ## Smart Frame-A Origin Search
 

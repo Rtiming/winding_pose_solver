@@ -10,6 +10,8 @@ This package contains high-level orchestration code:
 - Frame-A origin Y/Z search and dispatch
 - canonical main entry implementation (`main_entrypoint.py`)
 - modular online role orchestration (`online/roundtrip.py`)
+- external FastAPI service entry (`http_service.py`)
+- external reusable Python facade (`external_api.py`)
 
 If a change is about:
 
@@ -29,6 +31,9 @@ Important boundaries:
   handoff, and receiver orchestration. Root `online_roundtrip.py`,
   `online_requester.py`, and `online_worker.py` should stay compatibility
   wrappers.
+- `http_service.py` and `external_api.py` are the formal external call surface.
+  Keep HTTP in protocol/validation/response shaping only; do not duplicate IK,
+  search, continuity, or repair logic there.
 - `origin_sweep.py` reuses parsed centerline datasets inside worker processes
   during Y/Z sweeps. Keep the cache key tied to CSV path, mtime, size, frame
   build options, and terminal-append mode so edited input data cannot reuse stale

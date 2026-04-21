@@ -13,6 +13,8 @@ This repository is organized into four main layers:
   - High-level local and online orchestration.
   - `main_entrypoint.py` is the canonical implementation behind root `main.py`.
   - `runtime/online/` contains coordinator/server/receiver online entrypoints.
+  - `runtime/http_service.py` provides the formal FastAPI HTTP service surface.
+  - `runtime/external_api.py` provides the formal reusable Python API surface.
   - `delivery.py` owns the official/debug/diagnostic gate decision.
   - `origin_sweep.py` owns grid/adaptive/smart-square Frame-A origin search.
 - `robodk_runtime/`

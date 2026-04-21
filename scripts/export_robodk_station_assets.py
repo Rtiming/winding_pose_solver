@@ -3,10 +3,18 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import sys
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+
+_THIS_FILE = Path(__file__).resolve()
+_REPO_ROOT = _THIS_FILE.parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from src.runtime.model_identity import kinematics_hash
 
 
 def _sanitize_token(text: str) -> str:
@@ -109,6 +117,234 @@ def _safe_call(item: Any, method_name: str) -> Any:
         return None
 
 
+def _clamp01(value: float) -> float:
+    return max(0.0, min(1.0, float(value)))
+
+
+def _rgba_from_value(value: Any) -> list[float] | None:
+    if value is None:
+        return None
+    try:
+        values = list(value)
+    except Exception:
+        return None
+    if len(values) < 3:
+        return None
+
+    try:
+        rgba = [float(values[i]) for i in range(min(4, len(values)))]
+    except Exception:
+        return None
+    if len(rgba) == 3:
+        rgba.append(1.0)
+
+    if max(rgba[:3]) > 1.0 or rgba[3] > 1.0:
+        rgba = [component / 255.0 for component in rgba]
+    return [_clamp01(component) for component in rgba[:4]]
+
+
+def _rgba_to_hex(rgba: list[float]) -> str:
+    r, g, b = [int(round(_clamp01(component) * 255.0)) for component in rgba[:3]]
+    return f"#{r:02x}{g:02x}{b:02x}"
+
+
+def _safe_item_color(item: Any) -> list[float] | None:
+    return _rgba_from_value(_safe_call(item, "Color"))
+
+
+def _classify_visual_role(
+    name: str,
+    *,
+    is_robot_link: bool = False,
+    link_id: int | None = None,
+    item_type: int | None = None,
+) -> str:
+    lowered = str(name or "").lower()
+    if is_robot_link:
+        if link_id == 0 or "base" in lowered:
+            return "robot_base"
+        return "robot_link"
+    if lowered == "base" or lowered.endswith("_base"):
+        return "robot_base"
+    if lowered in {"j1", "j2", "j3", "j4", "j5", "j6"}:
+        return "robot_link"
+    if "tool" in lowered or "gripper" in lowered or "tcp" in lowered:
+        return "tool"
+    if "target" in lowered:
+        return "target"
+    if "frame" in lowered or "base" in lowered:
+        return "frame"
+    return "fixture"
+
+
+def _default_material_for_role(role: str) -> dict[str, Any]:
+    presets: dict[str, dict[str, Any]] = {
+        "robot_link": {
+            "base_color_rgba": [1.0, 0.27, 0.0, 1.0],
+            "metalness": 0.15,
+            "roughness": 0.42,
+            "double_sided": False,
+        },
+        "robot_base": {
+            "base_color_rgba": [0.015, 0.018, 0.018, 1.0],
+            "metalness": 0.25,
+            "roughness": 0.55,
+            "double_sided": False,
+        },
+        "fixture": {
+            "base_color_rgba": [0.62, 0.68, 0.86, 0.72],
+            "metalness": 0.05,
+            "roughness": 0.62,
+            "double_sided": True,
+        },
+        "tool": {
+            "base_color_rgba": [0.82, 0.84, 0.90, 0.92],
+            "metalness": 0.35,
+            "roughness": 0.38,
+            "double_sided": False,
+        },
+        "frame": {
+            "base_color_rgba": [0.82, 0.88, 1.0, 0.85],
+            "metalness": 0.0,
+            "roughness": 0.5,
+            "double_sided": True,
+        },
+        "target": {
+            "base_color_rgba": [0.15, 0.80, 0.20, 1.0],
+            "metalness": 0.0,
+            "roughness": 0.35,
+            "double_sided": True,
+        },
+    }
+    payload = dict(presets.get(role, presets["fixture"]))
+    rgba = list(payload["base_color_rgba"])
+    payload.update(
+        {
+            "role": role,
+            "source": "preset.robodk_like",
+            "base_color_hex": _rgba_to_hex(rgba),
+            "opacity": float(rgba[3]),
+            "transparent": bool(rgba[3] < 0.999),
+        }
+    )
+    return payload
+
+
+def _material_payload(item: Any, role: str) -> dict[str, Any]:
+    payload = _default_material_for_role(role)
+    item_rgba = _safe_item_color(item)
+    if item_rgba is None:
+        return payload
+    payload["base_color_rgba"] = item_rgba
+    payload["base_color_hex"] = _rgba_to_hex(item_rgba)
+    payload["opacity"] = float(item_rgba[3])
+    payload["transparent"] = bool(item_rgba[3] < 0.999)
+    payload["source"] = "robodk.item_color"
+    return payload
+
+
+def _mesh_asset_payload(
+    export_result: ExportResult,
+    *,
+    mesh_ext: str,
+    usage: str,
+    source: str,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "available": bool(export_result.ok and export_result.file_name),
+        "usage": usage,
+        "format": mesh_ext.lstrip(".").lower(),
+        "units": "mm",
+        "source": source,
+    }
+    if export_result.file_name:
+        payload["file"] = export_result.file_name
+    if export_result.message:
+        payload["error"] = export_result.message
+    return payload
+
+
+def _collision_asset_from_visual(export_result: ExportResult, *, mesh_ext: str) -> dict[str, Any]:
+    payload = _mesh_asset_payload(
+        export_result,
+        mesh_ext=mesh_ext,
+        usage="collision",
+        source="visual_mesh_fallback",
+    )
+    payload["quality"] = "preview_only"
+    payload["shared_with_visual"] = bool(export_result.ok and export_result.file_name)
+    return payload
+
+
+def _viewer_hints_payload(preset: str) -> dict[str, Any]:
+    if preset == "neutral":
+        return {
+            "preset": "neutral_inspection",
+            "units": "mm",
+            "background": {"type": "solid", "color": "#101217"},
+            "rendering": {
+                "antialias": True,
+                "shadows": True,
+                "ambient_occlusion": True,
+                "tone_mapping": "aces",
+                "output_color_space": "srgb",
+                "pixel_ratio_max": 2.0,
+            },
+            "camera": {"projection": "perspective", "fit": "scene_bounds", "padding_ratio": 0.18},
+        }
+
+    return {
+        "preset": "robodk_like_inspection",
+        "units": "mm",
+        "background": {
+            "type": "vertical_gradient",
+            "top": "#07073f",
+            "bottom": "#515b97",
+        },
+        "rendering": {
+            "antialias": True,
+            "shadows": True,
+            "ambient_occlusion": True,
+            "tone_mapping": "aces",
+            "output_color_space": "srgb",
+            "pixel_ratio_max": 2.0,
+            "sort_transparent_objects": True,
+        },
+        "lighting": [
+            {"type": "hemisphere", "sky_color": "#eef3ff", "ground_color": "#222640", "intensity": 1.8},
+            {"type": "directional", "color": "#ffffff", "intensity": 3.2, "position_mm": [2500, -3500, 5000], "cast_shadow": True},
+            {"type": "directional", "color": "#d6e2ff", "intensity": 0.8, "position_mm": [-4000, 2500, 2400], "cast_shadow": False},
+        ],
+        "camera": {
+            "projection": "perspective",
+            "fit": "scene_bounds",
+            "padding_ratio": 0.18,
+            "near_mm": 1.0,
+            "far_mm": 50000.0,
+        },
+        "overlays": {
+            "show_world_axes": True,
+            "show_target_axes": True,
+            "show_tcp_axes": True,
+            "axis_length_mm": 180.0,
+            "axis_radius_mm": 5.0,
+            "label_font_family": "monospace",
+            "label_color": "#ffffff",
+        },
+        "interaction": {
+            "orbit_controls": True,
+            "zoom_to_cursor": True,
+            "double_click_focus": True,
+            "preserve_solver_camera_independence": True,
+        },
+        "quality_notes": [
+            "Use GLB when available for colored previews; retain original mesh files for exact inspection.",
+            "Use solver FK/path results for link transforms; do not compute FK in the viewer adapter.",
+            "Collision assets may initially share visual meshes and should be replaced by simplified meshes later.",
+        ],
+    }
+
+
 @dataclass(frozen=True)
 class ExportResult:
     file_name: str | None
@@ -174,12 +410,28 @@ def _export_robot_links(
         missing_in_a_row = 0
         exported_link_items.append(link_item)
         link_name = _safe_item_name(link_item)
+        visual_role = _classify_visual_role(
+            link_name,
+            is_robot_link=True,
+            link_id=link_id,
+            item_type=_safe_item_type(link_item),
+        )
         file_name = f"{robot_token}__link_{link_id:02d}__{_sanitize_token(link_name)}.{mesh_ext}"
         out_path = mesh_dir / file_name
         export_result = _export_item_mesh(link_item, out_path)
         link_payload = {
             "link_id": int(link_id),
+            "kinematic_link_index": int(link_id),
             **_item_metadata(link_item),
+            "visual_role": visual_role,
+            "material": _material_payload(link_item, visual_role),
+            "visual_asset": _mesh_asset_payload(
+                export_result,
+                mesh_ext=mesh_ext,
+                usage="visual",
+                source="robodk_object_link_export",
+            ),
+            "collision_asset": _collision_asset_from_visual(export_result, mesh_ext=mesh_ext),
             "mesh_file": export_result.file_name,
             "mesh_export_ok": bool(export_result.ok),
             "mesh_export_error": export_result.message,
@@ -233,12 +485,26 @@ def _export_scene_objects(
         if _is_robot_link_item(obj, skip_items):
             continue
         obj_name = _safe_item_name(obj)
+        visual_role = _classify_visual_role(
+            obj_name,
+            is_robot_link=False,
+            item_type=_safe_item_type(obj),
+        )
         file_name = f"scene_object_{index:03d}__{_sanitize_token(obj_name)}.{mesh_ext}"
         out_path = mesh_dir / file_name
         export_result = _export_item_mesh(obj, out_path)
         payload = {
             "object_index": int(index),
             **_item_metadata(obj),
+            "visual_role": visual_role,
+            "material": _material_payload(obj, visual_role),
+            "visual_asset": _mesh_asset_payload(
+                export_result,
+                mesh_ext=mesh_ext,
+                usage="visual",
+                source="robodk_scene_object_export",
+            ),
+            "collision_asset": _collision_asset_from_visual(export_result, mesh_ext=mesh_ext),
             "mesh_file": export_result.file_name,
             "mesh_export_ok": bool(export_result.ok),
             "mesh_export_error": export_result.message,
@@ -252,7 +518,14 @@ def _collect_items_metadata(rdk: Any, *, item_type: int) -> list[dict[str, Any]]
     for item in rdk.ItemList(filter=item_type):
         if not _safe_item_valid(item):
             continue
-        payloads.append(_item_metadata(item))
+        name = _safe_item_name(item)
+        visual_role = _classify_visual_role(name, item_type=item_type)
+        payload = {
+            **_item_metadata(item),
+            "visual_role": visual_role,
+            "material": _material_payload(item, visual_role),
+        }
+        payloads.append(payload)
     return payloads
 
 
@@ -338,6 +611,12 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--visual-preset",
+        choices=("robodk", "neutral"),
+        default="robodk",
+        help="Viewer hint preset to include in metadata.json.",
+    )
+    parser.add_argument(
         "--glb-no-pose-abs",
         action="store_true",
         help="When building GLB, do not apply pose_abs transforms from metadata.",
@@ -376,7 +655,8 @@ def _build_glb(
         return False, "no mesh entries available for glb build"
 
     for index, entry in enumerate(mesh_entries, start=1):
-        mesh_file = entry.get("mesh_file")
+        visual_asset = entry.get("visual_asset") if isinstance(entry.get("visual_asset"), dict) else {}
+        mesh_file = visual_asset.get("file") or entry.get("mesh_file")
         if not mesh_file:
             continue
         mesh_path = mesh_dir / str(mesh_file)
@@ -386,6 +666,21 @@ def _build_glb(
             geom = trimesh.load(mesh_path, force="mesh")
         except Exception:
             continue
+
+        material = entry.get("material") if isinstance(entry.get("material"), dict) else {}
+        rgba = _rgba_from_value(material.get("base_color_rgba"))
+        if rgba is not None:
+            color = np.array([int(round(_clamp01(component) * 255.0)) for component in rgba], dtype=np.uint8)
+            try:
+                face_count = int(len(getattr(geom, "faces", [])))
+                if face_count > 0:
+                    geom.visual.face_colors = np.tile(color, (face_count, 1))
+                else:
+                    vertex_count = int(len(getattr(geom, "vertices", [])))
+                    if vertex_count > 0:
+                        geom.visual.vertex_colors = np.tile(color, (vertex_count, 1))
+            except Exception:
+                pass
 
         transform = np.eye(4)
         if apply_pose_abs:
@@ -465,6 +760,7 @@ def main() -> int:
         "created_at": datetime.now().isoformat(timespec="seconds"),
         "station_path_hint": _build_station_path_hint(rdk, robolink),
         "mesh_extension": args.mesh_ext.lstrip("."),
+        "viewer_hints": _viewer_hints_payload(args.visual_preset),
         "robots": [],
         "scene_objects": [],
         "frames": [],
@@ -486,18 +782,28 @@ def main() -> int:
         all_robot_link_items.extend(exported_link_items)
         lower, upper, joint_type = _safe_joint_limits(robot)
         kinematics_inferred = _infer_robot_kinematics(robot)
+        inferred_hash = _kinematics_hash_from_inferred(kinematics_inferred)
+        joints_current = _mat_to_vector(_safe_call(robot, "Joints"))
         robot_payload = {
             "name": robot_name,
+            "model_id": _sanitize_token(robot_name),
+            "kinematics_hash": inferred_hash,
             "type": _safe_item_type(robot),
             "pose_abs": _mat_to_rows(_safe_call(robot, "PoseAbs")),
             "pose_frame": _mat_to_rows(_safe_call(robot, "PoseFrame")),
             "pose_tool": _mat_to_rows(_safe_call(robot, "PoseTool")),
-            "joints_current_deg": _mat_to_vector(_safe_call(robot, "Joints")),
+            "joints_current_deg": joints_current,
+            "joints_at_export_deg": joints_current,
             "joints_home_deg": _mat_to_vector(_safe_call(robot, "JointsHome")),
             "joint_limits_lower_deg": lower,
             "joint_limits_upper_deg": upper,
             "joint_type": joint_type,
             "kinematics_inferred": kinematics_inferred,
+            "visual_style": {
+                "default_link_role": "robot_link",
+                "base_link_role": "robot_base",
+                "viewer_transform_source": "solver_fk_or_path_result",
+            },
             "links": links,
         }
         payload["robots"].append(robot_payload)
@@ -661,6 +967,20 @@ def _infer_robot_kinematics(robot: Any) -> dict[str, Any] | None:
         "joints_home_deg": q_home,
         "source": "robot.JointPoses(home,+1deg)",
     }
+
+
+def _kinematics_hash_from_inferred(kinematics_inferred: dict[str, Any] | None) -> str | None:
+    if not isinstance(kinematics_inferred, dict):
+        return None
+    try:
+        return kinematics_hash(
+            axes=kinematics_inferred.get("joint_axes_base"),
+            points=kinematics_inferred.get("joint_points_base_mm"),
+            senses=kinematics_inferred.get("joint_senses"),
+            home_flange=kinematics_inferred.get("home_flange"),
+        )
+    except Exception:
+        return None
 
 
 if __name__ == "__main__":
