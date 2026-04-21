@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import atexit
+import hashlib
 import io
+import json
 import math
+import os
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from contextlib import redirect_stdout
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from time import perf_counter
 from typing import Any, Sequence
@@ -138,6 +141,18 @@ class SweepResult:
             float(self.total_cost),
             float(self.timing_seconds),
         )
+
+
+@dataclass
+class _OriginSweepCaseCache:
+    path: Path
+    fingerprint: str
+    entries: dict[str, dict[str, object]]
+
+
+_ORIGIN_SWEEP_CACHE_SCHEMA_VERSION = 1
+_ORIGIN_SWEEP_CACHE_CONTEXTS: dict[tuple[str, str], _OriginSweepCaseCache] = {}
+_SOURCE_FINGERPRINT_CACHE: str | None = None
 
 
 def parse_float_list(raw: str) -> tuple[float, ...]:
@@ -720,6 +735,254 @@ def _make_candidate_ranker(
     return rank_result
 
 
+def _origin_sweep_cache_enabled() -> bool:
+    raw_value = os.getenv("WPS_ORIGIN_SWEEP_CACHE", "1").strip().lower()
+    return raw_value not in {"0", "false", "off", "no"}
+
+
+def _origin_sweep_cache_path(environment: SweepEnvironment) -> Path:
+    configured = os.getenv("WPS_ORIGIN_SWEEP_CACHE_PATH")
+    if configured:
+        return Path(configured)
+    return Path(environment.artifact_root) / "origin_case_eval_cache.json"
+
+
+def _hash_file(path: Path) -> str:
+    hasher = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+
+def _project_root() -> Path:
+    return Path(__file__).resolve().parents[2]
+
+
+def _source_fingerprint() -> str:
+    global _SOURCE_FINGERPRINT_CACHE
+    if _SOURCE_FINGERPRINT_CACHE is not None:
+        return _SOURCE_FINGERPRINT_CACHE
+
+    root = _project_root()
+    relative_paths = [
+        Path("app_settings.py"),
+        Path("src/core/frame_math.py"),
+        Path("src/core/geometry.py"),
+        Path("src/core/motion_settings.py"),
+        Path("src/core/pose_solver.py"),
+        Path("src/core/robot_interface.py"),
+        Path("src/robodk_runtime/eval_worker.py"),
+        Path("src/runtime/origin_sweep.py"),
+        Path("src/search/continuity_metrics.py"),
+        Path("src/search/global_search.py"),
+        Path("src/search/ik_collection.py"),
+        Path("src/search/local_repair.py"),
+        Path("src/search/path_optimizer.py"),
+    ]
+    six_axis_dir = root / "src" / "six_axis_ik"
+    if six_axis_dir.exists():
+        relative_paths.extend(
+            path.relative_to(root)
+            for path in sorted(six_axis_dir.rglob("*.py"))
+            if path.is_file()
+        )
+
+    source_payload: list[dict[str, str]] = []
+    for relative_path in sorted(set(relative_paths), key=lambda item: item.as_posix()):
+        path = root / relative_path
+        if not path.exists() or not path.is_file():
+            source_payload.append(
+                {"path": relative_path.as_posix(), "sha256": "missing"}
+            )
+            continue
+        source_payload.append(
+            {
+                "path": relative_path.as_posix(),
+                "sha256": _hash_file(path),
+            }
+        )
+
+    encoded = json.dumps(source_payload, sort_keys=True, separators=(",", ":")).encode(
+        "utf-8"
+    )
+    _SOURCE_FINGERPRINT_CACHE = hashlib.sha256(encoded).hexdigest()
+    return _SOURCE_FINGERPRINT_CACHE
+
+
+def _origin_sweep_cache_fingerprint(
+    *,
+    environment: SweepEnvironment,
+    eval_config: EvalConfig,
+) -> str:
+    centerline_path = Path(environment.validation_centerline_csv)
+    payload = {
+        "schema_version": _ORIGIN_SWEEP_CACHE_SCHEMA_VERSION,
+        "source_fingerprint": _source_fingerprint(),
+        "centerline_csv_sha256": _hash_file(centerline_path),
+        "target_frame_rotation_xyz_deg": [
+            round(float(value), 12)
+            for value in environment.target_frame_rotation_xyz_deg
+        ],
+        "enable_custom_smoothing_and_pose_selection": bool(
+            environment.enable_custom_smoothing_and_pose_selection
+        ),
+        "robot_name": str(environment.robot_name),
+        "frame_name": str(environment.frame_name),
+        "program_name": str(environment.program_name),
+        "ik_backend": str(environment.ik_backend),
+        "append_start_as_terminal": bool(environment.append_start_as_terminal),
+        "local_parallel_workers": int(environment.local_parallel_workers),
+        "local_parallel_min_batch_size": int(environment.local_parallel_min_batch_size),
+        "eval_config": {
+            "strategy": str(eval_config.strategy),
+            "run_window_repair": bool(eval_config.run_window_repair),
+            "run_inserted_repair": bool(eval_config.run_inserted_repair),
+        },
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode(
+        "utf-8"
+    )
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _load_origin_sweep_case_cache(
+    *,
+    environment: SweepEnvironment,
+    eval_config: EvalConfig,
+) -> _OriginSweepCaseCache | None:
+    if not _origin_sweep_cache_enabled():
+        return None
+    path = _origin_sweep_cache_path(environment)
+    fingerprint = _origin_sweep_cache_fingerprint(
+        environment=environment,
+        eval_config=eval_config,
+    )
+    context_key = (str(path.resolve()), fingerprint)
+    cached_context = _ORIGIN_SWEEP_CACHE_CONTEXTS.get(context_key)
+    if cached_context is not None:
+        return cached_context
+
+    entries: dict[str, dict[str, object]] = {}
+    if path.exists():
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if (
+                isinstance(payload, dict)
+                and int(payload.get("schema_version", 0))
+                == _ORIGIN_SWEEP_CACHE_SCHEMA_VERSION
+                and str(payload.get("fingerprint", "")) == fingerprint
+            ):
+                raw_entries = payload.get("entries", {})
+                if isinstance(raw_entries, dict):
+                    entries = {
+                        str(key): value
+                        for key, value in raw_entries.items()
+                        if isinstance(value, dict)
+                    }
+        except (OSError, ValueError, TypeError):
+            entries = {}
+
+    cache = _OriginSweepCaseCache(
+        path=path,
+        fingerprint=fingerprint,
+        entries=entries,
+    )
+    _ORIGIN_SWEEP_CACHE_CONTEXTS[context_key] = cache
+    return cache
+
+
+def _case_cache_key(
+    case: SweepCase,
+    *,
+    fingerprint: str,
+) -> str:
+    payload = {
+        "fingerprint": fingerprint,
+        "x_mm": round(float(case.x_mm), 6),
+        "y_mm": round(float(case.y_mm), 6),
+        "z_mm": round(float(case.z_mm), 6),
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode(
+        "utf-8"
+    )
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _sweep_result_from_cache_payload(payload: dict[str, object]) -> SweepResult:
+    return SweepResult(
+        request_id=str(payload["request_id"]),
+        x_mm=float(payload["x_mm"]),
+        y_mm=float(payload["y_mm"]),
+        z_mm=float(payload["z_mm"]),
+        status=str(payload["status"]),
+        timing_seconds=float(payload["timing_seconds"]),
+        invalid_row_count=int(payload["invalid_row_count"]),
+        ik_empty_row_count=int(payload["ik_empty_row_count"]),
+        config_switches=int(payload["config_switches"]),
+        bridge_like_segments=int(payload["bridge_like_segments"]),
+        big_circle_step_count=int(payload.get("big_circle_step_count", 0)),
+        branch_flip_ratio=float(payload.get("branch_flip_ratio", 0.0)),
+        worst_joint_step_deg=float(payload["worst_joint_step_deg"]),
+        mean_joint_step_deg=float(payload["mean_joint_step_deg"]),
+        total_cost=float(payload["total_cost"]),
+        pose_build_seconds=float(payload.get("pose_build_seconds", 0.0)),
+        ik_collection_seconds=float(payload.get("ik_collection_seconds", 0.0)),
+        dp_path_selection_seconds=float(payload.get("dp_path_selection_seconds", 0.0)),
+        window_repair_seconds=float(payload.get("window_repair_seconds", 0.0)),
+        inserted_repair_seconds=float(payload.get("inserted_repair_seconds", 0.0)),
+    )
+
+
+def _cache_lookup_origin_case(
+    cache: _OriginSweepCaseCache | None,
+    case: SweepCase,
+) -> SweepResult | None:
+    if cache is None:
+        return None
+    entry = cache.entries.get(
+        _case_cache_key(case, fingerprint=cache.fingerprint)
+    )
+    if entry is None:
+        return None
+    try:
+        return _sweep_result_from_cache_payload(entry)
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _store_origin_sweep_cache_results(
+    cache: _OriginSweepCaseCache | None,
+    results: Sequence[SweepResult],
+) -> None:
+    if cache is None or not results:
+        return
+    for result in results:
+        case = SweepCase(
+            x_mm=float(result.x_mm),
+            y_mm=float(result.y_mm),
+            z_mm=float(result.z_mm),
+        )
+        cache.entries[_case_cache_key(case, fingerprint=cache.fingerprint)] = asdict(
+            result
+        )
+    try:
+        cache.path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "schema_version": _ORIGIN_SWEEP_CACHE_SCHEMA_VERSION,
+            "fingerprint": cache.fingerprint,
+            "entries": cache.entries,
+        }
+        temp_path = cache.path.with_suffix(cache.path.suffix + ".tmp")
+        temp_path.write_text(
+            json.dumps(payload, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        temp_path.replace(cache.path)
+    except OSError as exc:
+        print(f"[origin-sweep-cache] warning: failed to write cache: {exc}")
+
+
 def evaluate_cases_parallel(
     *,
     cases: Sequence[SweepCase],
@@ -732,19 +995,43 @@ def evaluate_cases_parallel(
     if not case_list:
         return ()
 
-    worker_count = max(1, int(workers))
-    if worker_count == 1 or len(case_list) == 1:
-        completed: list[SweepResult] = []
-        for finished_index, case in enumerate(case_list, start=1):
-            result = _evaluate_case(case=case, environment=environment, eval_config=eval_config)
-            completed.append(result)
-            _print_progress(prefix, finished_index, len(case_list), result)
+    cache = _load_origin_sweep_case_cache(
+        environment=environment,
+        eval_config=eval_config,
+    )
+    completed: list[SweepResult] = []
+    pending_cases: list[SweepCase] = []
+    finished_index = 0
+    for case in case_list:
+        cached_result = _cache_lookup_origin_case(cache, case)
+        if cached_result is None:
+            pending_cases.append(case)
+            continue
+        finished_index += 1
+        completed.append(cached_result)
+        _print_progress(
+            f"{prefix} cache",
+            finished_index,
+            len(case_list),
+            cached_result,
+        )
+    if not pending_cases:
         return tuple(completed)
 
-    batch_count = min(len(case_list), worker_count * 4)
-    case_batches = _split_case_batches(case_list, batch_count=batch_count)
-    completed: list[SweepResult] = []
-    finished_index = 0
+    computed_results: list[SweepResult] = []
+    worker_count = max(1, int(workers))
+    if worker_count == 1 or len(pending_cases) == 1:
+        for case in pending_cases:
+            result = _evaluate_case(case=case, environment=environment, eval_config=eval_config)
+            finished_index += 1
+            completed.append(result)
+            computed_results.append(result)
+            _print_progress(prefix, finished_index, len(case_list), result)
+        _store_origin_sweep_cache_results(cache, computed_results)
+        return tuple(completed)
+
+    batch_count = min(len(pending_cases), worker_count * 4)
+    case_batches = _split_case_batches(pending_cases, batch_count=batch_count)
     executor = _get_shared_process_pool(worker_count)
     futures = [
         executor.submit(_evaluate_case_batch_entry, case_batch, environment, eval_config)
@@ -754,7 +1041,9 @@ def evaluate_cases_parallel(
         for result in future.result():
             finished_index += 1
             completed.append(result)
+            computed_results.append(result)
             _print_progress(prefix, finished_index, len(case_list), result)
+    _store_origin_sweep_cache_results(cache, computed_results)
     return tuple(completed)
 
 
@@ -1072,6 +1361,11 @@ def run_smart_square_sweep(
     ):
         all_results_by_key[case_key_result(result)] = result
 
+    best_result: SweepResult | None = None
+    for result in all_results_by_key.values():
+        if best_result is None or rank_result(result) < rank_result(best_result):
+            best_result = result
+
     step_mm = float(config.initial_step_mm)
     max_iters = max(1, int(config.max_iters))
     beam_width = max(1, int(config.beam_width))
@@ -1096,6 +1390,7 @@ def run_smart_square_sweep(
             centers = tuple(ordered[:beam_width])
 
         axis_cases: list[SweepCase] = []
+        diagonal_cases: list[SweepCase] = []
         for center_result in centers:
             axis_cases.extend(
                 _smart_square_axis_cases(
@@ -1109,34 +1404,7 @@ def run_smart_square_sweep(
                     max_z_mm=max_z_mm,
                 )
             )
-        pending_axis_cases = tuple(
-            case
-            for case in _deduplicate_cases(axis_cases)
-            if case_key(case) not in all_results_by_key
-        )
-        if pending_axis_cases:
-            for result in evaluate_cases_parallel(
-                cases=pending_axis_cases,
-                environment=environment,
-                eval_config=eval_config,
-                workers=workers,
-                prefix=f"{prefix} iter {iteration_index + 1} axis",
-            ):
-                all_results_by_key[case_key_result(result)] = result
-
-        best_after_axis = min(all_results_by_key.values(), key=rank_result)
-        diagonal_needed = diagonal_policy == "always"
-        if diagonal_policy == "conditional":
-            diagonal_needed = not (
-                best_after_axis.status == "valid"
-                and best_after_axis.bridge_like_segments == 0
-                and best_after_axis.big_circle_step_count == 0
-                and best_after_axis.worst_joint_step_deg <= 60.0 + 1e-9
-            )
-        pending_diagonal_cases: tuple[SweepCase, ...] = ()
-        if diagonal_needed:
-            diagonal_cases: list[SweepCase] = []
-            for center_result in centers:
+            if diagonal_policy != "never":
                 diagonal_cases.extend(
                     _smart_square_diagonal_cases(
                         x_mm=float(config.x_mm),
@@ -1149,9 +1417,108 @@ def run_smart_square_sweep(
                         max_z_mm=max_z_mm,
                     )
                 )
-            pending_diagonal_cases = tuple(
+        pending_axis_cases = tuple(
+            case
+            for case in _deduplicate_cases(axis_cases)
+            if case_key(case) not in all_results_by_key
+        )
+        pre_axis_pending_diagonal_cases: tuple[SweepCase, ...] = ()
+        if diagonal_policy != "never":
+            pre_axis_pending_diagonal_cases = tuple(
                 case
                 for case in _deduplicate_cases(diagonal_cases)
+                if case_key(case) not in all_results_by_key
+            )
+        pending_diagonal_cases: tuple[SweepCase, ...] = ()
+        speculative_diagonal_used = False
+        if diagonal_policy == "always":
+            pending_diagonal_cases = pre_axis_pending_diagonal_cases
+            pending_combined_cases = tuple(
+                case
+                for case in _deduplicate_cases(
+                    (*pending_axis_cases, *pending_diagonal_cases)
+                )
+                if case_key(case) not in all_results_by_key
+            )
+            if pending_combined_cases:
+                for result in evaluate_cases_parallel(
+                    cases=pending_combined_cases,
+                    environment=environment,
+                    eval_config=eval_config,
+                    workers=workers,
+                    prefix=f"{prefix} iter {iteration_index + 1} axis+diagonal",
+                ):
+                    all_results_by_key[case_key_result(result)] = result
+                    if best_result is None or rank_result(result) < rank_result(best_result):
+                        best_result = result
+        elif (
+            diagonal_policy == "conditional"
+            and pending_axis_cases
+            and pre_axis_pending_diagonal_cases
+            and best_result is not None
+            and not result_passes_official_gate(best_result)
+            and len(
+                _deduplicate_cases(
+                    (*pending_axis_cases, *pre_axis_pending_diagonal_cases)
+                )
+            )
+            <= max(1, int(workers))
+            and os.getenv("WPS_ORIGIN_SWEEP_SPECULATIVE_DIAGONALS", "auto")
+            .strip()
+            .lower()
+            not in {"0", "false", "off", "no", "never"}
+        ):
+            pending_diagonal_cases = pre_axis_pending_diagonal_cases
+            speculative_diagonal_used = True
+            pending_combined_cases = tuple(
+                case
+                for case in _deduplicate_cases(
+                    (*pending_axis_cases, *pending_diagonal_cases)
+                )
+                if case_key(case) not in all_results_by_key
+            )
+            if pending_combined_cases:
+                for result in evaluate_cases_parallel(
+                    cases=pending_combined_cases,
+                    environment=environment,
+                    eval_config=eval_config,
+                    workers=workers,
+                    prefix=f"{prefix} iter {iteration_index + 1} axis+spec-diagonal",
+                ):
+                    all_results_by_key[case_key_result(result)] = result
+                    if best_result is None or rank_result(result) < rank_result(best_result):
+                        best_result = result
+        elif pending_axis_cases:
+            for result in evaluate_cases_parallel(
+                cases=pending_axis_cases,
+                environment=environment,
+                eval_config=eval_config,
+                workers=workers,
+                prefix=f"{prefix} iter {iteration_index + 1} axis",
+            ):
+                all_results_by_key[case_key_result(result)] = result
+                if best_result is None or rank_result(result) < rank_result(best_result):
+                    best_result = result
+
+        if best_result is None:
+            break
+        best_after_axis = best_result
+        diagonal_needed = diagonal_policy == "always"
+        if diagonal_policy == "conditional":
+            diagonal_needed = not (
+                best_after_axis.status == "valid"
+                and best_after_axis.bridge_like_segments == 0
+                and best_after_axis.big_circle_step_count == 0
+                and best_after_axis.worst_joint_step_deg <= 60.0 + 1e-9
+            )
+        if (
+            diagonal_needed
+            and diagonal_policy != "always"
+            and not speculative_diagonal_used
+        ):
+            pending_diagonal_cases = tuple(
+                case
+                for case in pre_axis_pending_diagonal_cases
                 if case_key(case) not in all_results_by_key
             )
         print(
@@ -1159,7 +1526,11 @@ def run_smart_square_sweep(
             f"centers={len(centers)}, axis_pending={len(pending_axis_cases)}, "
             f"diagonal_pending={len(pending_diagonal_cases)}, policy={diagonal_policy}"
         )
-        if pending_diagonal_cases:
+        if (
+            pending_diagonal_cases
+            and diagonal_policy != "always"
+            and not speculative_diagonal_used
+        ):
             for result in evaluate_cases_parallel(
                 cases=pending_diagonal_cases,
                 environment=environment,
@@ -1168,8 +1539,12 @@ def run_smart_square_sweep(
                 prefix=f"{prefix} iter {iteration_index + 1} diagonal",
             ):
                 all_results_by_key[case_key_result(result)] = result
+                if best_result is None or rank_result(result) < rank_result(best_result):
+                    best_result = result
 
-        best_after = min(all_results_by_key.values(), key=rank_result)
+        if best_result is None:
+            break
+        best_after = best_result
         iteration_payload = {
             "iteration": iteration_index + 1,
             "step_mm": step_mm,
@@ -1210,7 +1585,7 @@ def run_smart_square_sweep(
 
     polish_step_mm = max(0.0, float(config.polish_step_mm))
     if polish_step_mm > 0.0 and all_results_by_key:
-        best_before_polish = min(all_results_by_key.values(), key=rank_result)
+        best_before_polish = best_result or min(all_results_by_key.values(), key=rank_result)
         polish_cases = _deduplicate_cases(
             (
                 *_smart_square_axis_cases(
@@ -1253,7 +1628,9 @@ def run_smart_square_sweep(
             prefix=f"{prefix} polish",
         ):
             all_results_by_key[case_key_result(result)] = result
-        best_after_polish = min(all_results_by_key.values(), key=rank_result)
+            if best_result is None or rank_result(result) < rank_result(best_result):
+                best_result = result
+        best_after_polish = best_result or min(all_results_by_key.values(), key=rank_result)
         trace["polish"] = {
             "step_mm": polish_step_mm,
             "pending_case_count": len(pending_polish_cases),
@@ -1297,6 +1674,8 @@ def run_smart_square_sweep(
             prefix=f"{prefix} validation",
         ):
             all_results_by_key[case_key_result(result)] = result
+            if best_result is None or rank_result(result) < rank_result(best_result):
+                best_result = result
         trace["validation_grid"] = {
             "step_mm": float(config.validation_grid_step_mm),
             "y_count": len(validation_y_values),

@@ -9,6 +9,11 @@ target coordinate points in order. Posture quality metrics such as config
 switches and worst joint step are diagnostics and optimization targets, not the
 root goal unless explicitly promoted to hard constraints for a run.
 
+Input centerline order is a hard part of the task. Row 0 in
+`data/validation_centerline.csv` is the user-selected start point; closed-path
+handling appends a copy of that first row as the terminal row and must not move
+the start to another seam.
+
 ## Current Defaults
 
 The top-level `main.py` is now a thin control panel. Implementation is in
@@ -16,12 +21,16 @@ The top-level `main.py` is now a thin control panel. Implementation is in
 
 ```python
 TARGET_FRAME_A_ORIGIN_IN_FRAME2_MM = (1126.0, -247.5, 977.5)
+TARGET_FRAME_A_ROTATION_IN_FRAME2_XYZ_DEG = (0.0, 0.0, -180.0)
 RUN_MODE = "online"
 SINGLE_ACTION = "program"
 ONLINE_ROLE = "coordinator"
 ONLINE_SERVER_DIR = "/home/tzwang/program/winding_pose_solver"
 REMOTE_SYNC_MODE = "push"  # off | guard | push
-ENABLE_TARGET_ORIGIN_YZ_SEARCH = False
+ENABLE_TARGET_ORIGIN_YZ_SEARCH = True
+TARGET_ORIGIN_YZ_SEARCH_SQUARE_SIZE_MM = 400.0
+TARGET_ORIGIN_YZ_SEARCH_INITIAL_STEP_MM = 100.0
+TARGET_ORIGIN_YZ_SEARCH_MIN_STEP_MM = 5.0
 ```
 
 `main.py` is intentionally a commented control panel. Edit those top-level
@@ -203,9 +212,11 @@ Reusable implementation:
 - `scripts/sweep_target_origin_yz.py`: thin CLI.
 
 Performance note: origin sweeps reuse the parsed centerline dataset inside each
-worker process. The cached key includes CSV path, mtime, size, frame-build
-options, and terminal-append mode, so repeated Y/Z candidates do not rebuild
-the centerline frames while still invalidating when the input CSV changes.
+worker process, and `smart-square` case results are cached across repeated runs
+under `artifacts/tmp/origin_sweep/origin_case_eval_cache.json`. The case-result
+cache key includes the relevant source files, centerline CSV content hash,
+Frame-A rotation, backend, terminal-append mode, parallel settings, and repair
+strategy. Set `WPS_ORIGIN_SWEEP_CACHE=0` to force fresh evaluation.
 
 Typical output:
 

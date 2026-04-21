@@ -44,6 +44,9 @@ The root objective is coordinate-driven:
 
 - The tool/work frame must visit the requested target coordinate points in
   order.
+- The imported centerline CSV row order is part of the task definition. Row 0
+  is the user-selected start point; do not rotate, reverse, sort, or choose a
+  different closed-curve seam unless the user explicitly asks for that.
 - `TARGET_FRAME_A_ORIGIN_IN_FRAME2_MM` is the nominal fixed Frame-A origin.
 - Per-row Frame-A Y/Z offsets and origin sweeps are optimization freedoms used
   to reduce physical detours and joint discontinuities.
@@ -53,6 +56,8 @@ The root objective is coordinate-driven:
 
 Current user-promoted hard rule for closed winding paths:
 
+- Closed-path terminal rows are produced by copying the imported row 0 to the
+  end; they must not replace or move the actual start row.
 - When the start point is appended as the terminal point, terminal I1-I5 must
   equal the start I1-I5.
 - Terminal I6 must differ from the start I6 by exactly one full turn
@@ -171,6 +176,9 @@ general advice:
   be explicitly enabled.
 - Smart origin search is available through `main.py --mode origin_search` or
   `python scripts/sweep_target_origin_yz.py --mode smart-square ...`.
+- Origin sweep case-result caching is enabled by default and stored under
+  `artifacts/tmp/origin_sweep/origin_case_eval_cache.json`. Disable it with
+  `WPS_ORIGIN_SWEEP_CACHE=0` when validating fresh recomputation behavior.
 
 Online cadence and sync rhythm defaults:
 
