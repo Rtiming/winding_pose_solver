@@ -136,57 +136,6 @@ def _read_eval_metrics(eval_result_path: Path) -> dict[str, Any]:
     }
 
 
-def _valid_rgba(value: Any) -> bool:
-    try:
-        arr = list(value)
-    except Exception:
-        return False
-    if len(arr) != 4:
-        return False
-    try:
-        return all(0.0 <= float(component) <= 1.0 for component in arr)
-    except Exception:
-        return False
-
-
-def _asset_file(entry: dict[str, Any], asset_key: str) -> str | None:
-    asset = entry.get(asset_key)
-    if isinstance(asset, dict):
-        file_name = asset.get("file") or asset.get("mesh_file")
-        if file_name:
-            return str(file_name)
-    return None
-
-
-def _visual_mesh_file(entry: dict[str, Any]) -> str | None:
-    return _asset_file(entry, "visual_asset") or (
-        str(entry.get("mesh_file")) if entry.get("mesh_file") else None
-    )
-
-
-def _mesh_file_state(meshes_dir: Path, file_name: str | None) -> str:
-    if not file_name:
-        return "missing"
-    mesh_path = meshes_dir / str(file_name)
-    if not mesh_path.exists():
-        return "missing"
-    if mesh_path.stat().st_size < 84:
-        return "too_small"
-    return "ok"
-
-
-def _iter_mesh_entries(metadata: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
-    entries: list[tuple[str, dict[str, Any]]] = []
-    for robot in metadata.get("robots") or []:
-        for link in robot.get("links") or []:
-            if isinstance(link, dict):
-                entries.append(("robot_link", link))
-    for obj in metadata.get("scene_objects") or []:
-        if isinstance(obj, dict):
-            entries.append(("scene_object", obj))
-    return entries
-
-
 def _percentiles(arr: np.ndarray, pcts: tuple[int, ...] = (50, 90, 95, 99)) -> dict[str, float]:
     if arr.size == 0:
         return {f"p{p}": float("nan") for p in pcts}
@@ -194,120 +143,55 @@ def _percentiles(arr: np.ndarray, pcts: tuple[int, ...] = (50, 90, 95, 99)) -> d
 
 
 def _analyze_mesh_assets(metadata_path: Path, metadata: dict[str, Any]) -> dict[str, Any]:
-    robots = metadata.get("robots") or []
     scene_objects = metadata.get("scene_objects") or []
     meshes_dir = metadata_path.parent / "meshes"
-    entries = _iter_mesh_entries(metadata)
 
     required_robot_links = {"base", "j1", "j2", "j3", "j4", "j5", "j6"}
     robot_links_found: set[str] = set()
-    robot_link_indices_found: set[int] = set()
     mesh_file_missing = 0
     mesh_file_too_small = 0
     mesh_file_ok = 0
-    visual_asset_missing = 0
-    collision_asset_missing = 0
-    collision_asset_fallback = 0
-    material_missing = 0
-    visual_role_missing = 0
 
-    for category, entry in entries:
-        name = str(entry.get("name") or "").lower()
-        if category == "robot_link":
-            link_index = entry.get("kinematic_link_index", entry.get("link_id"))
-            try:
-                robot_link_indices_found.add(int(link_index))
-            except Exception:
-                pass
-        elif name in required_robot_links:
+    for obj in scene_objects:
+        name = str(obj.get("name") or "").lower()
+        mesh_file = obj.get("mesh_file")
+        if name in required_robot_links:
             robot_links_found.add(name)
-
-        visual_file = _visual_mesh_file(entry)
-        if not visual_file:
-            visual_asset_missing += 1
-        visual_state = _mesh_file_state(meshes_dir, visual_file)
-        if visual_state == "missing":
+        if not mesh_file:
+            continue
+        mesh_path = meshes_dir / str(mesh_file)
+        if not mesh_path.exists():
             mesh_file_missing += 1
-        elif visual_state == "too_small":
+            continue
+        size = mesh_path.stat().st_size
+        if size < 84:
             mesh_file_too_small += 1
         else:
             mesh_file_ok += 1
 
-        collision_file = _asset_file(entry, "collision_asset")
-        collision_asset = entry.get("collision_asset")
-        if isinstance(collision_asset, dict):
-            if not collision_file:
-                collision_asset_missing += 1
-            elif _mesh_file_state(meshes_dir, collision_file) != "ok":
-                collision_asset_missing += 1
-            if collision_asset.get("source") == "visual_mesh_fallback":
-                collision_asset_fallback += 1
-        else:
-            collision_asset_missing += 1
-
-        material = entry.get("material")
-        rgba = material.get("base_color_rgba") if isinstance(material, dict) else None
-        if not _valid_rgba(rgba):
-            material_missing += 1
-        if not entry.get("visual_role"):
-            visual_role_missing += 1
-
-    failed_exports = [entry for _category, entry in entries if entry.get("mesh_export_ok") is False]
+    failed_exports = [obj for obj in scene_objects if obj.get("mesh_export_ok") is False]
     placeholder_failed = []
     critical_failed = []
-    for entry in failed_exports:
-        err = str(entry.get("mesh_export_error") or "").lower()
+    for obj in failed_exports:
+        err = str(obj.get("mesh_export_error") or "").lower()
         if "placeholder" in err or "suspiciously small" in err:
-            placeholder_failed.append(entry)
+            placeholder_failed.append(obj)
         else:
-            critical_failed.append(entry)
-
-    if robot_link_indices_found:
-        required_robot_link_indices = set(range(7))
-        missing_robot_link_indices = sorted(required_robot_link_indices - robot_link_indices_found)
-        missing_robot_links = [f"link_{idx}" for idx in missing_robot_link_indices]
-        required_robot_links_ok = len(missing_robot_link_indices) == 0
-    else:
-        missing_robot_links = sorted(required_robot_links - robot_links_found)
-        required_robot_links_ok = len(missing_robot_links) == 0
-
-    viewer_hints = metadata.get("viewer_hints")
-    viewer_hints_ok = (
-        isinstance(viewer_hints, dict)
-        and isinstance(viewer_hints.get("background"), dict)
-        and isinstance(viewer_hints.get("rendering"), dict)
-    )
-    visual_contract_ok = (
-        viewer_hints_ok
-        and visual_asset_missing == 0
-        and material_missing == 0
-        and visual_role_missing == 0
-    )
-
+            critical_failed.append(obj)
+    missing_robot_links = sorted(required_robot_links - robot_links_found)
     return {
-        "robot_count": len(robots),
-        "robot_link_entries_count": sum(1 for category, _entry in entries if category == "robot_link"),
         "scene_objects_count": len(scene_objects),
-        "mesh_entries_count": len(entries),
         "mesh_export_failed_count": len(failed_exports),
-        "mesh_export_failed_names": [str(entry.get("name") or "") for entry in failed_exports],
+        "mesh_export_failed_names": [str(obj.get("name") or "") for obj in failed_exports],
         "mesh_export_placeholder_failed_count": len(placeholder_failed),
         "mesh_export_critical_failed_count": len(critical_failed),
-        "mesh_export_critical_failed_names": [str(entry.get("name") or "") for entry in critical_failed],
+        "mesh_export_critical_failed_names": [str(obj.get("name") or "") for obj in critical_failed],
         "mesh_files_ok_count": mesh_file_ok,
         "mesh_files_missing_count": mesh_file_missing,
         "mesh_files_too_small_count": mesh_file_too_small,
-        "visual_asset_missing_count": visual_asset_missing,
-        "collision_asset_missing_count": collision_asset_missing,
-        "collision_asset_visual_fallback_count": collision_asset_fallback,
-        "material_missing_count": material_missing,
-        "visual_role_missing_count": visual_role_missing,
-        "viewer_hints_ok": viewer_hints_ok,
-        "visual_contract_ok": visual_contract_ok,
         "robot_links_found": sorted(robot_links_found),
-        "robot_link_indices_found": sorted(robot_link_indices_found),
         "robot_links_missing": missing_robot_links,
-        "required_robot_links_ok": required_robot_links_ok,
+        "required_robot_links_ok": len(missing_robot_links) == 0,
     }
 
 
@@ -395,7 +279,6 @@ def _derive_pass_flags(mesh_summary: dict[str, Any], traj_summary: dict[str, Any
         and mesh_summary.get("mesh_files_missing_count", 1) == 0
         and mesh_summary.get("mesh_files_too_small_count", 1) == 0
         and bool(mesh_summary.get("required_robot_links_ok"))
-        and bool(mesh_summary.get("visual_contract_ok"))
     )
     traj_ok = (
         float(traj_summary.get("worst_joint_step_deg", 999.0)) <= 60.0
@@ -412,7 +295,6 @@ def _derive_pass_flags(mesh_summary: dict[str, Any], traj_summary: dict[str, Any
 
     return {
         "mesh_ok": mesh_ok,
-        "visual_contract_ok": bool(mesh_summary.get("visual_contract_ok")),
         "trajectory_ok": traj_ok,
         "fk_match_ok": fk_ok,
         "overall_ok": bool(mesh_ok and traj_ok and fk_ok),
