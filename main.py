@@ -35,11 +35,18 @@ ONLINE_SERVER_DIR = "/home/tzwang/program/winding_pose_solver"
 ONLINE_ENV_NAME = "winding_pose_solver"
 ONLINE_FINAL_GENERATE_PROGRAM = True
 
+# Online compute policy:
+# Windows coordinates sync and final RoboDK import; heavy continuity retry/repair
+# runs in the server role under Slurm.
+ONLINE_PROFILE_RETRY_CANDIDATE_LIMIT = 4
+ONLINE_PROFILE_RETRY_REPAIR_LIMIT = 2
+ONLINE_PROFILE_RETRY_MAX_ROUNDS = 1
+
 # Local exact-profile evaluation parallelism (six_axis_ik only).
 # Keep enabled for heavy continuity repair workloads.
 ENABLE_LOCAL_MULTIPROCESS_PARALLEL = True
 LOCAL_PARALLEL_WORKERS = 0  # 0 = auto
-LOCAL_PARALLEL_MIN_BATCH_SIZE = 8
+LOCAL_PARALLEL_MIN_BATCH_SIZE = 4
 
 # Endpoint-locked path fallback:
 # keep the configured Frame-A origin at the first and terminal winding rows,
@@ -73,8 +80,8 @@ TARGET_ORIGIN_YZ_SEARCH_POLISH_STEP_MM = 5.0
 # - only materialize/import the best official candidate by default;
 # - do not import debug/invalid candidates unless explicitly changed here or via CLI.
 TARGET_ORIGIN_YZ_SEARCH_USABLE_COUNT = 5
-TARGET_ORIGIN_YZ_SEARCH_POST_DISPATCH = "single_action"  # "none" | "single_action" | "online_role"
-TARGET_ORIGIN_YZ_SEARCH_POST_TOP_N = 5
+TARGET_ORIGIN_YZ_SEARCH_POST_DISPATCH = "online_role"  # "none" | "single_action" | "online_role"
+TARGET_ORIGIN_YZ_SEARCH_POST_TOP_N = 1
 DEBUG_FALLBACK_IMPORT_COUNT = 0
 ALLOW_INVALID_DEBUG_OUTPUTS = False
 
@@ -100,6 +107,9 @@ def _override_map() -> dict[str, object]:
         "ONLINE_SERVER_DIR": ONLINE_SERVER_DIR,
         "ONLINE_ENV_NAME": ONLINE_ENV_NAME,
         "ONLINE_FINAL_GENERATE_PROGRAM": ONLINE_FINAL_GENERATE_PROGRAM,
+        "ONLINE_PROFILE_RETRY_CANDIDATE_LIMIT": ONLINE_PROFILE_RETRY_CANDIDATE_LIMIT,
+        "ONLINE_PROFILE_RETRY_REPAIR_LIMIT": ONLINE_PROFILE_RETRY_REPAIR_LIMIT,
+        "ONLINE_PROFILE_RETRY_MAX_ROUNDS": ONLINE_PROFILE_RETRY_MAX_ROUNDS,
         "ENABLE_LOCAL_MULTIPROCESS_PARALLEL": ENABLE_LOCAL_MULTIPROCESS_PARALLEL,
         "LOCAL_PARALLEL_WORKERS": LOCAL_PARALLEL_WORKERS,
         "LOCAL_PARALLEL_MIN_BATCH_SIZE": LOCAL_PARALLEL_MIN_BATCH_SIZE,

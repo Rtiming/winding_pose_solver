@@ -61,9 +61,9 @@ ENABLE_CUSTOM_SMOOTHING_AND_POSE_SELECTION = True
 ROBOT_NAME = "KUKA"
 FRAME_NAME = "Frame 2"
 PROGRAM_NAME = "Path_From_CSV"
-ENABLE_LOCAL_MULTIPROCESS_PARALLEL = False
+ENABLE_LOCAL_MULTIPROCESS_PARALLEL = True
 LOCAL_PARALLEL_WORKERS = 0  # 0 = auto
-LOCAL_PARALLEL_MIN_BATCH_SIZE = 8
+LOCAL_PARALLEL_MIN_BATCH_SIZE = 4
 SINGLE_RUN_WINDOW_REPAIR = False
 SINGLE_RUN_INSERTED_REPAIR = False
 ENABLE_FIXED_POINT_PATH_FALLBACK = True
@@ -111,11 +111,12 @@ ONLINE_AUTO_SETUP_SERVER = False
 ONLINE_SETUP_SERVER_ENABLE_SLURM = False
 ONLINE_SERVER_EVAL_WHEN_POSSIBLE = False
 ONLINE_FINAL_GENERATE_PROGRAM = True
-# Accuracy-first online retry budget (still conservative; can be overridden by env):
+# Server-side online continuity retry budget. This keeps heavy repair on master
+# while Windows only coordinates transfer and the final RoboDK receiver import.
 #   WPS_ONLINE_RETRY_CANDIDATE_LIMIT / WPS_ONLINE_RETRY_REPAIR_LIMIT / WPS_ONLINE_RETRY_MAX_ROUNDS
-ONLINE_PROFILE_RETRY_CANDIDATE_LIMIT = 0
-ONLINE_PROFILE_RETRY_REPAIR_LIMIT = 0
-ONLINE_PROFILE_RETRY_MAX_ROUNDS = 0
+ONLINE_PROFILE_RETRY_CANDIDATE_LIMIT = 4
+ONLINE_PROFILE_RETRY_REPAIR_LIMIT = 2
+ONLINE_PROFILE_RETRY_MAX_ROUNDS = 1
 ENFORCE_REMOTE_SYNC_GUARD = True
 REMOTE_SYNC_MODE = "guard"  # "off" | "guard" | "push"
 ALLOW_INVALID_DEBUG_OUTPUTS = False
@@ -154,7 +155,7 @@ TARGET_ORIGIN_YZ_OUTSIDE_FALLBACK_EDGE_STEP_MM = 75.0
 #   "none"          : only report usable origins
 #   "single_action" : run local flow with SINGLE_ACTION on best N usable origins
 #   "online_role"   : run online flow with ONLINE_ROLE on best N usable origins
-TARGET_ORIGIN_YZ_SEARCH_POST_DISPATCH = "single_action"
+TARGET_ORIGIN_YZ_SEARCH_POST_DISPATCH = "online_role"
 TARGET_ORIGIN_YZ_SEARCH_POST_TOP_N = 1
 
 WRITE_DETAILED_LOG_FILE = True
@@ -1091,8 +1092,15 @@ def _run_online_mode(
     )
     if retry_max_rounds <= 0 or retry_candidate_limit <= 0:
         print(
-            "[online] Fast delivery mode: server retry/repair is disabled by default. "
+            "[online] Fast delivery mode: server retry/repair is disabled. "
             "Set WPS_ONLINE_RETRY_MAX_ROUNDS=1 for continuity refinement."
+        )
+    else:
+        print(
+            "[online] Server retry/repair enabled: "
+            f"candidate_limit={retry_candidate_limit}, "
+            f"repair_limit={retry_repair_limit}, "
+            f"max_rounds={retry_max_rounds}."
         )
 
     if online_command == "server":
@@ -1528,7 +1536,7 @@ def _run_origin_search_mode(
                 / f"candidate_{candidate_index:02d}_request.json"
             )
             candidate_paths, candidate_status = _run_online_mode(
-                None,
+                args,
                 runtime_settings=candidate_settings,
                 run_id_override=candidate_run_id,
                 request_path_override=candidate_request_path,

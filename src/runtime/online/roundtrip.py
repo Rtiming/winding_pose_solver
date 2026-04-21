@@ -72,6 +72,9 @@ SYNC_BUNDLE_ROOT_FILES: tuple[str, ...] = (
     "AGENTS.md",
 )
 SYNC_BUNDLE_HASH_RELATIVE_PATH = "artifacts/tmp/runtime_bundle.sha256"
+DEFAULT_ONLINE_RETRY_CANDIDATE_LIMIT = 4
+DEFAULT_ONLINE_RETRY_REPAIR_LIMIT = 2
+DEFAULT_ONLINE_RETRY_MAX_ROUNDS = 1
 
 
 @dataclass(frozen=True)
@@ -1249,7 +1252,7 @@ def run_server_role(
             )
 
         retry_outcome = _run_stage(
-            "[online/server] Running local profile retry/repair...",
+            "[online/server] Running server-side profile retry/repair...",
             _retry,
             log_options=effective_log_options,
         )
@@ -1274,7 +1277,7 @@ def run_server_role(
         )
     elif selected_result is not None and not result_is_strictly_valid(selected_result):
         print(
-            "[online/server] Local profile retry/repair skipped by retry budget "
+            "[online/server] Server-side profile retry/repair skipped by retry budget "
             f"(candidate_limit={retry_candidate_budget}, "
             f"repair_limit={retry_repair_budget}, max_rounds={retry_round_budget})."
         )
@@ -1621,9 +1624,9 @@ def run_online_coordinator(
     generate_final_program: bool = True,
     final_program_name: str | None = None,
     optimized_csv_path: str | None = None,
-    retry_candidate_limit: int = 4,
-    retry_repair_limit: int = 0,
-    retry_max_rounds: int = 1,
+    retry_candidate_limit: int = DEFAULT_ONLINE_RETRY_CANDIDATE_LIMIT,
+    retry_repair_limit: int = DEFAULT_ONLINE_RETRY_REPAIR_LIMIT,
+    retry_max_rounds: int = DEFAULT_ONLINE_RETRY_MAX_ROUNDS,
     allow_invalid_outputs: bool = False,
     enforce_remote_sync_guard: bool = True,
     remote_sync_mode: str = SYNC_MODE_GUARD,
@@ -1981,6 +1984,9 @@ def run_round(
     generate_final_program: bool = True,
     final_program_name: str | None = None,
     optimized_csv_path: str | None = None,
+    retry_candidate_limit: int = DEFAULT_ONLINE_RETRY_CANDIDATE_LIMIT,
+    retry_repair_limit: int = DEFAULT_ONLINE_RETRY_REPAIR_LIMIT,
+    retry_max_rounds: int = DEFAULT_ONLINE_RETRY_MAX_ROUNDS,
     allow_invalid_outputs: bool = False,
     enforce_remote_sync_guard: bool = True,
     remote_sync_mode: str = SYNC_MODE_GUARD,
@@ -2001,6 +2007,9 @@ def run_round(
         generate_final_program=generate_final_program,
         final_program_name=final_program_name,
         optimized_csv_path=optimized_csv_path,
+        retry_candidate_limit=retry_candidate_limit,
+        retry_repair_limit=retry_repair_limit,
+        retry_max_rounds=retry_max_rounds,
         allow_invalid_outputs=allow_invalid_outputs,
         enforce_remote_sync_guard=enforce_remote_sync_guard,
         remote_sync_mode=remote_sync_mode,
@@ -2061,9 +2070,21 @@ def _add_coordinator_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--skip-final-generate", action="store_true")
     parser.add_argument("--program-name")
     parser.add_argument("--optimized-csv-path")
-    parser.add_argument("--retry-candidate-limit", type=int, default=4)
-    parser.add_argument("--retry-repair-limit", type=int, default=0)
-    parser.add_argument("--retry-max-rounds", type=int, default=1)
+    parser.add_argument(
+        "--retry-candidate-limit",
+        type=int,
+        default=DEFAULT_ONLINE_RETRY_CANDIDATE_LIMIT,
+    )
+    parser.add_argument(
+        "--retry-repair-limit",
+        type=int,
+        default=DEFAULT_ONLINE_RETRY_REPAIR_LIMIT,
+    )
+    parser.add_argument(
+        "--retry-max-rounds",
+        type=int,
+        default=DEFAULT_ONLINE_RETRY_MAX_ROUNDS,
+    )
     parser.add_argument(
         "--remote-sync-mode",
         choices=(SYNC_MODE_OFF, SYNC_MODE_GUARD, SYNC_MODE_PUSH),
@@ -2138,9 +2159,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
     server_parser.add_argument("--show-command-details", action="store_true")
     server_parser.add_argument("--program-name")
     server_parser.add_argument("--optimized-csv-path")
-    server_parser.add_argument("--retry-candidate-limit", type=int, default=4)
-    server_parser.add_argument("--retry-repair-limit", type=int, default=0)
-    server_parser.add_argument("--retry-max-rounds", type=int, default=1)
+    server_parser.add_argument(
+        "--retry-candidate-limit",
+        type=int,
+        default=DEFAULT_ONLINE_RETRY_CANDIDATE_LIMIT,
+    )
+    server_parser.add_argument(
+        "--retry-repair-limit",
+        type=int,
+        default=DEFAULT_ONLINE_RETRY_REPAIR_LIMIT,
+    )
+    server_parser.add_argument(
+        "--retry-max-rounds",
+        type=int,
+        default=DEFAULT_ONLINE_RETRY_MAX_ROUNDS,
+    )
     server_parser.add_argument("--allow-invalid-outputs", action="store_true")
 
     receiver_parser = subparsers.add_parser("run-receiver", help="Run Windows receiver role only.")
@@ -2222,6 +2255,9 @@ def main(argv: list[str] | None = None) -> int:
                 generate_final_program=not bool(args.skip_final_generate),
                 final_program_name=args.program_name,
                 optimized_csv_path=args.optimized_csv_path,
+                retry_candidate_limit=args.retry_candidate_limit,
+                retry_repair_limit=args.retry_repair_limit,
+                retry_max_rounds=args.retry_max_rounds,
                 allow_invalid_outputs=bool(args.allow_invalid_outputs),
                 enforce_remote_sync_guard=not bool(args.disable_sync_guard),
                 remote_sync_mode=sync_mode,

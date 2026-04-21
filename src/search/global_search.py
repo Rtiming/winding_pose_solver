@@ -190,6 +190,7 @@ def _finalize_frame_a_origin_profile_result(
                 require_terminal_match_start=_reference_path_has_terminal_start_copy(
                     reference_pose_rows
                 ),
+                selection_bridge_trigger_joint_delta_deg=bridge_trigger_joint_delta_deg,
             )
             selected_path = tuple(selected_path_list)
         except RuntimeError:
@@ -211,6 +212,7 @@ def _finalize_frame_a_origin_profile_result(
                         require_terminal_match_start=_reference_path_has_terminal_start_copy(
                             reference_pose_rows
                         ),
+                        selection_bridge_trigger_joint_delta_deg=bridge_trigger_joint_delta_deg,
                     )
                     selected_path = tuple(selected_path_list)
                 except RuntimeError:

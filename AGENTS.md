@@ -170,10 +170,12 @@ general advice:
 
 - Default `TARGET_FRAME_A_ORIGIN_IN_FRAME2_MM` is configured in `main.py`.
 - Default backend is expected to remain `six_axis_ik` for server-safe compute.
-- Default online final program generation remains local on Windows.
+- Default online final program generation remains local on Windows, but
+  online SixAxisIK evaluation and retry/repair run in the server role.
 - Online coordinator preflight sync supports `off|guard|push` mode.
-- Default online retry/repair should stay conservative; expensive repair must
-  be explicitly enabled.
+- Default online retry/repair should stay conservative and server-side;
+  tune `ONLINE_PROFILE_RETRY_*` or `WPS_ONLINE_RETRY_*` rather than moving
+  continuity repair back into the Windows receiver.
 - Smart origin search is available through `main.py --mode origin_search` or
   `python scripts/sweep_target_origin_yz.py --mode smart-square ...`.
 - Origin sweep case-result caching is enabled by default and stored under

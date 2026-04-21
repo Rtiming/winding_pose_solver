@@ -334,7 +334,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--outside-fallback-count",
         type=int,
-        default=0,
+        default=3,
         help=(
             "If smart-square finds no official deliverable inside the square, "
             "search for this many nearest official candidates outside the square."
@@ -343,19 +343,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--outside-fallback-max-rings",
         type=int,
-        default=0,
+        default=6,
         help="Maximum number of expanding outside-square perimeter rings to evaluate.",
     )
     parser.add_argument(
         "--outside-fallback-ring-step-mm",
         type=float,
-        default=0.0,
+        default=25.0,
         help="Distance between outside-square fallback rings. 0 uses the smart minimum step.",
     )
     parser.add_argument(
         "--outside-fallback-edge-step-mm",
         type=float,
-        default=0.0,
+        default=75.0,
         help="Spacing along each outside-square fallback ring edge. 0 uses half the smart initial step.",
     )
     return parser.parse_args()

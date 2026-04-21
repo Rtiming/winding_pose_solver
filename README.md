@@ -31,6 +31,8 @@ ENABLE_TARGET_ORIGIN_YZ_SEARCH = True
 TARGET_ORIGIN_YZ_SEARCH_SQUARE_SIZE_MM = 400.0
 TARGET_ORIGIN_YZ_SEARCH_INITIAL_STEP_MM = 100.0
 TARGET_ORIGIN_YZ_SEARCH_MIN_STEP_MM = 5.0
+TARGET_ORIGIN_YZ_SEARCH_POST_DISPATCH = "online_role"
+TARGET_ORIGIN_YZ_SEARCH_POST_TOP_N = 1
 ```
 
 `main.py` is intentionally a commented control panel. Edit those top-level
@@ -104,9 +106,21 @@ ONLINE_HOST = "master"
 ONLINE_SERVER_DIR = "/home/tzwang/program/winding_pose_solver"
 ONLINE_ENV_NAME = "winding_pose_solver"
 ONLINE_FINAL_GENERATE_PROGRAM = True
+ONLINE_PROFILE_RETRY_CANDIDATE_LIMIT = 4
+ONLINE_PROFILE_RETRY_REPAIR_LIMIT = 2
+ONLINE_PROFILE_RETRY_MAX_ROUNDS = 1
+ENABLE_LOCAL_MULTIPROCESS_PARALLEL = True
+LOCAL_PARALLEL_WORKERS = 0  # 0 = auto
+LOCAL_PARALLEL_MIN_BATCH_SIZE = 4
 REMOTE_SYNC_MODE = "push"  # off | guard | push
 ENFORCE_REMOTE_SYNC_GUARD = True
 ```
+
+In online mode, Windows builds/uploads the request and later imports the
+server-generated handoff into RoboDK. SixAxisIK evaluation, candidate scoring,
+global/window Y/Z refinement, and retry/repair run in the server role under
+Slurm. Single-machine mode still uses the local evaluator and local fallback
+settings.
 
 Retry budgets can also be overridden by env vars:
 `WPS_ONLINE_RETRY_CANDIDATE_LIMIT`, `WPS_ONLINE_RETRY_REPAIR_LIMIT`,

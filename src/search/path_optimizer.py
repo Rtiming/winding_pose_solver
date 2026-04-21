@@ -339,6 +339,7 @@ def _optimize_joint_path(
     start_joints: tuple[float, ...],
     optimizer_settings: _PathOptimizerSettings,
     require_terminal_match_start: bool = False,
+    selection_bridge_trigger_joint_delta_deg: float | None = None,
 ) -> tuple[list[_IKCandidate], float]:
     """?????????????????????????????????????????????"""
 
@@ -352,6 +353,7 @@ def _optimize_joint_path(
             move_type=move_type,
             start_joints=start_joints,
             optimizer_settings=optimizer_settings,
+            selection_bridge_trigger_joint_delta_deg=selection_bridge_trigger_joint_delta_deg,
         )
 
     corridor_scores = _compute_candidate_corridor_scores(ik_layers, optimizer_settings)
@@ -392,6 +394,21 @@ def _optimize_joint_path(
     previous_layer = ik_layers[0]
     for layer_index in range(1, len(ik_layers)):
         current_layer = ik_layers[layer_index]
+        previous_guided_flags = None
+        current_guided_flags = None
+        if guided_config_path is not None:
+            previous_guided_flags = guided_config_path[layer_index - 1]
+            current_guided_flags = guided_config_path[layer_index]
+
+        active_previous_candidates = [
+            (previous_index, previous_candidate, previous_costs[previous_index])
+            for previous_index, previous_candidate in enumerate(previous_layer.candidates)
+            if math.isfinite(previous_costs[previous_index])
+            and (
+                previous_guided_flags is None
+                or previous_candidate.config_flags == previous_guided_flags
+            )
+        ]
 
         # MoveL ????????"??????????????????????????????
         # ??????????????????????????????????????????????
@@ -413,8 +430,8 @@ def _optimize_joint_path(
 
         for current_index, current_candidate in enumerate(current_layer.candidates):
             if (
-                guided_config_path is not None
-                and current_candidate.config_flags != guided_config_path[layer_index]
+                current_guided_flags is not None
+                and current_candidate.config_flags != current_guided_flags
             ):
                 continue
             node_cost = _candidate_node_cost(
@@ -425,25 +442,20 @@ def _optimize_joint_path(
             best_cost = math.inf
             best_previous_index = -1
 
-            for previous_index, previous_candidate in enumerate(previous_layer.candidates):
-                if not math.isfinite(previous_costs[previous_index]):
-                    continue
-                if (
-                    guided_config_path is not None
-                    and previous_candidate.config_flags != guided_config_path[layer_index - 1]
-                ):
-                    continue
-                if not _passes_joint_continuity_constraint(
+            for previous_index, previous_candidate, previous_cost in active_previous_candidates:
+                pair_metrics = _joint_pair_metrics(
                     previous_candidate.joints,
                     current_candidate.joints,
                     optimizer_settings,
-                ):
+                )
+                if not pair_metrics.passes_joint_continuity:
                     continue
 
-                transition_cost = _candidate_transition_penalty(
+                transition_cost = _candidate_transition_penalty_from_metrics(
                     previous_candidate,
                     current_candidate,
                     optimizer_settings,
+                    pair_metrics,
                 )
 
                 if move_l_cache is not None:
@@ -463,7 +475,7 @@ def _optimize_joint_path(
                             )
                         )
 
-                total_cost = previous_costs[previous_index] + transition_cost + node_cost
+                total_cost = previous_cost + transition_cost + node_cost
                 if total_cost < best_cost:
                     best_cost = total_cost
                     best_previous_index = previous_index
@@ -488,17 +500,61 @@ def _optimize_joint_path(
         previous_layer = current_layer
         previous_costs = current_costs
 
-    end_index = min(range(len(previous_costs)), key=previous_costs.__getitem__)
+    end_index = _choose_best_end_index(
+        ik_layers,
+        previous_costs=previous_costs,
+        backpointers=backpointers,
+        selection_bridge_trigger_joint_delta_deg=selection_bridge_trigger_joint_delta_deg,
+    )
     total_cost = previous_costs[end_index]
-    selected_path = [ik_layers[-1].candidates[end_index]]
+    selected_path = _reconstruct_selected_path(ik_layers, backpointers, end_index)
+    return selected_path, total_cost
 
-    # ????????????????????????
+
+def _choose_best_end_index(
+    ik_layers: Sequence[_IKLayer],
+    *,
+    previous_costs: Sequence[float],
+    backpointers: Sequence[Sequence[int]],
+    selection_bridge_trigger_joint_delta_deg: float | None,
+) -> int:
+    if selection_bridge_trigger_joint_delta_deg is None:
+        return min(range(len(previous_costs)), key=previous_costs.__getitem__)
+
+    best_index = -1
+    best_key: tuple[float, ...] | None = None
+    for candidate_index, total_cost in enumerate(previous_costs):
+        if not math.isfinite(total_cost):
+            continue
+        candidate_path = _reconstruct_selected_path(
+            ik_layers,
+            backpointers,
+            candidate_index,
+        )
+        quality_key = _selected_path_quality_key(
+            candidate_path,
+            total_cost=float(total_cost),
+            bridge_trigger_joint_delta_deg=float(selection_bridge_trigger_joint_delta_deg),
+        )
+        if best_key is None or quality_key < best_key:
+            best_key = quality_key
+            best_index = candidate_index
+    if best_index >= 0:
+        return best_index
+    return min(range(len(previous_costs)), key=previous_costs.__getitem__)
+
+
+def _reconstruct_selected_path(
+    ik_layers: Sequence[_IKLayer],
+    backpointers: Sequence[Sequence[int]],
+    end_index: int,
+) -> list[_IKCandidate]:
+    selected_path = [ik_layers[-1].candidates[end_index]]
     for layer_index in range(len(ik_layers) - 2, -1, -1):
         end_index = backpointers[layer_index][end_index]
         selected_path.append(ik_layers[layer_index].candidates[end_index])
-
     selected_path.reverse()
-    return selected_path, total_cost
+    return selected_path
 
 
 def _optimize_closed_joint_path(
@@ -508,9 +564,11 @@ def _optimize_closed_joint_path(
     move_type: str,
     start_joints: tuple[float, ...],
     optimizer_settings: _PathOptimizerSettings,
+    selection_bridge_trigger_joint_delta_deg: float | None = None,
 ) -> tuple[list[_IKCandidate], float]:
     best_path: list[_IKCandidate] | None = None
     best_cost = math.inf
+    best_quality_key: tuple[float, ...] | None = None
     joint6_turn_direction_cache: dict[tuple[float, ...], int] = {}
     for start_candidate in ik_layers[0].candidates:
         start_joints_key = tuple(float(value) for value in start_candidate.joints)
@@ -552,13 +610,23 @@ def _optimize_closed_joint_path(
                 start_joints=start_joints,
                 optimizer_settings=optimizer_settings,
                 require_terminal_match_start=False,
+                selection_bridge_trigger_joint_delta_deg=selection_bridge_trigger_joint_delta_deg,
             )
         except RuntimeError:
             continue
 
-        if candidate_cost < best_cost:
+        if selection_bridge_trigger_joint_delta_deg is None:
+            candidate_quality_key = (float(candidate_cost),)
+        else:
+            candidate_quality_key = _selected_path_quality_key(
+                candidate_path,
+                total_cost=float(candidate_cost),
+                bridge_trigger_joint_delta_deg=float(selection_bridge_trigger_joint_delta_deg),
+            )
+        if best_quality_key is None or candidate_quality_key < best_quality_key:
             best_path = candidate_path
             best_cost = candidate_cost
+            best_quality_key = candidate_quality_key
 
     if best_path is None:
         raise RuntimeError(
@@ -1014,18 +1082,12 @@ def _evaluate_move_l_transition(
     return 0.0, reached_joints
 
 
-def _candidate_transition_penalty(
+def _candidate_transition_penalty_from_metrics(
     previous_candidate: _IKCandidate,
     current_candidate: _IKCandidate,
     optimizer_settings: _PathOptimizerSettings,
+    pair_metrics: _JointPairMetrics,
 ) -> float:
-    """??????????????????????"""
-
-    pair_metrics = _joint_pair_metrics(
-        previous_candidate.joints,
-        current_candidate.joints,
-        optimizer_settings,
-    )
     cost = pair_metrics.transition_cost
 
     previous_flags = previous_candidate.config_flags
@@ -1066,14 +1128,30 @@ def _candidate_transition_penalty(
     # ??DP ?????????????????"??exact-pose ???????
     if previous_flags == current_flags:
         cost -= optimizer_settings.same_config_stay_bonus
-        if _passes_preferred_continuity(
-            previous_candidate.joints,
-            current_candidate.joints,
-            optimizer_settings,
-        ):
+        if pair_metrics.passes_preferred_continuity:
             cost -= optimizer_settings.preferred_transition_bonus
 
     return cost
+
+
+def _candidate_transition_penalty(
+    previous_candidate: _IKCandidate,
+    current_candidate: _IKCandidate,
+    optimizer_settings: _PathOptimizerSettings,
+) -> float:
+    """??????????????????????"""
+
+    pair_metrics = _joint_pair_metrics(
+        previous_candidate.joints,
+        current_candidate.joints,
+        optimizer_settings,
+    )
+    return _candidate_transition_penalty_from_metrics(
+        previous_candidate,
+        current_candidate,
+        optimizer_settings,
+        pair_metrics,
+    )
 
 
 def _passes_joint_continuity_constraint(

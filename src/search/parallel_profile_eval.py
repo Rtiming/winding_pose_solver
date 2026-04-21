@@ -6,6 +6,7 @@ import multiprocessing
 import os
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Sequence
 
 from src.core.motion_settings import RoboDKMotionSettings
@@ -68,6 +69,8 @@ def maybe_parallel_evaluate_exact_profiles(
     worker_count = resolve_local_parallel_workers(motion_settings.local_parallel_workers)
     if worker_count <= 1:
         return None
+    if not _can_spawn_local_profile_workers():
+        return None
 
     profile_batches = tuple(
         tuple((float(dy_mm), float(dz_mm)) for dy_mm, dz_mm in profile)
@@ -107,18 +110,27 @@ def maybe_parallel_evaluate_exact_profiles(
         for start_index in range(0, len(profile_batches), chunk_size)
     ]
     executor = _get_exact_profile_executor(worker_count)
-    results_by_chunk = [
-        future.result()
-        for future in [
-            executor.submit(_evaluate_exact_profile_batch_worker, batch_spec)
-            for batch_spec in batch_specs
+    try:
+        results_by_chunk = [
+            future.result()
+            for future in [
+                executor.submit(_evaluate_exact_profile_batch_worker, batch_spec)
+                for batch_spec in batch_specs
+            ]
         ]
-    ]
+    except Exception:
+        shutdown_exact_profile_executor()
+        return None
     return tuple(
         result
         for chunk_results in results_by_chunk
         for result in chunk_results
     )
+
+
+def _can_spawn_local_profile_workers() -> bool:
+    main_file = getattr(__import__("__main__"), "__file__", None)
+    return bool(main_file and Path(str(main_file)).exists())
 
 
 def shutdown_exact_profile_executor() -> None:
