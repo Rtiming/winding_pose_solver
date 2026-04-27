@@ -12,6 +12,7 @@ This package contains high-level orchestration code:
 - modular online role orchestration (`online/roundtrip.py`)
 - external FastAPI service entry (`http_service.py`)
 - external reusable Python facade (`external_api.py`)
+- async winding orchestration run manager (`winding_runs.py`)
 
 If a change is about:
 

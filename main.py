@@ -25,6 +25,10 @@ TARGET_FRAME_A_ROTATION_IN_FRAME2_XYZ_DEG = (0.0, 0.0, -180.0)
 # ENABLE_TARGET_ORIGIN_YZ_SEARCH=True takes priority and enters origin_search first.
 RUN_MODE = "online"
 
+# Local machine profile: "auto" | "mac" | "windows" | "linux".
+# This only describes the coordinator/receiver machine; solver behavior remains shared.
+LOCAL_MACHINE_PROFILE = "auto"
+
 # Single-machine action: "solve" | "program" | "visualize".
 SINGLE_ACTION = "program"
 
@@ -36,8 +40,8 @@ ONLINE_ENV_NAME = "winding_pose_solver"
 ONLINE_FINAL_GENERATE_PROGRAM = True
 
 # Online compute policy:
-# Windows coordinates sync and final RoboDK import; heavy continuity retry/repair
-# runs in the server role under Slurm.
+# Local coordinator handles sync and final RoboDK import; heavy continuity
+# retry/repair runs in the server role under Slurm.
 ONLINE_PROFILE_RETRY_CANDIDATE_LIMIT = 4
 ONLINE_PROFILE_RETRY_REPAIR_LIMIT = 2
 ONLINE_PROFILE_RETRY_MAX_ROUNDS = 1
@@ -100,6 +104,7 @@ def _override_map() -> dict[str, object]:
             TARGET_FRAME_A_ROTATION_IN_FRAME2_XYZ_DEG
         ),
         "RUN_MODE": RUN_MODE,
+        "LOCAL_MACHINE_PROFILE": LOCAL_MACHINE_PROFILE,
         "SINGLE_ACTION": SINGLE_ACTION,
         "ONLINE_ROLE": ONLINE_ROLE,
         "ONLINE_ACTION": ONLINE_ROLE,

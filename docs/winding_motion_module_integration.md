@@ -43,6 +43,10 @@ python scripts/model_demo_solver_api.py --host 127.0.0.1 --port 8898
 - 显示层只加载资产和应用姿态，不实现 FK。
 - 姿态应来自 `/api/fk`、`/api/ik` 或 `/api/path/solve` 返回结果。
 - 若使用 RoboDK 导出的模型资产，优先校验 `kinematics_hash` 与资产清单中的 hash 是否一致。
+- FK 驱动真实 link mesh 时，使用 solver 返回的 `joint_frames_robot`
+  配合资产清单中的 bind pose；外部模块不得自行计算 FK。
+- 碰撞资产可以由 solver 导出流程预处理生成，但碰撞有效性判断和策略仍归
+  `winding_pose_solver` 所有。
 - 后续碰撞检测模型选择应由 `winding_pose_solver` 暴露模型/资产清单，`winding-motion-module` 只选择模式和展示结果。
 
 ### 2.3 完整路径求解

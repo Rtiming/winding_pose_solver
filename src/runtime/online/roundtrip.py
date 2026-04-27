@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import os
 import shlex
 import subprocess
@@ -28,60 +27,41 @@ from src.runtime.delivery import (
 )
 from src.runtime.remote_search import propose_candidates, summarize_results
 from src.runtime.request_builder import build_profile_evaluation_request, build_remote_search_request
+from src.runtime.local_profile import (
+    LOCAL_PROFILE_CHOICES,
+    local_conda_python_candidates,
+    local_profile_status_text,
+    resolve_local_profile,
+)
+from src.runtime.online.command_runner import (
+    CommandLogOptions,
+    _append_log,
+    _can_import_module,
+    _looks_like_missing_remote_artifact,
+    _render_command,
+    _run_local_command,
+    _run_local_command_with_retries,
+    _run_remote_bash,
+    _run_remote_bash_with_retries,
+    _run_stage,
+    _safe_print,
+)
+from src.runtime.online.sync_preflight import (
+    DEFAULT_SERVER_DIR,
+    SYNC_MODE_GUARD,
+    SYNC_MODE_OFF,
+    SYNC_MODE_PUSH,
+    _remote_dir_for_shell,
+    _run_coordinator_sync_preflight,
+    _sync_source_tree_to_server,
+)
 
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
-DEFAULT_SERVER_DIR = "/home/tzwang/program/winding_pose_solver"
 DEFAULT_ENV_NAME = "winding_pose_solver"
-SYNC_GUARD_FILES: tuple[str, ...] = (
-    "app_settings.py",
-    "main.py",
-    "src/core/motion_settings.py",
-    "src/core/types.py",
-    "src/runtime/delivery.py",
-    "src/runtime/main_entrypoint.py",
-    "src/runtime/origin_search_runner.py",
-    "src/runtime/origin_sweep.py",
-    "scripts/sweep_target_origin_yz.py",
-    "src/robodk_runtime/eval_worker.py",
-    "src/search/global_search.py",
-    "src/search/ik_collection.py",
-    "src/search/path_optimizer.py",
-    "src/search/local_repair.py",
-    "src/search/parallel_profile_eval.py",
-    "src/runtime/online/roundtrip.py",
-    "online_roundtrip.py",
-)
-SYNC_MODE_OFF = "off"
-SYNC_MODE_GUARD = "guard"
-SYNC_MODE_PUSH = "push"
-SYNC_BUNDLE_TREE_PATHS: tuple[str, ...] = (
-    "src",
-    "scripts",
-)
-SYNC_BUNDLE_ROOT_FILES: tuple[str, ...] = (
-    "online_roundtrip.py",
-    "online_requester.py",
-    "online_worker.py",
-    "main.py",
-    "app_settings.py",
-    "requirements.shared.txt",
-    "requirements.server.txt",
-    "environment.server.yml",
-    "README.md",
-    "AGENTS.md",
-)
-SYNC_BUNDLE_HASH_RELATIVE_PATH = "artifacts/tmp/runtime_bundle.sha256"
 DEFAULT_ONLINE_RETRY_CANDIDATE_LIMIT = 4
 DEFAULT_ONLINE_RETRY_REPAIR_LIMIT = 2
 DEFAULT_ONLINE_RETRY_MAX_ROUNDS = 1
-
-
-@dataclass(frozen=True)
-class CommandLogOptions:
-    log_path: Path | None = None
-    show_command_details: bool = True
-    show_worker_output: bool = True
 
 
 @dataclass(frozen=True)
@@ -151,618 +131,6 @@ def _local_artifact_dir(run_id: str) -> Path:
     return REPO_ROOT / "artifacts" / "online_runs" / run_id
 
 
-def _remote_dir_for_shell(server_dir: str) -> str:
-    if server_dir.startswith("~/"):
-        return server_dir.replace("~/", "$HOME/", 1)
-    if server_dir == "~":
-        return "$HOME"
-    return server_dir
-
-
-def _append_log(log_path: Path | None, message: str) -> None:
-    if log_path is None:
-        return
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    with log_path.open("a", encoding="utf-8") as handle:
-        handle.write(message)
-        if not message.endswith("\n"):
-            handle.write("\n")
-
-
-def _console_safe_text(text: str) -> str:
-    encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
-    return text.encode(encoding, errors="replace").decode(encoding, errors="replace")
-
-
-def _safe_print(text: str) -> None:
-    print(_console_safe_text(text))
-
-
-def _render_command(args: list[str]) -> str:
-    return " ".join(shlex.quote(part) for part in args)
-
-
-def _run_logged_command(
-    args: list[str],
-    *,
-    cwd: Path | None = None,
-    display_prefix: str,
-    log_options: CommandLogOptions,
-    echo_output: bool,
-) -> subprocess.CompletedProcess[str]:
-    rendered_command = _render_command(args)
-    if log_options.show_command_details:
-        print(f"{display_prefix} {rendered_command}")
-    _append_log(log_options.log_path, f"{display_prefix} {rendered_command}")
-
-    result = subprocess.run(
-        args,
-        cwd=str(cwd or REPO_ROOT),
-        text=True,
-        encoding="utf-8",
-        errors="backslashreplace",
-        capture_output=True,
-        check=False,
-    )
-    stdout_text = result.stdout or ""
-    stderr_text = result.stderr or ""
-    if stdout_text:
-        _append_log(log_options.log_path, "STDOUT:\n" + stdout_text)
-    if stderr_text:
-        _append_log(log_options.log_path, "STDERR:\n" + stderr_text)
-
-    if result.returncode != 0:
-        raise subprocess.CalledProcessError(
-            result.returncode,
-            args,
-            output=result.stdout,
-            stderr=result.stderr,
-        )
-
-    if echo_output:
-        if stdout_text.strip():
-            _safe_print(stdout_text.strip())
-        if stderr_text.strip():
-            _safe_print(stderr_text.strip())
-    return result
-
-
-def _run_local_command(
-    args: list[str],
-    *,
-    cwd: Path | None = None,
-    log_options: CommandLogOptions,
-    echo_output: bool,
-) -> subprocess.CompletedProcess[str]:
-    return _run_logged_command(
-        args,
-        cwd=cwd,
-        display_prefix="LOCAL >",
-        log_options=log_options,
-        echo_output=echo_output,
-    )
-
-
-def _run_local_command_with_retries(
-    args: list[str],
-    *,
-    cwd: Path | None = None,
-    log_options: CommandLogOptions,
-    echo_output: bool,
-    attempts: int | None = None,
-    delay_seconds: float | None = None,
-) -> subprocess.CompletedProcess[str]:
-    resolved_attempts = (
-        max(1, int(attempts))
-        if attempts is not None
-        else _positive_int_from_env("WPS_LOCAL_CMD_RETRY_ATTEMPTS", 3)
-    )
-    resolved_delay_seconds = (
-        max(0.0, float(delay_seconds))
-        if delay_seconds is not None
-        else _non_negative_float_from_env("WPS_LOCAL_CMD_RETRY_DELAY_SECONDS", 1.0)
-    )
-    last_error: subprocess.CalledProcessError | None = None
-    for attempt_index in range(1, resolved_attempts + 1):
-        try:
-            return _run_local_command(
-                args,
-                cwd=cwd,
-                log_options=log_options,
-                echo_output=echo_output,
-            )
-        except subprocess.CalledProcessError as exc:
-            last_error = exc
-            if attempt_index >= resolved_attempts:
-                break
-            message = (
-                f"[retry] local command failed on attempt {attempt_index}/{resolved_attempts}; "
-                f"retrying in {resolved_delay_seconds:.1f}s."
-            )
-            print(message)
-            _append_log(log_options.log_path, message)
-            sleep(resolved_delay_seconds)
-    assert last_error is not None
-    raise last_error
-
-
-def _run_remote_bash(
-    host: str,
-    script: str,
-    *,
-    log_options: CommandLogOptions,
-    echo_output: bool,
-) -> subprocess.CompletedProcess[str]:
-    command = ["ssh", host, f"bash -lc {shlex.quote(script)}"]
-    _append_log(log_options.log_path, f"REMOTE SCRIPT [{host}]:\n{script}")
-    return _run_logged_command(
-        command,
-        display_prefix=f"REMOTE[{host}] >",
-        log_options=log_options,
-        echo_output=echo_output,
-    )
-
-
-def _run_remote_bash_with_retries(
-    host: str,
-    script: str,
-    *,
-    log_options: CommandLogOptions,
-    echo_output: bool,
-    attempts: int | None = None,
-    delay_seconds: float | None = None,
-) -> subprocess.CompletedProcess[str]:
-    resolved_attempts = (
-        max(1, int(attempts))
-        if attempts is not None
-        else _positive_int_from_env("WPS_REMOTE_CMD_RETRY_ATTEMPTS", 3)
-    )
-    resolved_delay_seconds = (
-        max(0.0, float(delay_seconds))
-        if delay_seconds is not None
-        else _non_negative_float_from_env("WPS_REMOTE_CMD_RETRY_DELAY_SECONDS", 1.0)
-    )
-    last_error: subprocess.CalledProcessError | None = None
-    for attempt_index in range(1, resolved_attempts + 1):
-        try:
-            return _run_remote_bash(
-                host,
-                script,
-                log_options=log_options,
-                echo_output=echo_output,
-            )
-        except subprocess.CalledProcessError as exc:
-            last_error = exc
-            if attempt_index >= resolved_attempts:
-                break
-            message = (
-                f"[retry] remote command failed on attempt {attempt_index}/{resolved_attempts}; "
-                f"retrying in {resolved_delay_seconds:.1f}s."
-            )
-            print(message)
-            _append_log(log_options.log_path, message)
-            sleep(resolved_delay_seconds)
-    assert last_error is not None
-    raise last_error
-
-
-def _summarize_subprocess_failure(exc: subprocess.CalledProcessError) -> str:
-    stderr_text = (exc.stderr or "").strip()
-    stdout_text = (exc.output or "").strip()
-    for text in (stderr_text, stdout_text):
-        if text:
-            lines = [line.strip() for line in text.splitlines() if line.strip()]
-            if lines:
-                return lines[-1]
-    return f"command failed with exit code {exc.returncode}"
-
-
-def _subprocess_text(exc: subprocess.CalledProcessError) -> str:
-    return "\n".join(text for text in (exc.stderr, exc.output) if text)
-
-
-def _positive_int_from_env(name: str, default: int) -> int:
-    fallback = max(1, int(default))
-    raw_value = os.getenv(name)
-    if raw_value is None:
-        return fallback
-    try:
-        parsed_value = int(str(raw_value).strip())
-    except ValueError:
-        return fallback
-    return max(1, parsed_value)
-
-
-def _non_negative_float_from_env(name: str, default: float) -> float:
-    fallback = max(0.0, float(default))
-    raw_value = os.getenv(name)
-    if raw_value is None:
-        return fallback
-    try:
-        parsed_value = float(str(raw_value).strip())
-    except ValueError:
-        return fallback
-    return max(0.0, parsed_value)
-
-
-def _env_flag(name: str, *, default: bool = False) -> bool:
-    raw_value = os.getenv(name)
-    if raw_value is None:
-        return bool(default)
-    normalized = str(raw_value).strip().lower()
-    if normalized in {"", "0", "false", "no", "off"}:
-        return False
-    if normalized in {"1", "true", "yes", "on"}:
-        return True
-    return bool(default)
-
-
-def _looks_like_missing_remote_artifact(exc: subprocess.CalledProcessError) -> bool:
-    text = _subprocess_text(exc).lower()
-    missing_markers = (
-        "no such file",
-        "not a regular file",
-        "cannot stat",
-        "could not stat",
-        "does not exist",
-    )
-    return any(marker in text for marker in missing_markers)
-
-
-def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        while True:
-            chunk = handle.read(1024 * 1024)
-            if not chunk:
-                break
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def _sync_bundle_local_paths() -> tuple[Path, ...]:
-    return tuple(
-        (REPO_ROOT / relative_path)
-        for relative_path in (
-            *SYNC_BUNDLE_TREE_PATHS,
-            *SYNC_BUNDLE_ROOT_FILES,
-        )
-    )
-
-
-def _iter_sync_bundle_local_files() -> tuple[Path, ...]:
-    collected_files: list[Path] = []
-    for path in _sync_bundle_local_paths():
-        if not path.exists():
-            raise FileNotFoundError(f"Sync bundle path does not exist: {path}")
-        if path.is_file():
-            collected_files.append(path)
-            continue
-        if path.is_dir():
-            collected_files.extend(
-                child_path
-                for child_path in sorted(path.rglob("*"))
-                if child_path.is_file()
-            )
-            continue
-        raise RuntimeError(f"Unsupported sync bundle path type: {path}")
-    return tuple(collected_files)
-
-
-def _compute_sync_bundle_sha256() -> str:
-    digest = hashlib.sha256()
-    seen_relative_paths: set[str] = set()
-    for local_path in _iter_sync_bundle_local_files():
-        relative_path = local_path.relative_to(REPO_ROOT).as_posix()
-        if relative_path in seen_relative_paths:
-            continue
-        seen_relative_paths.add(relative_path)
-        digest.update(relative_path.encode("utf-8"))
-        digest.update(b"\0")
-        with local_path.open("rb") as handle:
-            while True:
-                chunk = handle.read(1024 * 1024)
-                if not chunk:
-                    break
-                digest.update(chunk)
-        digest.update(b"\0")
-    return digest.hexdigest()
-
-
-def _read_remote_sync_bundle_sha256(
-    *,
-    host: str,
-    server_dir: str,
-    log_options: CommandLogOptions,
-) -> str | None:
-    remote_shell_dir = _remote_dir_for_shell(server_dir)
-    remote_script = f"""
-set -e
-cd "{remote_shell_dir}"
-if [ -f "{SYNC_BUNDLE_HASH_RELATIVE_PATH}" ]; then
-    cat "{SYNC_BUNDLE_HASH_RELATIVE_PATH}"
-fi
-"""
-    result = _run_remote_bash_with_retries(
-        host,
-        remote_script,
-        log_options=log_options,
-        echo_output=False,
-    )
-    digest = (result.stdout or "").strip().lower()
-    if len(digest) == 64 and all(char in "0123456789abcdef" for char in digest):
-        return digest
-    return None
-
-
-def _write_remote_sync_bundle_sha256(
-    *,
-    host: str,
-    server_dir: str,
-    digest: str,
-    log_options: CommandLogOptions,
-) -> None:
-    remote_shell_dir = _remote_dir_for_shell(server_dir)
-    quoted_digest = shlex.quote(str(digest).strip())
-    remote_script = f"""
-set -e
-cd "{remote_shell_dir}"
-mkdir -p "$(dirname "{SYNC_BUNDLE_HASH_RELATIVE_PATH}")"
-printf '%s\\n' {quoted_digest} > "{SYNC_BUNDLE_HASH_RELATIVE_PATH}"
-"""
-    _run_remote_bash_with_retries(
-        host,
-        remote_script,
-        log_options=log_options,
-        echo_output=False,
-    )
-
-
-def _remote_file_sha256(
-    *,
-    host: str,
-    remote_path: str,
-    log_options: CommandLogOptions,
-) -> str | None:
-    remote_script = f"""
-set -e
-if [ -f "{remote_path}" ]; then
-    sha256sum "{remote_path}" | awk '{{print $1}}'
-fi
-"""
-    result = _run_remote_bash_with_retries(
-        host,
-        remote_script,
-        log_options=log_options,
-        echo_output=False,
-    )
-    digest = (result.stdout or "").strip()
-    return digest or None
-
-
-def _remote_files_sha256(
-    *,
-    host: str,
-    server_dir: str,
-    relative_paths: tuple[str, ...],
-    log_options: CommandLogOptions,
-) -> dict[str, str | None]:
-    """Return SHA-256 for several remote files through one SSH connection.
-
-    The Windows coordinator can see intermittent SSH resets on master.  Running
-    one short remote shell for all key files keeps the sync guard strict while
-    avoiding a burst of separate SSH sessions before every online run.
-    """
-    remote_shell_dir = _remote_dir_for_shell(server_dir)
-    script_lines = ["set -e", f'cd "{remote_shell_dir}"']
-    for relative_path in relative_paths:
-        quoted_path = shlex.quote(relative_path)
-        script_lines.append(
-            "if [ -f {path} ]; then "
-            "printf '%s\\t' {path}; "
-            "sha256sum {path} | awk '{{print $1}}'; "
-            "else "
-            "printf '%s\\tMISSING\\n' {path}; "
-            "fi".format(path=quoted_path)
-        )
-    result = _run_remote_bash_with_retries(
-        host,
-        "\n".join(script_lines),
-        log_options=log_options,
-        echo_output=False,
-    )
-    hashes: dict[str, str | None] = {}
-    for raw_line in (result.stdout or "").splitlines():
-        line = raw_line.strip()
-        if not line or "\t" not in line:
-            continue
-        relative_path, digest = line.split("\t", 1)
-        hashes[relative_path] = None if digest == "MISSING" else digest
-    return hashes
-
-
-def _enforce_remote_sync_guard(
-    *,
-    host: str,
-    server_dir: str,
-    log_options: CommandLogOptions,
-) -> None:
-    mismatches: list[dict[str, str]] = []
-    missing_local: list[str] = []
-    missing_remote: list[str] = []
-    remote_hashes = _remote_files_sha256(
-        host=host,
-        server_dir=server_dir,
-        relative_paths=SYNC_GUARD_FILES,
-        log_options=log_options,
-    )
-    for relative_path in SYNC_GUARD_FILES:
-        local_path = REPO_ROOT / relative_path
-        if not local_path.is_file():
-            missing_local.append(relative_path)
-            continue
-        local_hash = _sha256_file(local_path)
-        remote_hash = remote_hashes.get(relative_path)
-        if remote_hash is None:
-            missing_remote.append(relative_path)
-            continue
-        if local_hash != remote_hash:
-            mismatches.append(
-                {
-                    "path": relative_path,
-                    "local_sha256": local_hash,
-                    "remote_sha256": remote_hash,
-                }
-            )
-
-    if not mismatches and not missing_local and not missing_remote:
-        print("[online/coordinator] Remote sync guard passed.")
-        return
-
-    message_lines = [
-        "Remote sync guard blocked online run: local/remote key files are inconsistent.",
-        f"Remote root: {server_dir}",
-    ]
-    if missing_local:
-        message_lines.append("Missing local files: " + ", ".join(sorted(missing_local)))
-    if missing_remote:
-        message_lines.append("Missing remote files: " + ", ".join(sorted(missing_remote)))
-    if mismatches:
-        message_lines.append("Hash mismatches:")
-        for item in mismatches:
-            message_lines.append(
-                f"  - {item['path']}: local={item['local_sha256'][:12]} remote={item['remote_sha256'][:12]}"
-            )
-    message_lines.append(
-        f"Please sync to {DEFAULT_SERVER_DIR} before rerunning online mode."
-    )
-    raise RuntimeError("\n".join(message_lines))
-
-
-def _normalize_sync_mode(raw_value: str) -> str:
-    normalized = str(raw_value).strip().lower()
-    aliases = {
-        "check": SYNC_MODE_GUARD,
-        "verify": SYNC_MODE_GUARD,
-        "sync": SYNC_MODE_PUSH,
-        "none": SYNC_MODE_OFF,
-    }
-    normalized = aliases.get(normalized, normalized)
-    if normalized not in {SYNC_MODE_OFF, SYNC_MODE_GUARD, SYNC_MODE_PUSH}:
-        raise ValueError(
-            f"Unsupported remote sync mode={raw_value!r}; expected off/guard/push."
-        )
-    return normalized
-
-
-def _sync_source_tree_to_server(
-    *,
-    host: str,
-    server_dir: str,
-    log_options: CommandLogOptions,
-) -> None:
-    """Upload runtime source files to server without touching conda environment."""
-    remote_shell_dir = _remote_dir_for_shell(server_dir)
-    _run_stage(
-        "[online/sync] Ensuring remote project directory exists...",
-        lambda: _run_remote_bash_with_retries(
-            host,
-            f'mkdir -p "{remote_shell_dir}"',
-            log_options=log_options,
-            echo_output=False,
-        ),
-        log_options=log_options,
-    )
-    local_bundle_hash = _compute_sync_bundle_sha256()
-    remote_bundle_hash = _read_remote_sync_bundle_sha256(
-        host=host,
-        server_dir=server_dir,
-        log_options=log_options,
-    )
-    force_bundle_sync = _env_flag("WPS_FORCE_BUNDLE_SYNC", default=False)
-    if not force_bundle_sync and remote_bundle_hash == local_bundle_hash:
-        message = (
-            "[online/sync] Runtime bundle unchanged; upload skipped "
-            f"(hash={local_bundle_hash[:12]})."
-        )
-        print(message)
-        _append_log(log_options.log_path, message)
-        return
-    if force_bundle_sync:
-        force_message = "[online/sync] WPS_FORCE_BUNDLE_SYNC=1; forcing runtime bundle upload."
-        print(force_message)
-        _append_log(log_options.log_path, force_message)
-
-    upload_sources = [
-        *(str(REPO_ROOT / relative_path) for relative_path in SYNC_BUNDLE_TREE_PATHS),
-        *(str(REPO_ROOT / relative_path) for relative_path in SYNC_BUNDLE_ROOT_FILES),
-    ]
-    _run_stage(
-        "[online/sync] Uploading runtime bundle ...",
-        lambda: _run_local_command_with_retries(
-            [
-                "scp",
-                "-r",
-                *upload_sources,
-                f"{host}:{server_dir}/",
-            ],
-            log_options=log_options,
-            echo_output=False,
-            attempts=4,
-            delay_seconds=1.5,
-        ),
-        log_options=log_options,
-    )
-    _run_stage(
-        "[online/sync] Recording runtime bundle hash ...",
-        lambda: _write_remote_sync_bundle_sha256(
-            host=host,
-            server_dir=server_dir,
-            digest=local_bundle_hash,
-            log_options=log_options,
-        ),
-        log_options=log_options,
-    )
-
-
-def _run_coordinator_sync_preflight(
-    *,
-    host: str,
-    server_dir: str,
-    enforce_remote_sync_guard: bool,
-    remote_sync_mode: str,
-    log_options: CommandLogOptions,
-) -> None:
-    sync_mode = _normalize_sync_mode(remote_sync_mode)
-    if sync_mode == SYNC_MODE_PUSH:
-        _sync_source_tree_to_server(
-            host=host,
-            server_dir=server_dir,
-            log_options=log_options,
-        )
-    if sync_mode == SYNC_MODE_OFF:
-        if enforce_remote_sync_guard:
-            print(
-                "[online/coordinator] Remote sync mode=off; SHA guard is bypassed "
-                "for this run."
-            )
-        else:
-            print("[online/coordinator] Remote sync mode=off.")
-        return
-    if enforce_remote_sync_guard:
-        _run_stage(
-            "[online/coordinator] Checking local/remote sync guard...",
-            lambda: _enforce_remote_sync_guard(
-                host=host,
-                server_dir=server_dir,
-                log_options=log_options,
-            ),
-            log_options=log_options,
-        )
-    else:
-        print("[online/coordinator] Remote sync guard disabled by configuration.")
-
-
 def _remote_server_env_export_block() -> str:
     override_names = (
         "WPS_SERVER_PARTITION",
@@ -790,52 +158,20 @@ def _remote_server_env_export_block() -> str:
     return "\n".join(export_lines)
 
 
-def _run_stage(
-    stage_name: str,
-    func,
+def resolve_local_worker_python(
+    explicit_path: str | None = None,
     *,
-    log_options: CommandLogOptions,
-):
-    print(stage_name)
-    _append_log(log_options.log_path, stage_name)
-    started = perf_counter()
-    try:
-        result = func()
-    except subprocess.CalledProcessError as exc:
-        elapsed_seconds = perf_counter() - started
-        summary = _summarize_subprocess_failure(exc)
-        _append_log(log_options.log_path, f"{stage_name} failed after {elapsed_seconds:.2f}s")
-        raise RuntimeError(f"{stage_name} failed after {elapsed_seconds:.2f}s: {summary}") from exc
-    elapsed_seconds = perf_counter() - started
-    timing_message = f"{stage_name} done in {elapsed_seconds:.2f}s"
-    print(timing_message)
-    _append_log(log_options.log_path, timing_message)
-    return result
-
-
-def _can_import_module(python_executable: str, module_name: str) -> bool:
-    try:
-        subprocess.run(
-            [python_executable, "-c", f"import {module_name}"],
-            check=True,
-            text=True,
-            encoding="utf-8",
-            errors="backslashreplace",
-            capture_output=True,
-        )
-        return True
-    except Exception:
-        return False
-
-
-def resolve_local_worker_python(explicit_path: str | None = None) -> str:
+    local_profile: str = "auto",
+) -> str:
     if explicit_path:
         return explicit_path
 
     candidates = [sys.executable]
-    default_conda_worker = Path.home() / "anaconda3" / "envs" / "winding_pose_solver" / "python.exe"
-    if default_conda_worker.is_file():
-        candidates.append(str(default_conda_worker))
+    candidates.extend(
+        str(candidate)
+        for candidate in local_conda_python_candidates(local_profile)
+        if candidate.is_file()
+    )
 
     for candidate in candidates:
         if _can_import_module(candidate, "robodk"):
@@ -1429,12 +765,18 @@ def run_receiver_role(
     handoff_path: str | Path,
     run_id: str,
     local_python: str | None,
+    local_profile: str = "auto",
     allow_invalid_handoff: bool = False,
     log_options: CommandLogOptions | None = None,
 ) -> ReceiverRoleArtifacts:
     run_dir = _local_artifact_dir(run_id)
     run_dir.mkdir(parents=True, exist_ok=True)
     effective_log_options = log_options or CommandLogOptions(log_path=run_dir / "receiver_role.log")
+    resolved_profile = resolve_local_profile(local_profile)
+    print(
+        "[online/receiver] Local profile: "
+        f"{local_profile_status_text(resolved_profile)}."
+    )
 
     handoff_package_path = Path(handoff_path)
     handoff_payload = load_handoff_package(
@@ -1621,6 +963,7 @@ def run_online_coordinator(
     request_path: str | Path,
     run_id: str,
     local_python: str | None,
+    local_profile: str = "auto",
     generate_final_program: bool = True,
     final_program_name: str | None = None,
     optimized_csv_path: str | None = None,
@@ -1636,6 +979,11 @@ def run_online_coordinator(
     local_run_dir.mkdir(parents=True, exist_ok=True)
     effective_log_options = log_options or CommandLogOptions(
         log_path=local_run_dir / "online_coordinator.log",
+    )
+    resolved_profile = resolve_local_profile(local_profile)
+    print(
+        "[online/coordinator] Local profile: "
+        f"{local_profile_status_text(resolved_profile)}."
     )
 
     remote_request = _load_remote_request(request_path)
@@ -1921,6 +1269,7 @@ exit 0
                     handoff_path=debug_handoff_package_path,
                     run_id=run_id,
                     local_python=local_python,
+                    local_profile=resolved_profile,
                     allow_invalid_handoff=True,
                     log_options=effective_log_options,
                 )
@@ -1938,6 +1287,7 @@ exit 0
             handoff_path=handoff_package_path,
             run_id=run_id,
             local_python=local_python,
+            local_profile=resolved_profile,
             log_options=effective_log_options,
         )
         final_result_path = receiver_artifacts.result_path
@@ -1980,6 +1330,7 @@ def run_round(
     request_path: str | Path,
     run_id: str,
     local_python: str | None,
+    local_profile: str = "auto",
     server_eval_when_possible: bool = False,
     generate_final_program: bool = True,
     final_program_name: str | None = None,
@@ -2004,6 +1355,7 @@ def run_round(
         request_path=request_path,
         run_id=run_id,
         local_python=local_python,
+        local_profile=local_profile,
         generate_final_program=generate_final_program,
         final_program_name=final_program_name,
         optimized_csv_path=optimized_csv_path,
@@ -2022,13 +1374,17 @@ def run_worker_eval(
     request_path: str | Path,
     result_path: str | Path,
     local_python: str | None,
+    local_profile: str = "auto",
     log_options: CommandLogOptions | None = None,
 ) -> WorkerEvalArtifacts:
     effective_log_options = log_options or CommandLogOptions()
     request_path = Path(request_path)
     result_path = Path(result_path)
     result_path.parent.mkdir(parents=True, exist_ok=True)
-    worker_python = resolve_local_worker_python(local_python)
+    worker_python = resolve_local_worker_python(
+        local_python,
+        local_profile=local_profile,
+    )
 
     _run_stage(
         "[worker-eval] Local RoboDK worker evaluating request...",
@@ -2064,6 +1420,12 @@ def _add_coordinator_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--request", required=True)
     parser.add_argument("--run-id", default=_default_run_id())
     parser.add_argument("--local-python")
+    parser.add_argument(
+        "--local-profile",
+        choices=LOCAL_PROFILE_CHOICES,
+        default="auto",
+        help="Local coordinator/receiver machine profile.",
+    )
     parser.add_argument("--log-file")
     parser.add_argument("--show-command-details", action="store_true")
     parser.add_argument("--quiet-worker-output", action="store_true")
@@ -2111,7 +1473,7 @@ def _add_coordinator_args(parser: argparse.ArgumentParser) -> None:
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Role-based online runner for Windows coordinator, server, and receiver flows."
+        description="Role-based online runner for local coordinator, server, and receiver flows."
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -2141,7 +1503,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     online_parser = subparsers.add_parser(
         "run-online",
-        help="Run Windows coordinator: server compute then local receiver.",
+        help="Run local coordinator: server compute then optional local receiver.",
     )
     _add_coordinator_args(online_parser)
 
@@ -2176,10 +1538,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     server_parser.add_argument("--allow-invalid-outputs", action="store_true")
 
-    receiver_parser = subparsers.add_parser("run-receiver", help="Run Windows receiver role only.")
+    receiver_parser = subparsers.add_parser("run-receiver", help="Run local receiver role only.")
     receiver_parser.add_argument("--handoff", required=True)
     receiver_parser.add_argument("--run-id", default=_default_run_id())
     receiver_parser.add_argument("--local-python")
+    receiver_parser.add_argument(
+        "--local-profile",
+        choices=LOCAL_PROFILE_CHOICES,
+        default="auto",
+        help="Local receiver machine profile.",
+    )
     receiver_parser.add_argument("--log-file")
     receiver_parser.add_argument("--show-command-details", action="store_true")
     receiver_parser.add_argument("--quiet-worker-output", action="store_true")
@@ -2235,6 +1603,7 @@ def main(argv: list[str] | None = None) -> int:
                 handoff_path=args.handoff,
                 run_id=args.run_id,
                 local_python=args.local_python,
+                local_profile=args.local_profile,
                 allow_invalid_handoff=bool(args.allow_invalid_handoff),
                 log_options=log_options,
             )
@@ -2251,6 +1620,7 @@ def main(argv: list[str] | None = None) -> int:
                 request_path=args.request,
                 run_id=args.run_id,
                 local_python=args.local_python,
+                local_profile=args.local_profile,
                 server_eval_when_possible=bool(args.server_eval_when_possible),
                 generate_final_program=not bool(args.skip_final_generate),
                 final_program_name=args.program_name,
@@ -2274,6 +1644,7 @@ def main(argv: list[str] | None = None) -> int:
                 request_path=args.request,
                 run_id=args.run_id,
                 local_python=args.local_python,
+                local_profile=args.local_profile,
                 generate_final_program=not bool(args.skip_final_generate),
                 final_program_name=args.program_name,
                 optimized_csv_path=args.optimized_csv_path,

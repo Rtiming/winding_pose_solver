@@ -41,6 +41,12 @@ from src.runtime.origin_search_runner import (
     origin_search_run_dir,
     run_origin_search,
 )
+from src.runtime.local_profile import (
+    LOCAL_PROFILE_CHOICES,
+    local_profile_metadata,
+    local_profile_status_text,
+    resolve_local_profile,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -90,6 +96,7 @@ IK_BACKEND = "six_axis_ik"
 # ---------------------------------------------------------------------------
 
 RUN_MODE = "online"  # "single" | "online" | "origin_search"
+LOCAL_MACHINE_PROFILE = "auto"  # "auto" | "mac" | "windows" | "linux"
 SINGLE_ACTION = "program"  # "solve" | "program" | "visualize"
 SINGLE_RESULT_ARCHIVE_DIR = Path("artifacts/local_runs")
 
@@ -112,7 +119,7 @@ ONLINE_SETUP_SERVER_ENABLE_SLURM = False
 ONLINE_SERVER_EVAL_WHEN_POSSIBLE = False
 ONLINE_FINAL_GENERATE_PROGRAM = True
 # Server-side online continuity retry budget. This keeps heavy repair on master
-# while Windows only coordinates transfer and the final RoboDK receiver import.
+# while the local coordinator only handles transfer and the final RoboDK receiver import.
 #   WPS_ONLINE_RETRY_CANDIDATE_LIMIT / WPS_ONLINE_RETRY_REPAIR_LIMIT / WPS_ONLINE_RETRY_MAX_ROUNDS
 ONLINE_PROFILE_RETRY_CANDIDATE_LIMIT = 4
 ONLINE_PROFILE_RETRY_REPAIR_LIMIT = 2
@@ -303,6 +310,26 @@ def _resolve_run_id(args: argparse.Namespace | None = None) -> str:
     return timestamp_token()
 
 
+def _resolve_local_machine_profile(args: argparse.Namespace | None = None) -> str:
+    configured = (
+        str(args.local_profile)
+        if args is not None and getattr(args, "local_profile", None)
+        else LOCAL_MACHINE_PROFILE
+    )
+    return resolve_local_profile(configured)
+
+
+def _local_machine_profile_metadata(
+    args: argparse.Namespace | None = None,
+) -> dict[str, object]:
+    configured = (
+        str(args.local_profile)
+        if args is not None and getattr(args, "local_profile", None)
+        else LOCAL_MACHINE_PROFILE
+    )
+    return local_profile_metadata(configured)
+
+
 def _resolve_single_run_id(args: argparse.Namespace | None = None) -> str:
     if args is not None and args.run_id:
         return args.run_id
@@ -472,6 +499,7 @@ def _prepare_online_request(
     *,
     request_path: Path,
     runtime_settings=None,
+    args: argparse.Namespace | None = None,
 ) -> Path:
     from src.runtime.online.roundtrip import build_request_file
     active_settings = runtime_settings or APP_RUNTIME_SETTINGS
@@ -485,13 +513,17 @@ def _prepare_online_request(
         return request_path
 
     request_path.parent.mkdir(parents=True, exist_ok=True)
+    request_metadata = {
+        **_fixed_point_path_fallback_metadata(),
+        **_local_machine_profile_metadata(args),
+    }
     built_request_path = build_request_file(
         active_settings,
         request_path,
         round_index=ONLINE_ROUND_INDEX,
         candidate_limit=ONLINE_CANDIDATE_LIMIT,
         refresh_csv=not ONLINE_SKIP_POSE_SOLVER_WHEN_BUILDING_REQUEST,
-        metadata=_fixed_point_path_fallback_metadata(),
+        metadata=request_metadata,
     )
     print(f"[online] Built request: {built_request_path}")
     return built_request_path
@@ -1007,6 +1039,11 @@ def _run_online_mode(
         show_worker_output=SHOW_DETAILED_TERMINAL_LOGS,
     )
     allow_invalid_debug_outputs = _allow_invalid_debug_outputs(args)
+    local_profile = _resolve_local_machine_profile(args)
+    print(
+        "[profile] Local machine profile: "
+        f"{local_profile_status_text(local_profile)}."
+    )
 
     if online_command == "setup_server":
         print("Running online mode: setup_server")
@@ -1020,7 +1057,7 @@ def _run_online_mode(
         return {"detail_log": roundtrip_log_path}, "success"
 
     if online_command == "receiver":
-        print("Running online mode: receiver role (Windows RoboDK finalization)")
+        print("Running online mode: receiver role (local RoboDK finalization)")
         artifacts = run_receiver_role(
             handoff_path=_resolve_online_handoff_path(args),
             run_id=run_id,
@@ -1029,6 +1066,7 @@ def _run_online_mode(
                 if args is not None and getattr(args, "local_python", None)
                 else ONLINE_LOCAL_PYTHON
             ),
+            local_profile=local_profile,
             allow_invalid_handoff=allow_invalid_debug_outputs,
             log_options=command_log_options,
         )
@@ -1045,6 +1083,7 @@ def _run_online_mode(
     prepared_request_path = _prepare_online_request(
         request_path=request_path,
         runtime_settings=active_settings,
+        args=args,
     )
 
     if online_command == "build_request":
@@ -1066,6 +1105,7 @@ def _run_online_mode(
                 if args is not None and getattr(args, "local_python", None)
                 else ONLINE_LOCAL_PYTHON
             ),
+            local_profile=local_profile,
             log_options=command_log_options,
         )
         _summarize_worker_eval_result(artifacts.result_path)
@@ -1130,7 +1170,7 @@ def _run_online_mode(
             "detail_log": artifacts.log_path,
         }, artifacts.result_status
 
-    print("Running online mode: coordinator role (Windows orchestrates server + receiver)")
+    print("Running online mode: coordinator role (local machine orchestrates server + optional receiver)")
     if ONLINE_AUTO_SETUP_SERVER:
         print("[online] Auto setup enabled; preparing server first...")
         setup_server(
@@ -1152,6 +1192,7 @@ def _run_online_mode(
             if args is not None and getattr(args, "local_python", None)
             else ONLINE_LOCAL_PYTHON
         ),
+        local_profile=local_profile,
         generate_final_program=(
             ONLINE_FINAL_GENERATE_PROGRAM
             and not bool(args is not None and getattr(args, "skip_final_generate", False))
@@ -1637,6 +1678,11 @@ def parse_args() -> argparse.Namespace:
         help="Run smart-square Y/Z origin search around TARGET_FRAME_A_ORIGIN_IN_FRAME2_MM.",
     )
     parser.add_argument(
+        "--no-origin-search",
+        action="store_true",
+        help="Do not enter origin_search automatically even when ENABLE_TARGET_ORIGIN_YZ_SEARCH=True.",
+    )
+    parser.add_argument(
         "--origin-search-dispatch",
         choices=("none", "single_action", "online_role"),
         help=(
@@ -1685,6 +1731,11 @@ def parse_args() -> argparse.Namespace:
         choices=("coordinator", "server", "receiver"),
         help="Role-based online entry. Defaults to coordinator.",
     )
+    parser.add_argument(
+        "--local-profile",
+        choices=LOCAL_PROFILE_CHOICES,
+        help="Local coordinator/receiver machine profile. Defaults to LOCAL_MACHINE_PROFILE.",
+    )
     parser.add_argument("--request")
     parser.add_argument("--handoff")
     parser.add_argument("--local-python")
@@ -1711,7 +1762,7 @@ def main() -> int:
     args = parse_args()
     run_mode = (
         "origin_search"
-        if bool(args.origin_search or ENABLE_TARGET_ORIGIN_YZ_SEARCH)
+        if bool(args.origin_search or (ENABLE_TARGET_ORIGIN_YZ_SEARCH and not args.no_origin_search))
         else (args.mode or RUN_MODE)
     )
     single_action = (

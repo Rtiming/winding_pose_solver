@@ -93,6 +93,8 @@
 
 - `tcp_frame_pose`：TCP 在参考坐标系下的 4x4
 - `tcp_world_pose`：TCP 在世界坐标系下的 4x4
+- `joint_frames_robot`：机器人基坐标系下的关节层级帧，用于真实 link
+  mesh bind pose 适配。
 - `joint_frames_world`：各关节层级位姿
 
 ### 2.4 `POST /api/ik`
@@ -169,7 +171,67 @@
 - `best_request_id`
 - `best_quality`
 
-### 2.7 Reserved RoboDK-Parity Runtime Endpoints
+### 2.7 `POST /api/collision/check`
+
+Purpose: first solver-owned collision check entrypoint for real per-link robot
+assets.
+
+Request:
+
+```json
+{
+  "asset_manifest_path": "C:/.../examples/assets/model-manifest.json",
+  "q_deg": [0, 0, 0, 0, 0, 0],
+  "padding_mm": 0,
+  "ignore_adjacent_links": true
+}
+```
+
+Path request:
+
+```json
+{
+  "asset_manifest_path": "C:/.../examples/assets/model-manifest.json",
+  "q_path_deg": [
+    [0, 0, 0, 0, 0, 0],
+    [1, 2, 3, 4, 5, 6]
+  ],
+  "include_static_collision": true,
+  "sample_stride": 1,
+  "stop_on_first_collision": false
+}
+```
+
+Return highlights:
+
+- `method`: currently `link_static_aabb_broadphase` when static collision
+  assets are present, otherwise `link_aabb_broadphase`.
+- `collision_free`: boolean result for the checked pose.
+- `path_collision_free`: boolean result for the whole checked path when
+  `q_path_deg` is supplied.
+- `first_collision_sample_index`: first failing sample when path mode detects
+  collision, or `null`.
+- `collisions`: non-adjacent link pairs whose dedicated collision meshes
+  overlap in broadphase, plus robot-link vs static-object overlaps when
+  `include_static_collision=true`.
+- `kinematics_hash`: active solver model hash, used to match the asset
+  manifest.
+
+Important constraints:
+
+- The endpoint requires a configured solver session and dedicated
+  `robot_link_visuals[*].collision_asset` entries.
+- Path mode evaluates every sample by default. Use `sample_stride` only as an
+  explicit diagnostic/performance tradeoff; do not treat a sparse diagnostic
+  pass as final delivery validation.
+- The asset manifest `kinematics_hash` must match the configured solver model
+  unless `allow_kinematics_mismatch=true` is explicitly provided for
+  diagnostics.
+- This implementation covers robot-link self-collision and robot-link vs static
+  object broadphase. Path collision policy, narrowphase strategy, and
+  collision mode selection remain solver-owned future extensions.
+
+### 2.8 Reserved RoboDK-Parity Runtime Endpoints
 
 These endpoints reserve the future contract for RoboDK-class operation. They
 must stay solver-owned. Adapter packages may call them, but must not implement
@@ -198,6 +260,18 @@ KUKA C5 direction:
 - Reserved planning targets: `kuka_mxautomation_plan` and `kuka_srci_plan`.
 - KUKA export must consume selected paths and program IR; it must not choose IK
   candidates or repair continuity.
+
+Model/collision asset helpers:
+
+- `scripts/build_collision_assets_from_export.py`: builds simplified collision
+  meshes from exported real link/static meshes. For large fixture assemblies,
+  `--strategy grid-aabb` avoids collapsing the full fixture into one huge box.
+  It prepares assets only; collision policy remains solver-owned.
+- `POST /api/collision/check`: checks a configured pose against dedicated
+  link collision assets. Adapter packages must call this endpoint instead of
+  deciding collision validity locally.
+- `scripts/build_fk_preview_track.py`: builds a browser preview track using
+  solver FK. This is for visual QA and must not be replaced by frontend FK.
 
 ## 3. 质量字段语义（硬门禁 vs 诊断）
 
@@ -236,6 +310,7 @@ online role 流程适合跨机、Slurm、RoboDK 终态交付链路。
 - `configure_robot(payload, session=None)`
 - `solve_fk(payload, session=None)`
 - `solve_ik(payload, session=None)`
+- `check_collision(payload, session=None)`
 - `solve_path_request(payload)`
 - `solve_path_batch(payload)`
 
@@ -243,6 +318,7 @@ online role 流程适合跨机、Slurm、RoboDK 终态交付链路。
 
 ```python
 from src.runtime.external_api import (
+    check_collision,
     configure_robot,
     solve_fk,
     solve_ik,
@@ -252,6 +328,10 @@ from src.runtime.external_api import (
 configure_robot({"robot": {}})
 fk = solve_fk({"q_deg": [0, 0, 0, 0, 0, 0]})
 ik = solve_ik({"target_frame_pose": fk["tcp_frame_pose"]})
+collision = check_collision({
+    "asset_manifest_path": "C:/.../model-manifest.json",
+    "q_deg": fk["q_deg"],
+})
 
 # 路径请求按 ProfileEvaluationRequest 结构传入
 result = solve_path_request({...})

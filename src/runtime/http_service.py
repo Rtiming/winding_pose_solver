@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import uuid
+from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import FastAPI, Request
@@ -11,6 +13,7 @@ from pydantic import BaseModel
 
 from src.runtime.external_api import (
     ExternalAPIError,
+    check_collision,
     configure_robot,
     control_simulation,
     export_program,
@@ -22,6 +25,7 @@ from src.runtime.external_api import (
     solve_path_batch,
     solve_path_request,
 )
+from src.runtime.winding_runs import DEFAULT_WINDING_RUN_MANAGER, WindingRunError
 
 
 class ErrorPayload(BaseModel):
@@ -61,6 +65,51 @@ def _build_error_response(
         "error_legacy": str(message),
     }
     return JSONResponse(payload, status_code=status_code)
+
+
+def _api_ts() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _ok_envelope(
+    *,
+    code: str,
+    message: str,
+    data: Any,
+    request_id: str | None = None,
+) -> dict[str, Any]:
+    rid = request_id or uuid.uuid4().hex
+    return {
+        "ok": True,
+        "code": str(code),
+        "message": str(message),
+        "data": data,
+        "request_id": rid,
+        "ts": _api_ts(),
+    }
+
+
+def _error_envelope(
+    *,
+    code: str,
+    message: str,
+    detail: Any | None = None,
+    suggestion: str | None = None,
+    request_id: str | None = None,
+) -> dict[str, Any]:
+    rid = request_id or uuid.uuid4().hex
+    return {
+        "ok": False,
+        "code": str(code),
+        "message": str(message),
+        "data": {
+            "error_code": str(code),
+            "detail": detail,
+            "suggestion": suggestion,
+        },
+        "request_id": rid,
+        "ts": _api_ts(),
+    }
 
 
 def create_app() -> FastAPI:
@@ -151,6 +200,10 @@ def create_app() -> FastAPI:
     def path_solve_batch(payload: dict[str, Any]) -> dict[str, Any]:
         return solve_path_batch(payload)
 
+    @app.post("/api/collision/check")
+    def collision_check(payload: dict[str, Any]) -> dict[str, Any]:
+        return check_collision(payload)
+
     @app.post("/api/simulation/control")
     def simulation_control(payload: dict[str, Any]) -> dict[str, Any]:
         return control_simulation(payload)
@@ -162,6 +215,213 @@ def create_app() -> FastAPI:
     @app.post("/api/program/export")
     def program_export(payload: dict[str, Any]) -> dict[str, Any]:
         return export_program(payload)
+
+    @app.get("/api/winding/capabilities")
+    def winding_capabilities() -> dict[str, Any]:
+        request_id = uuid.uuid4().hex
+        try:
+            data = DEFAULT_WINDING_RUN_MANAGER.capabilities()
+        except WindingRunError as exc:
+            return JSONResponse(
+                _error_envelope(
+                    code=exc.code,
+                    message=exc.message,
+                    detail=exc.detail,
+                    suggestion=exc.suggestion,
+                    request_id=request_id,
+                ),
+                status_code=exc.status_code,
+            )
+        return _ok_envelope(
+            code="winding_capabilities_ready",
+            message="Winding orchestration capabilities loaded.",
+            data=data,
+            request_id=request_id,
+        )
+
+    @app.post("/api/winding/runs")
+    def winding_create_run(payload: dict[str, Any]) -> dict[str, Any]:
+        request_id = uuid.uuid4().hex
+        try:
+            data = DEFAULT_WINDING_RUN_MANAGER.create_run(payload)
+        except WindingRunError as exc:
+            return JSONResponse(
+                _error_envelope(
+                    code=exc.code,
+                    message=exc.message,
+                    detail=exc.detail,
+                    suggestion=exc.suggestion,
+                    request_id=request_id,
+                ),
+                status_code=exc.status_code,
+            )
+        return _ok_envelope(
+            code="winding_run_created",
+            message="Winding run accepted.",
+            data=data,
+            request_id=request_id,
+        )
+
+    @app.get("/api/winding/runs")
+    def winding_list_runs(limit: int = 20) -> dict[str, Any]:
+        request_id = uuid.uuid4().hex
+        try:
+            data = DEFAULT_WINDING_RUN_MANAGER.list_runs(limit=limit)
+        except WindingRunError as exc:
+            return JSONResponse(
+                _error_envelope(
+                    code=exc.code,
+                    message=exc.message,
+                    detail=exc.detail,
+                    suggestion=exc.suggestion,
+                    request_id=request_id,
+                ),
+                status_code=exc.status_code,
+            )
+        return _ok_envelope(
+            code="winding_runs_listed",
+            message="Winding runs listed.",
+            data={"runs": data},
+            request_id=request_id,
+        )
+
+    @app.get("/api/winding/runs/{run_id}")
+    def winding_get_run(run_id: str) -> dict[str, Any]:
+        request_id = uuid.uuid4().hex
+        try:
+            data = DEFAULT_WINDING_RUN_MANAGER.get_run(run_id)
+        except WindingRunError as exc:
+            return JSONResponse(
+                _error_envelope(
+                    code=exc.code,
+                    message=exc.message,
+                    detail=exc.detail,
+                    suggestion=exc.suggestion,
+                    request_id=request_id,
+                ),
+                status_code=exc.status_code,
+            )
+        return _ok_envelope(
+            code="winding_run_status",
+            message="Winding run status fetched.",
+            data=data,
+            request_id=request_id,
+        )
+
+    @app.post("/api/winding/runs/{run_id}/cancel")
+    def winding_cancel_run(run_id: str) -> dict[str, Any]:
+        request_id = uuid.uuid4().hex
+        try:
+            data = DEFAULT_WINDING_RUN_MANAGER.cancel_run(run_id)
+        except WindingRunError as exc:
+            return JSONResponse(
+                _error_envelope(
+                    code=exc.code,
+                    message=exc.message,
+                    detail=exc.detail,
+                    suggestion=exc.suggestion,
+                    request_id=request_id,
+                ),
+                status_code=exc.status_code,
+            )
+        return _ok_envelope(
+            code="winding_run_cancel_requested",
+            message="Cancel signal sent.",
+            data=data,
+            request_id=request_id,
+        )
+
+    @app.get("/api/winding/runs/{run_id}/summary")
+    def winding_get_summary(run_id: str) -> dict[str, Any]:
+        request_id = uuid.uuid4().hex
+        try:
+            data = DEFAULT_WINDING_RUN_MANAGER.load_artifact(run_id, "summary")
+        except WindingRunError as exc:
+            return JSONResponse(
+                _error_envelope(
+                    code=exc.code,
+                    message=exc.message,
+                    detail=exc.detail,
+                    suggestion=exc.suggestion,
+                    request_id=request_id,
+                ),
+                status_code=exc.status_code,
+            )
+        return _ok_envelope(
+            code="winding_summary_loaded",
+            message="summary.json loaded.",
+            data=data,
+            request_id=request_id,
+        )
+
+    @app.get("/api/winding/runs/{run_id}/results")
+    def winding_get_results(run_id: str) -> dict[str, Any]:
+        request_id = uuid.uuid4().hex
+        try:
+            data = DEFAULT_WINDING_RUN_MANAGER.load_artifact(run_id, "results")
+        except WindingRunError as exc:
+            return JSONResponse(
+                _error_envelope(
+                    code=exc.code,
+                    message=exc.message,
+                    detail=exc.detail,
+                    suggestion=exc.suggestion,
+                    request_id=request_id,
+                ),
+                status_code=exc.status_code,
+            )
+        return _ok_envelope(
+            code="winding_results_loaded",
+            message="results.json loaded.",
+            data=data,
+            request_id=request_id,
+        )
+
+    @app.get("/api/winding/runs/{run_id}/handoff")
+    def winding_get_handoff(run_id: str) -> dict[str, Any]:
+        request_id = uuid.uuid4().hex
+        try:
+            data = DEFAULT_WINDING_RUN_MANAGER.load_artifact(run_id, "handoff_package")
+        except WindingRunError as exc:
+            return JSONResponse(
+                _error_envelope(
+                    code=exc.code,
+                    message=exc.message,
+                    detail=exc.detail,
+                    suggestion=exc.suggestion,
+                    request_id=request_id,
+                ),
+                status_code=exc.status_code,
+            )
+        return _ok_envelope(
+            code="winding_handoff_loaded",
+            message="handoff_package.json loaded.",
+            data=data,
+            request_id=request_id,
+        )
+
+    @app.get("/api/winding/latest")
+    def winding_latest() -> dict[str, Any]:
+        request_id = uuid.uuid4().hex
+        try:
+            data = DEFAULT_WINDING_RUN_MANAGER.latest_summary()
+        except WindingRunError as exc:
+            return JSONResponse(
+                _error_envelope(
+                    code=exc.code,
+                    message=exc.message,
+                    detail=exc.detail,
+                    suggestion=exc.suggestion,
+                    request_id=request_id,
+                ),
+                status_code=exc.status_code,
+            )
+        return _ok_envelope(
+            code="winding_latest_loaded",
+            message="Latest summary loaded.",
+            data=data,
+            request_id=request_id,
+        )
 
     return app
 

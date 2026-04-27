@@ -122,6 +122,7 @@ python scripts/model_demo_solver_api.py --host 127.0.0.1 --port 8898
 - [docs/winding_motion_module_integration.md](docs/winding_motion_module_integration.md)
 - [docs/model_assets_and_collision.md](docs/model_assets_and_collision.md)
 - [docs/robodk_parity_and_kuka_c5.md](docs/robodk_parity_and_kuka_c5.md)
+- [docs/winding_workbench_api_contract.md](docs/winding_workbench_api_contract.md)
 
 ## Main Workflows
 

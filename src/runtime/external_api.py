@@ -19,6 +19,7 @@ from src.runtime.delivery import (
     result_quality_summary,
     result_semantic_status,
 )
+from src.runtime.collision_check import check_collision_with_session
 from src.runtime.model_identity import kinematics_hash
 from src.six_axis_ik import config as ik_config
 from src.six_axis_ik.interface import SixAxisIKSolver
@@ -153,15 +154,30 @@ def _kinematics_hash(
     )
 
 
+def _fk_partial_robot_rows(
+    robot_model: RobotModel,
+    q_deg: np.ndarray,
+) -> list[list[list[float]]]:
+    rows: list[list[list[float]]] = [_to_rows(np.eye(4, dtype=float))]
+    for joint_index in range(JOINT_COUNT):
+        partial = robot_model.fk_partial(q_deg, n_joints=joint_index + 1)
+        joint_point_home = np.ones((4,), dtype=float)
+        joint_point_home[:3] = robot_model.joint_axis_points_base_mm[joint_index]
+        joint_point_current = partial @ joint_point_home
+        joint_frame = partial.copy()
+        joint_frame[:3, 3] = joint_point_current[:3]
+        rows.append(_to_rows(joint_frame))
+    return rows
+
+
 def _fk_partial_world_rows(
     robot_model: RobotModel,
     robot_base_pose: np.ndarray,
     q_deg: np.ndarray,
 ) -> list[list[list[float]]]:
     rows: list[list[list[float]]] = []
-    for joint_count in range(JOINT_COUNT + 1):
-        partial = robot_model.fk_partial(q_deg, n_joints=joint_count)
-        world = robot_base_pose @ partial
+    for robot_rows in _fk_partial_robot_rows(robot_model, q_deg):
+        world = robot_base_pose @ np.asarray(robot_rows, dtype=float)
         rows.append(_to_rows(world))
     return rows
 
@@ -326,6 +342,7 @@ class SolverSession:
         tcp_world = base_pose @ tcp_robot
         tcp_frame = robot_model.fk_tcp_in_frame(q_clipped)
         joint_frames_world = _fk_partial_world_rows(robot_model, base_pose, q_clipped)
+        joint_frames_robot = _fk_partial_robot_rows(robot_model, q_clipped)
 
         return {
             "ok": True,
@@ -333,6 +350,7 @@ class SolverSession:
             "tcp_robot_pose": _to_rows(tcp_robot),
             "tcp_world_pose": _to_rows(tcp_world),
             "tcp_frame_pose": _to_rows(tcp_frame),
+            "joint_frames_robot": joint_frames_robot,
             "joint_frames_world": joint_frames_world,
         }
 
@@ -508,6 +526,25 @@ def get_runtime_capabilities() -> dict[str, Any]:
             "ik_fk_path_continuity": "implemented",
             "owner": "winding_pose_solver",
         },
+        "collision_runtime": {
+            "implemented": True,
+            "owner": "winding_pose_solver",
+            "method": "link_static_aabb_broadphase",
+            "supports": [
+                "single_pose_q_deg",
+                "path_q_path_deg",
+                "stop_on_first_collision",
+                "static_object_broadphase",
+            ],
+            "requires": [
+                "configured_solver_session",
+                "robot_link_visuals",
+                "dedicated_link_collision_assets",
+                "dedicated_static_collision_assets_when_static_collision_enabled",
+                "matching_kinematics_hash",
+            ],
+            "scope": "robot_link_self_collision_and_static_broadphase",
+        },
         "program_runtime": program_runtime_capabilities(),
     }
 
@@ -589,6 +626,23 @@ def solve_ik(
             "ik_failed",
             f"{type(exc).__name__}: {exc}",
             status_code=400,
+        ) from exc
+
+
+def check_collision(
+    payload: dict[str, Any],
+    *,
+    session: SolverSession | None = None,
+) -> dict[str, Any]:
+    active_session = session or DEFAULT_SOLVER_SESSION
+    try:
+        return check_collision_with_session(payload, active_session)
+    except Exception as exc:
+        raise ExternalAPIError(
+            "collision_check_failed",
+            f"{type(exc).__name__}: {exc}",
+            status_code=400,
+            details={"payload_keys": sorted(payload.keys()) if isinstance(payload, dict) else None},
         ) from exc
 
 
