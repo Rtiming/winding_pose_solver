@@ -14,6 +14,7 @@ Good fits for `core/`:
 - request/result schemas
 - pose solving from centerline data
 - backend-agnostic robot interface helpers
+- shared motion settings dataclasses and validation
 - visualization that does not depend on a live RoboDK station
 
 Avoid putting live-station behavior here. If code needs an open RoboDK station, it should usually live in `src/robodk_runtime/`.
@@ -26,6 +27,10 @@ Pose-solving structure:
   `solve_tool_poses()` for one-shot CSV input and
   `solve_tool_poses_from_dataset()` when a caller needs to evaluate many
   Frame-A origins against the same centerline.
+- `motion_settings.py` owns backend-neutral tuning fields shared by runtime
+  and search: joint limits, max-step limits, lower-config preference/lock,
+  periodic continuity settings, repair envelopes, bridge thresholds, and
+  closed-path terminal constraints.
 
 Do not add IK, DP scoring, or RoboDK station behavior here; those belong in
 `src/search/` and `src/robodk_runtime/`.

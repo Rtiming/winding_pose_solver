@@ -16,4 +16,17 @@ Current examples:
   (`check_model_demo_quality.py`)
 - launch an unattended `overnight_codex.sh` run that keeps working after you disconnect
 
-Prefer keeping scripts thin: they should usually call into `src/core/`, `src/search/`, or `src/robodk_runtime/` rather than duplicating project logic.
+Prefer keeping scripts thin: they should usually call into `src/core/`,
+`src/search/`, `src/runtime/`, or `src/robodk_runtime/` rather than duplicating
+project logic.
+
+Stable smoke examples:
+
+```powershell
+python scripts/sweep_target_origin_yz.py --help
+python scripts/sweep_target_origin_yz.py --mode smart-square --seed-origin 1126,-400,1130 --square-size-mm 300 --smart-max-iters 1 --workers 1 --skip-window-repair --skip-inserted-repair
+```
+
+Do not put online retry, active-set profile generation, or RoboDK finalization
+logic directly into scripts. Add or update the owning `src/` module first, then
+keep the script as a CLI wrapper.

@@ -42,6 +42,7 @@ from src.runtime.origin_sweep import (
     run_smart_square_sweep,
     select_diverse_top_results,
     select_nearest_official_outside_results,
+    result_passes_official_gate,
 )
 
 
@@ -132,11 +133,12 @@ def _print_recommended_constants(
         print(
             f"[sweep] #{index} TARGET_FRAME_A_ORIGIN_IN_FRAME2_MM = "
             f"({result.x_mm:.3f}, {result.y_mm:.3f}, {result.z_mm:.3f}) "
-            f"distance={distance_mm:.3f}mm status={result.status} "
+            f"distance={distance_mm:.3f}mm status={getattr(result, 'gate_tier', result.status)} "
             f"empty={result.ik_empty_row_count} switches={result.config_switches} "
             f"bridge={result.bridge_like_segments} big_circle={result.big_circle_step_count} "
             f"ratio={result.branch_flip_ratio:.3f} worst={result.worst_joint_step_deg:.3f} "
-            f"mean={result.mean_joint_step_deg:.6f}"
+            f"mean={result.mean_joint_step_deg:.6f} "
+            f"posture={getattr(result, 'posture_stress_score', 0.0):.6f}"
         )
     return recommended
 
@@ -516,12 +518,7 @@ def main() -> int:
                 half_span_mm=smart_square_config.half_span_mm,
             )
             <= 1e-9
-            and result.status == "valid"
-            and result.invalid_row_count == 0
-            and result.ik_empty_row_count == 0
-            and result.bridge_like_segments == 0
-            and result.big_circle_step_count == 0
-            and result.worst_joint_step_deg <= 60.0 + 1e-9
+            and result_passes_official_gate(result)
         ]
         if not official_inside and int(args.outside_fallback_count) > 0:
             ring_step_mm = (
@@ -699,8 +696,9 @@ def main() -> int:
         )
         print(
             "[sweep] best "
-            f"status={best.status}, origin=({best.x_mm:.3f}, {best.y_mm:.3f}, {best.z_mm:.3f}), "
+            f"status={getattr(best, 'gate_tier', best.status)}, origin=({best.x_mm:.3f}, {best.y_mm:.3f}, {best.z_mm:.3f}), "
             f"worst={best.worst_joint_step_deg:.3f}, mean={best.mean_joint_step_deg:.6f}, "
+            f"posture={getattr(best, 'posture_stress_score', 0.0):.6f}, "
             f"switches={best.config_switches}, bridge={best.bridge_like_segments}, "
             f"empty={best.ik_empty_row_count}, distance={best_distance_mm:.3f}mm, "
             f"time={best.timing_seconds:.3f}s"

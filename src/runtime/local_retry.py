@@ -84,6 +84,7 @@ def _result_sort_key(result: ProfileEvaluationResult) -> tuple[float, ...]:
         float(result.ik_empty_row_count),
         float(result.bridge_like_segments),
         float(getattr(result, "big_circle_step_count", 0)),
+        float(getattr(result, "posture_stress_score", 0.0)),
         float(result.worst_joint_step_deg),
         float(result.mean_joint_step_deg),
         float(result.config_switches),
@@ -198,6 +199,7 @@ def _top_result_summary(
         "branch_flip_ratio": float(getattr(result, "branch_flip_ratio", 0.0)),
         "worst_joint_step_deg": float(result.worst_joint_step_deg),
         "mean_joint_step_deg": float(result.mean_joint_step_deg),
+        "posture_stress_score": float(getattr(result, "posture_stress_score", 0.0)),
         "total_cost": float(result.total_cost),
     }
 
@@ -221,10 +223,14 @@ def _request_summary(
         "left_dz_mm",
         "right_dy_mm",
         "right_dz_mm",
+        "segment_indices",
+        "active_segment_count",
     ):
         if field_name in metadata:
             field_value = metadata[field_name]
-            if isinstance(field_value, (int, float)):
+            if field_name == "segment_indices" and isinstance(field_value, (list, tuple)):
+                summary[field_name] = [int(value) for value in field_value]
+            elif isinstance(field_value, (int, float)):
                 summary[field_name] = float(field_value)
             else:
                 summary[field_name] = field_value
@@ -234,6 +240,7 @@ def _request_summary(
 def _focus_segment_indices(
     result: ProfileEvaluationResult,
 ) -> tuple[int, ...]:
+    focus_limit = _positive_int_from_env("WPS_LOCAL_RETRY_FOCUS_SEGMENT_LIMIT") or 6
     ordered_segments = sorted(
         result.failing_segments,
         key=lambda segment: (
@@ -251,9 +258,54 @@ def _focus_segment_indices(
             continue
         seen.add(segment_index)
         unique_indices.append(segment_index)
-        if len(unique_indices) >= 3:
+        if len(unique_indices) >= max(1, focus_limit // 2):
+            break
+    for segment_index in _largest_selected_path_step_segments(
+        result,
+        max_segments=focus_limit,
+    ):
+        if segment_index in seen:
+            continue
+        seen.add(segment_index)
+        unique_indices.append(segment_index)
+        if len(unique_indices) >= focus_limit:
             break
     return tuple(unique_indices)
+
+
+def _selected_path_segment_step_map(
+    result: ProfileEvaluationResult,
+) -> dict[int, float]:
+    selected_path = tuple(result.selected_path or ())
+    if len(selected_path) < 2:
+        return {}
+
+    step_map: dict[int, float] = {}
+    for segment_index, (previous_entry, current_entry) in enumerate(
+        zip(selected_path, selected_path[1:])
+    ):
+        previous_joints = tuple(float(value) for value in previous_entry.joints)
+        current_joints = tuple(float(value) for value in current_entry.joints)
+        step_map[int(segment_index)] = max(
+            (
+                abs(current - previous)
+                for previous, current in zip(previous_joints, current_joints)
+            ),
+            default=0.0,
+        )
+    return step_map
+
+
+def _largest_selected_path_step_segments(
+    result: ProfileEvaluationResult,
+    *,
+    max_segments: int,
+) -> tuple[int, ...]:
+    if max_segments <= 0:
+        return ()
+    step_map = _selected_path_segment_step_map(result)
+    ranked = sorted(step_map.items(), key=lambda item: (-item[1], item[0]))
+    return tuple(segment_index for segment_index, _step in ranked[:max_segments])
 
 
 def _focus_segment_metrics(
@@ -267,12 +319,10 @@ def _focus_segment_metrics(
         int(segment.segment_index): float(segment.max_joint_delta_deg)
         for segment in result.failing_segments
     }
+    selected_step_map = _selected_path_segment_step_map(result)
     fallback = float(result.worst_joint_step_deg) + 1_000.0
     return tuple(
-        segment_map.get(
-            segment_index,
-            0.0 if result.status == "valid" else fallback,
-        )
+        segment_map.get(segment_index, selected_step_map.get(segment_index, fallback))
         for segment_index in focus_segments
     )
 
@@ -298,13 +348,22 @@ def _round_progress_sort_key(
 ) -> tuple[float, ...]:
     focus_metrics = _focus_segment_metrics(result, focus_segments=focus_segments)
     unresolved_focus_count = sum(1 for value in focus_metrics if value > 1e-9)
+    focus_worst = max(focus_metrics, default=0.0)
+    focus_sum = sum(float(value) for value in focus_metrics)
     return (
-        float(unresolved_focus_count),
-        *(float(value) for value in focus_metrics),
+        float(result.invalid_row_count),
+        float(result.ik_empty_row_count),
         float(result.bridge_like_segments),
         float(getattr(result, "big_circle_step_count", 0)),
+        float(getattr(result, "posture_stress_score", 0.0)),
+        float(result.worst_joint_step_deg),
+        float(result.mean_joint_step_deg),
         float(result.config_switches),
-        *_result_sort_key(result),
+        float(unresolved_focus_count),
+        float(focus_worst),
+        float(focus_sum),
+        float(result.total_cost),
+        float(result.timing_seconds),
     )
 
 
@@ -511,9 +570,14 @@ def run_local_profile_retry(
     repair_retry_limit: int,
     max_rounds: int,
     baseline_search_result=None,
+    quality_polish: bool = False,
 ) -> LocalProfileRetryOutcome:
     retry_started = perf_counter()
-    if baseline_result.status == "valid" and not result_has_continuity_warnings(baseline_result):
+    if (
+        baseline_result.status == "valid"
+        and not result_has_continuity_warnings(baseline_result)
+        and not bool(quality_polish)
+    ):
         return LocalProfileRetryOutcome(
             best_result=baseline_result,
             payload={
@@ -557,6 +621,7 @@ def run_local_profile_retry(
                 "entrypoint": "local_profile_retry",
                 "round_index": round_index,
                 "prefer_local_candidates": True,
+                "quality_polish": bool(quality_polish),
             },
         )
         candidate_proposal_started = perf_counter()
@@ -809,13 +874,18 @@ def run_local_profile_retry(
         else:
             break
 
-        if best_result.status == "valid" and not result_has_continuity_warnings(best_result):
+        if (
+            not bool(quality_polish)
+            and best_result.status == "valid"
+            and not result_has_continuity_warnings(best_result)
+        ):
             break
 
     return LocalProfileRetryOutcome(
         best_result=best_result,
         payload={
             "entrypoint": "local_profile_retry",
+            "quality_polish": bool(quality_polish),
             "initial_result": _top_result_summary(baseline_result),
             "best_result": _top_result_summary(best_result),
             "rounds": rounds_payload,

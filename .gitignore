@@ -20,6 +20,7 @@ venv/
 *.tmp
 tempCodeRunnerFile.py
 artifacts/
+.runtime/
 
 # Data files (optional, depending on your workflow)
 # data/_*.csv

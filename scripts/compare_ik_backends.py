@@ -19,8 +19,8 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.ik_collection import _build_pose, _collect_ik_candidates, _build_seed_joint_strategies
-from src.path_optimizer import _build_optimizer_settings
+from src.search.ik_collection import _build_pose, _collect_ik_candidates, _build_seed_joint_strategies
+from src.search.path_optimizer import _build_optimizer_settings
 from src.core.motion_settings import RoboDKMotionSettings
 from src.core.pose_csv import load_pose_rows
 

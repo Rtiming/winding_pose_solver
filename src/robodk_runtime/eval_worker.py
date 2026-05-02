@@ -520,6 +520,8 @@ def _finalize_request_result(
         request=request,
         search_result=search_result,
         settings=resources.settings,
+        robot=context.robot,
+        optimizer_settings=resources.optimizer_settings,
         elapsed_seconds=elapsed_seconds,
         diagnostics=validation_message,
         metadata=extra_metadata,
@@ -857,6 +859,8 @@ def _search_result_to_profile_result(
     request: ProfileEvaluationRequest,
     search_result,
     settings: RoboDKMotionSettings,
+    robot,
+    optimizer_settings,
     elapsed_seconds: float,
     diagnostics: str | None,
     metadata: dict[str, Any] | None = None,
@@ -879,6 +883,12 @@ def _search_result_to_profile_result(
         ),
         ratio_eps_mm=float(getattr(settings, "branch_flip_ratio_eps_mm", 1e-3)),
     )
+    posture_stress = path_optimizer_module.summarize_path_posture_stress(
+        robot,
+        search_result.selected_path,
+        optimizer_settings,
+        row_labels=search_result.row_labels,
+    )
     result_metadata = dict(request.metadata)
     result_metadata.update(metadata or {})
     result_metadata["branch_jump_metrics"] = {
@@ -889,6 +899,7 @@ def _search_result_to_profile_result(
             for item in branch_jump_metrics.get("violent_branch_segments", ())
         ],
     }
+    result_metadata["posture_stress"] = dict(posture_stress)
     is_valid = error_message is None and diagnostics is None
     return ProfileEvaluationResult(
         request_id=request.request_id,
@@ -924,6 +935,7 @@ def _search_result_to_profile_result(
         profiling=runtime_profile_snapshot(),
         big_circle_step_count=int(branch_jump_metrics.get("big_circle_step_count", 0)),
         branch_flip_ratio=float(branch_jump_metrics.get("max_branch_flip_ratio", 0.0)),
+        posture_stress_score=float(posture_stress.get("mean_score", 0.0)),
         violent_branch_segments=tuple(
             dict(item)
             for item in branch_jump_metrics.get("violent_branch_segments", ())
@@ -1459,6 +1471,7 @@ def evaluate_request(
         f"big_circle_step_count={result.big_circle_step_count}, "
         f"worst_joint_step={result.worst_joint_step_deg:.3f} deg, "
         f"branch_flip_ratio={result.branch_flip_ratio:.3f}, "
+        f"posture_stress={result.posture_stress_score:.6f}, "
         f"time={result.timing_seconds:.3f}s"
     )
     return result, search_result

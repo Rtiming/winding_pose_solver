@@ -9,6 +9,7 @@ This file applies to `src/core/`.
 - request and result schemas
 - pose solving from centerline data
 - backend-agnostic robot interface helpers
+- shared motion settings and validation
 - visualization that does not need a live RoboDK station
 
 ## Good Edit Targets
@@ -16,6 +17,7 @@ This file applies to `src/core/`.
 - `frame_math.py`, `geometry.py`, `simple_mat.py`: reusable math and transforms
 - `pose_solver.py`, `pose_csv.py`: centerline-to-pose generation and CSV plumbing
 - `collab_models.py`, `types.py`: shared request/result payload shapes and typing
+- `motion_settings.py`: backend-neutral motion/search tuning fields
 - `robot_interface.py`: backend-agnostic abstraction boundary
 - `visualization.py`: shared visualization helpers that do not require station access
 
@@ -32,9 +34,13 @@ If the code needs an open RoboDK station, it probably belongs in `src/robodk_run
 
 - Favor pure functions and data-shape clarity here because this layer is reused by local runs, online flows, and diagnostics scripts.
 - If you change schemas in `collab_models.py`, inspect all producers and consumers in `src/runtime/`, `online_roundtrip.py`, and worker-side code.
+- If you change `RoboDKMotionSettings`, inspect `app_settings.py`,
+  `src/runtime/main_entrypoint.py`, request serialization, and search consumers.
 - Keep backend-agnostic abstractions honest. Do not quietly leak RoboDK-only assumptions into shared interfaces.
 
 ## Validation
 
 - Prefer import checks and small focused payload or CSV roundtrips.
 - If a schema changes, validate at least one caller and one consumer.
+- If motion settings change, compile `app_settings.py`, `src/core/types.py`,
+  and the relevant `src/search/` consumer.

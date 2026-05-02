@@ -9,6 +9,7 @@ This file applies to `src/six_axis_ik/`.
 - FK helpers
 - backend-specific workflow glue for the embedded solver
 - RoboDK bridge helpers used for parity checks
+- server-safe behavior that must not require a live RoboDK station
 
 ## Good Edit Targets
 
@@ -30,6 +31,11 @@ This package should focus on kinematics and backend behavior, not search strateg
 - Be explicit when a change is intended to improve RoboDK parity versus when it intentionally changes local-solver behavior.
 - Keep interfaces stable for callers in `src/core/robot_interface.py` and the search layer unless the task explicitly changes that contract.
 - If you change numeric tolerances or model constants, document the intent in code comments when the reason is not obvious.
+- Do not encode high-level lower/elbow preferences, active-set polish, or
+  closed-path policy here. Return stable IK/FK/config information and let
+  `src/search/` decide how to score it.
+- Preserve server safety: imports and normal compute paths must work without
+  RoboDK installed or activated.
 
 ## Validation
 

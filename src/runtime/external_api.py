@@ -229,6 +229,7 @@ def _result_sort_key(result: Any) -> tuple[float, ...]:
         float(getattr(result, "ik_empty_row_count", 0)),
         float(getattr(result, "bridge_like_segments", 0)),
         float(getattr(result, "big_circle_step_count", 0)),
+        float(getattr(result, "posture_stress_score", 0.0)),
         float(getattr(result, "worst_joint_step_deg", 0.0)),
         float(getattr(result, "mean_joint_step_deg", 0.0)),
         float(getattr(result, "config_switches", 0)),

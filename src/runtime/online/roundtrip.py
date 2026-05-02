@@ -59,9 +59,9 @@ from src.runtime.online.sync_preflight import (
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_ENV_NAME = "winding_pose_solver"
-DEFAULT_ONLINE_RETRY_CANDIDATE_LIMIT = 4
+DEFAULT_ONLINE_RETRY_CANDIDATE_LIMIT = 24
 DEFAULT_ONLINE_RETRY_REPAIR_LIMIT = 2
-DEFAULT_ONLINE_RETRY_MAX_ROUNDS = 1
+DEFAULT_ONLINE_RETRY_MAX_ROUNDS = 3
 
 
 @dataclass(frozen=True)
@@ -143,6 +143,8 @@ def _remote_server_env_export_block() -> str:
         "WPS_SERVER_PROFILE_MIN_BATCH_SIZE_CAP",
         "WPS_SERVER_PROFILE_ALLOW_HIGH_MIN_BATCH",
         "WPS_LOCAL_RETRY_REPAIR_EVAL_MODE",
+        "WPS_ONLINE_QUALITY_POLISH",
+        "WPS_ONLINE_QUALITY_POLISH_TARGET_DEG",
         "WPS_RUNTIME_PROFILE_LEVEL",
         "WPS_ALLOW_LOGIN_NODE_SERVER",
     )
@@ -235,6 +237,7 @@ def _result_sort_key(result) -> tuple[float, ...]:
         float(result.ik_empty_row_count),
         float(result.bridge_like_segments),
         float(getattr(result, "big_circle_step_count", 0)),
+        float(getattr(result, "posture_stress_score", 0.0)),
         float(result.worst_joint_step_deg),
         float(result.mean_joint_step_deg),
         float(result.config_switches),
@@ -247,6 +250,43 @@ def _select_best_result(results: tuple) -> object | None:
     if not results:
         return None
     return sorted(results, key=_result_sort_key)[0]
+
+
+def _env_bool(name: str, default_value: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return bool(default_value)
+    return value.strip().lower() not in {"0", "false", "no", "off", ""}
+
+
+def _online_quality_polish_target_deg() -> float:
+    raw_value = os.getenv("WPS_ONLINE_QUALITY_POLISH_TARGET_DEG", "20.0")
+    try:
+        return max(0.0, float(raw_value))
+    except ValueError:
+        return 20.0
+
+
+def _online_quality_polish_posture_target() -> float:
+    raw_value = os.getenv("WPS_ONLINE_QUALITY_POLISH_POSTURE_TARGET", "0.15")
+    try:
+        return max(0.0, float(raw_value))
+    except ValueError:
+        return 0.15
+
+
+def _should_run_online_quality_polish(selected_result) -> bool:
+    if selected_result is None:
+        return False
+    if not _env_bool("WPS_ONLINE_QUALITY_POLISH", True):
+        return False
+    if not result_is_strictly_valid(selected_result):
+        return False
+    return (
+        float(selected_result.worst_joint_step_deg) > _online_quality_polish_target_deg()
+        or float(getattr(selected_result, "posture_stress_score", 0.0))
+        > _online_quality_polish_posture_target()
+    )
 
 
 def _build_receiver_request_from_result(
@@ -337,9 +377,9 @@ else
     conda env create -n "{env_name}" -f environment.server.yml
 fi
 conda activate "{env_name}"
-python online_requester.py --help >/tmp/wps_requester_help.txt
+python -m src.runtime.online.requester --help >/tmp/wps_requester_help.txt
 python online_roundtrip.py --help >/tmp/wps_roundtrip_help.txt
-python online_worker.py --help >/tmp/wps_worker_help.txt
+python -m src.runtime.online.worker --help >/tmp/wps_worker_help.txt
 python scripts/sweep_target_origin_yz.py --help >/tmp/wps_sweep_help.txt
 python main.py --help >/tmp/wps_main_help.txt
 python - <<'PY'
@@ -552,7 +592,20 @@ def run_server_role(
     retry_round_budget = max(0, int(retry_max_rounds))
     retry_enabled = retry_candidate_budget > 0 and retry_round_budget > 0
     retry_summary_path: Path | None = None
-    if selected_result is not None and not result_is_strictly_valid(selected_result) and retry_enabled:
+    quality_polish = bool(
+        selected_result is not None
+        and retry_enabled
+        and _should_run_online_quality_polish(selected_result)
+    )
+    retry_needed = bool(
+        selected_result is not None
+        and retry_enabled
+        and (
+            not result_is_strictly_valid(selected_result)
+            or quality_polish
+        )
+    )
+    if retry_needed:
         def _retry():
             from src.runtime.local_retry import run_local_profile_retry
             baseline_search_result = selected_search_result_holder.get("value")
@@ -585,10 +638,15 @@ def run_server_role(
                 repair_retry_limit=retry_repair_budget,
                 max_rounds=retry_round_budget,
                 baseline_search_result=baseline_search_result,
+                quality_polish=quality_polish,
             )
 
         retry_outcome = _run_stage(
-            "[online/server] Running server-side profile retry/repair...",
+            (
+                "[online/server] Running server-side profile quality polish..."
+                if quality_polish
+                else "[online/server] Running server-side profile retry/repair..."
+            ),
             _retry,
             log_options=effective_log_options,
         )
@@ -607,8 +665,12 @@ def run_server_role(
             selected_result = retry_outcome.best_result
             best_request_id = str(selected_result.request_id)
         print(
-            "[online/server] Retry best: "
-            f"status={retry_outcome.best_result.status}, "
+            (
+                "[online/server] Quality polish best: "
+                if quality_polish
+                else "[online/server] Retry best: "
+            )
+            + f"status={retry_outcome.best_result.status}, "
             f"worst_joint_step={retry_outcome.best_result.worst_joint_step_deg:.3f}"
         )
     elif selected_result is not None and not result_is_strictly_valid(selected_result):
@@ -1391,7 +1453,8 @@ def run_worker_eval(
         lambda: _run_local_command(
             [
                 worker_python,
-                str(REPO_ROOT / "online_worker.py"),
+                "-m",
+                "src.runtime.online.worker",
                 "eval",
                 "--request",
                 str(request_path),

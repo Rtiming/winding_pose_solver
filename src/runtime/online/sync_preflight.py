@@ -47,8 +47,6 @@ SYNC_BUNDLE_TREE_PATHS: tuple[str, ...] = (
 )
 SYNC_BUNDLE_ROOT_FILES: tuple[str, ...] = (
     "online_roundtrip.py",
-    "online_requester.py",
-    "online_worker.py",
     "main.py",
     "app_settings.py",
     "requirements.shared.txt",

@@ -111,6 +111,7 @@ class SweepResult:
     y_mm: float
     z_mm: float
     status: str
+    gate_tier: str
     timing_seconds: float
     invalid_row_count: int
     ik_empty_row_count: int
@@ -121,6 +122,7 @@ class SweepResult:
     worst_joint_step_deg: float
     mean_joint_step_deg: float
     total_cost: float
+    posture_stress_score: float = 0.0
     pose_build_seconds: float = 0.0
     ik_collection_seconds: float = 0.0
     dp_path_selection_seconds: float = 0.0
@@ -129,12 +131,13 @@ class SweepResult:
 
     def rank_key(self) -> tuple[float, ...]:
         return (
-            0.0 if self.status == "valid" else 1.0,
+            _gate_tier_rank(self.gate_tier),
             float(self.invalid_row_count),
             float(self.ik_empty_row_count),
             float(self.bridge_like_segments),
             float(self.big_circle_step_count),
             float(self.branch_flip_ratio),
+            float(self.posture_stress_score),
             float(self.worst_joint_step_deg),
             float(self.mean_joint_step_deg),
             float(self.config_switches),
@@ -520,9 +523,18 @@ def outside_square_distance_yz_mm(
     return math.hypot(dy_out, dz_out)
 
 
+def _gate_tier_rank(gate_tier: str) -> float:
+    if str(gate_tier) == "official":
+        return 0.0
+    if str(gate_tier) == "debug":
+        return 1.0
+    return 2.0
+
+
 def result_passes_official_gate(result: SweepResult, *, worst_step_limit_deg: float = 60.0) -> bool:
     return (
         str(result.status) == "valid"
+        and str(result.gate_tier) == "official"
         and int(result.invalid_row_count) == 0
         and int(result.ik_empty_row_count) == 0
         and int(result.bridge_like_segments) == 0
@@ -554,15 +566,16 @@ def select_nearest_official_outside_results(
             > 1e-9
         ),
         key=lambda result: (
+            float(result.branch_flip_ratio),
+            float(result.posture_stress_score),
+            float(result.worst_joint_step_deg),
+            float(result.mean_joint_step_deg),
             outside_square_distance_yz_mm(
                 result,
                 center_y_mm=center_y_mm,
                 center_z_mm=center_z_mm,
                 half_span_mm=half_span_mm,
             ),
-            float(result.branch_flip_ratio),
-            float(result.worst_joint_step_deg),
-            float(result.mean_joint_step_deg),
             distance_from_seed_yz_mm(
                 result,
                 seed_y_mm=center_y_mm,
@@ -598,12 +611,13 @@ def candidate_rank_key(
     seed_z_mm: float,
 ) -> tuple[float, ...]:
     return (
-        0.0 if result.status == "valid" else 1.0,
+        _gate_tier_rank(result.gate_tier),
         float(result.invalid_row_count),
         float(result.ik_empty_row_count),
         float(result.bridge_like_segments),
         float(result.big_circle_step_count),
         float(result.branch_flip_ratio),
+        float(result.posture_stress_score),
         float(result.worst_joint_step_deg),
         float(result.mean_joint_step_deg),
         float(result.config_switches),
@@ -697,17 +711,18 @@ def is_better(lhs: SweepResult, rhs: SweepResult) -> bool:
 
 def print_result_table(results: Sequence[SweepResult]) -> None:
     print(
-        "request_id,status,y_mm,z_mm,worst_joint_step_deg,mean_joint_step_deg,"
-        "config_switches,bridge_like_segments,big_circle_step_count,branch_flip_ratio,ik_empty_rows,time_s,pose_s,ik_s,dp_s,"
+        "request_id,status,raw_status,y_mm,z_mm,worst_joint_step_deg,mean_joint_step_deg,"
+        "config_switches,bridge_like_segments,big_circle_step_count,branch_flip_ratio,posture_stress_score,ik_empty_rows,time_s,pose_s,ik_s,dp_s,"
         "window_repair_s,inserted_repair_s,total_cost"
     )
     for result in results:
         print(
-            f"{result.request_id},{result.status},{result.y_mm:.3f},{result.z_mm:.3f},"
+            f"{result.request_id},{result.gate_tier},{result.status},{result.y_mm:.3f},{result.z_mm:.3f},"
             f"{result.worst_joint_step_deg:.6f},{result.mean_joint_step_deg:.6f},"
             f"{result.config_switches},{result.bridge_like_segments},"
             f"{result.big_circle_step_count},{result.branch_flip_ratio:.6f},"
-            f"{result.ik_empty_row_count},{result.timing_seconds:.3f},"
+            f"{result.posture_stress_score:.6f},{result.ik_empty_row_count},"
+            f"{result.timing_seconds:.3f},"
             f"{result.pose_build_seconds:.3f},{result.ik_collection_seconds:.3f},"
             f"{result.dp_path_selection_seconds:.3f},{result.window_repair_seconds:.3f},"
             f"{result.inserted_repair_seconds:.3f},{result.total_cost:.6f}"
@@ -916,6 +931,7 @@ def _sweep_result_from_cache_payload(payload: dict[str, object]) -> SweepResult:
         y_mm=float(payload["y_mm"]),
         z_mm=float(payload["z_mm"]),
         status=str(payload["status"]),
+        gate_tier=str(payload.get("gate_tier", "diagnostic")),
         timing_seconds=float(payload["timing_seconds"]),
         invalid_row_count=int(payload["invalid_row_count"]),
         ik_empty_row_count=int(payload["ik_empty_row_count"]),
@@ -926,6 +942,7 @@ def _sweep_result_from_cache_payload(payload: dict[str, object]) -> SweepResult:
         worst_joint_step_deg=float(payload["worst_joint_step_deg"]),
         mean_joint_step_deg=float(payload["mean_joint_step_deg"]),
         total_cost=float(payload["total_cost"]),
+        posture_stress_score=float(payload.get("posture_stress_score", 0.0)),
         pose_build_seconds=float(payload.get("pose_build_seconds", 0.0)),
         ik_collection_seconds=float(payload.get("ik_collection_seconds", 0.0)),
         dp_path_selection_seconds=float(payload.get("dp_path_selection_seconds", 0.0)),
@@ -1285,7 +1302,7 @@ def run_candidate_sweep(
             {
                 "y_mm": float(result.y_mm),
                 "z_mm": float(result.z_mm),
-                "status": result.status,
+                "status": str(result.gate_tier),
                 "ik_empty_row_count": int(result.ik_empty_row_count),
                 "config_switches": int(result.config_switches),
                 "bridge_like_segments": int(result.bridge_like_segments),
@@ -1505,12 +1522,7 @@ def run_smart_square_sweep(
         best_after_axis = best_result
         diagonal_needed = diagonal_policy == "always"
         if diagonal_policy == "conditional":
-            diagonal_needed = not (
-                best_after_axis.status == "valid"
-                and best_after_axis.bridge_like_segments == 0
-                and best_after_axis.big_circle_step_count == 0
-                and best_after_axis.worst_joint_step_deg <= 60.0 + 1e-9
-            )
+            diagonal_needed = not result_passes_official_gate(best_after_axis)
         if (
             diagonal_needed
             and diagonal_policy != "always"
@@ -1555,7 +1567,7 @@ def run_smart_square_sweep(
             "evaluated_case_count": len(all_results_by_key),
             "best_y_mm": float(best_after.y_mm),
             "best_z_mm": float(best_after.z_mm),
-            "best_status": str(best_after.status),
+            "best_status": str(best_after.gate_tier),
             "best_ik_empty_row_count": int(best_after.ik_empty_row_count),
             "best_config_switches": int(best_after.config_switches),
             "best_bridge_like_segments": int(best_after.bridge_like_segments),
@@ -1566,7 +1578,7 @@ def run_smart_square_sweep(
                 {
                     "y_mm": float(result.y_mm),
                     "z_mm": float(result.z_mm),
-                    "status": str(result.status),
+                    "status": str(result.gate_tier),
                     "big_circle_step_count": int(result.big_circle_step_count),
                     "worst_joint_step_deg": float(result.worst_joint_step_deg),
                 }
@@ -1926,7 +1938,7 @@ def run_adaptive_sweep(
                 "step_z_mm": step_z_mm,
                 "local_best_y_mm": local_best.y_mm,
                 "local_best_z_mm": local_best.z_mm,
-                "local_best_status": local_best.status,
+                "local_best_status": str(local_best.gate_tier),
                 "local_best_worst_joint_step_deg": local_best.worst_joint_step_deg,
                 "improved_center": improved_center,
             }
@@ -1934,10 +1946,10 @@ def run_adaptive_sweep(
         print(
             f"{prefix} iter={iteration_index + 1}, center=({center_y_mm:.3f},{center_z_mm:.3f}), "
             f"step=({step_y_mm:.3f},{step_z_mm:.3f}), best=({local_best.y_mm:.3f},{local_best.z_mm:.3f}), "
-            f"status={local_best.status}, worst={local_best.worst_joint_step_deg:.3f}"
+            f"status={local_best.gate_tier}, worst={local_best.worst_joint_step_deg:.3f}"
         )
 
-        if local_best.status == "valid" and bool(config.stop_on_first_valid):
+        if result_passes_official_gate(local_best) and bool(config.stop_on_first_valid):
             center_y_mm = local_best.y_mm
             center_z_mm = local_best.z_mm
             break
@@ -2027,6 +2039,7 @@ def _evaluate_case(
         y_mm=case.y_mm,
         z_mm=case.z_mm,
         status=result.status,
+        gate_tier=str(getattr(result, "gate_tier", "diagnostic")),
         timing_seconds=float(result.timing_seconds),
         invalid_row_count=int(result.invalid_row_count),
         ik_empty_row_count=int(result.ik_empty_row_count),
@@ -2037,6 +2050,7 @@ def _evaluate_case(
         worst_joint_step_deg=float(result.worst_joint_step_deg),
         mean_joint_step_deg=float(result.mean_joint_step_deg),
         total_cost=float(result.total_cost),
+        posture_stress_score=float(getattr(result, "posture_stress_score", 0.0)),
         pose_build_seconds=_metadata_seconds(
             result.metadata,
             "origin_sweep_timing",
@@ -2236,7 +2250,7 @@ def _print_progress(
 ) -> None:
     print(
         f"{prefix} {finished_index:>2}/{total_count} "
-        f"y={result.y_mm:.3f}, z={result.z_mm:.3f}, status={result.status}, "
+        f"y={result.y_mm:.3f}, z={result.z_mm:.3f}, status={result.gate_tier}, "
         f"worst={result.worst_joint_step_deg:.3f}, time={result.timing_seconds:.3f}s",
         flush=True,
     )

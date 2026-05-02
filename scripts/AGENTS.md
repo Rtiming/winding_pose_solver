@@ -21,6 +21,10 @@ Current scripts include:
 - Preserve user-facing CLI behavior unless the task explicitly asks to redesign it.
 - If a script writes outputs, prefer existing artifact conventions under `artifacts/`.
 - If a script triggers a heavy sweep, repeated evaluation, or broad comparison, run it through Slurm rather than on the login node.
+- Do not implement online retry, active-set profile generation, path scoring,
+  or RoboDK finalization policy directly in `scripts/`. Put reusable behavior
+  in the owning `src/` package and keep the script as a launcher.
+- Server examples must use `/home/tzwang/program/winding_pose_solver`.
 
 ## Validation
 

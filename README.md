@@ -31,6 +31,7 @@ The top-level `main.py` is now a thin control panel. Implementation is in
 TARGET_FRAME_A_ORIGIN_IN_FRAME2_MM = (1126.0, -247.5, 977.5)
 TARGET_FRAME_A_ROTATION_IN_FRAME2_XYZ_DEG = (0.0, 0.0, -180.0)
 RUN_MODE = "online"
+LOCAL_MACHINE_PROFILE = "auto"  # auto | mac | windows | linux
 SINGLE_ACTION = "program"
 ONLINE_ROLE = "coordinator"
 ONLINE_SERVER_DIR = "/home/tzwang/program/winding_pose_solver"
@@ -46,6 +47,12 @@ TARGET_ORIGIN_YZ_SEARCH_POST_TOP_N = 1
 `main.py` is intentionally a commented control panel. Edit those top-level
 parameters first; deeper defaults and advanced tuning stay in
 `src/runtime/main_entrypoint.py` and `app_settings.py`.
+
+`LOCAL_MACHINE_PROFILE` describes the coordinator/receiver machine only. Use
+`auto` for normal runs, or set `mac`, `windows`, or `linux` explicitly. It can
+also be overridden with `WPS_LOCAL_MACHINE_PROFILE`. The profile affects local
+command/python-path conventions; solver behavior, server compute, and selected
+path semantics remain shared across Mac and Windows.
 
 When `ENABLE_TARGET_ORIGIN_YZ_SEARCH=True`, a plain `python main.py` starts
 with origin search before any post-dispatch flow.
@@ -89,6 +96,12 @@ artifacts/                      generated runs, logs, temporary outputs
 data/                           input CSVs and small generated pose CSVs
 ```
 
+`AGENTS.md` is the canonical coding-agent policy. `CLAUDE.md` is only a
+compatibility pointer and should not duplicate repository policy.
+Requester and worker online entrypoints live in `src/runtime/online/`; use
+`python -m src.runtime.online.requester` and
+`python -m src.runtime.online.worker` instead of adding root-level wrappers.
+
 Keep reusable logic out of `main.py`. When adding behavior, put it in the
 owning package and keep `main.py` as a small switchboard.
 
@@ -110,11 +123,72 @@ python scripts/model_demo_solver_api.py --host 127.0.0.1 --port 8898
 
 - `GET /health`（标准健康检查）
 - `GET /api/health`（兼容路径）
+- `GET /api/capabilities`
 - `POST /api/configure`
 - `POST /api/fk`
 - `POST /api/ik`
 - `POST /api/path/solve`
 - `POST /api/path/solve-batch`
+- `POST /api/collision/check`
+- `GET /api/winding/capabilities`
+- `POST /api/winding/runs`
+- `GET /api/winding/runs`
+- `GET /api/winding/runs/{run_id}`
+- `POST /api/winding/runs/{run_id}/cancel`
+- `GET /api/winding/runs/{run_id}/summary`
+- `GET /api/winding/runs/{run_id}/results`
+- `GET /api/winding/runs/{run_id}/handoff`
+- `GET /api/winding/latest`
+
+`/api/path/solve` and `/api/path/solve-batch` are the required path-level
+entrypoints for continuity, candidate selection, and repair behavior. External
+adapters must not emulate path continuity by looping over `/api/ik`.
+
+`/api/winding/*` is the workbench orchestration layer. It returns envelope
+payloads shaped as `{ ok, code, message, data, request_id, ts }` and supports
+dry-run lifecycle checks without launching a heavy solver subprocess:
+
+```json
+{
+  "run_mode": "online",
+  "online_role": "server",
+  "options": { "dry_run": true }
+}
+```
+
+Reserved RoboDK-parity endpoints exist for future animation/program/export
+control:
+
+- `POST /api/simulation/control`
+- `POST /api/program/plan`
+- `POST /api/program/export`
+
+They currently return structured `501` errors until the owning runtime layer is
+implemented. Adapter packages may call them but must not implement fallback
+program execution/export logic locally.
+
+Runtime dependencies for this API are listed in `requirements.shared.txt`.
+`httpx` is required by FastAPI/TestClient smoke tests, and `trimesh` is
+required by collision checking.
+
+Quick runtime checks:
+
+```powershell
+python -m compileall -q src scripts/smoke_winding_runtime_api.py
+python scripts/smoke_winding_runtime_api.py --skip-live-run
+
+python -m src.runtime.http_service --host 127.0.0.1 --port 8898
+curl http://127.0.0.1:8898/api/health
+curl http://127.0.0.1:8898/api/winding/capabilities
+```
+
+For model/collision integration, configure with the same robot metadata used
+to build the model manifest. The current native station spec in
+`winding-motion-module/config/native-station-spec.json` provides
+`robot.kinematics_inferred`; strict configuration should produce the same
+`kinematics_hash` as the active `model-manifest.json`. Collision smoke should
+cover preload, single-pose, and path modes so link/tool/static asset coverage
+is checked.
 
 详细契约见：
 
@@ -145,10 +219,11 @@ Useful defaults in `main.py`:
 ONLINE_HOST = "master"
 ONLINE_SERVER_DIR = "/home/tzwang/program/winding_pose_solver"
 ONLINE_ENV_NAME = "winding_pose_solver"
+LOCAL_MACHINE_PROFILE = "auto"
 ONLINE_FINAL_GENERATE_PROGRAM = True
-ONLINE_PROFILE_RETRY_CANDIDATE_LIMIT = 4
+ONLINE_PROFILE_RETRY_CANDIDATE_LIMIT = 24
 ONLINE_PROFILE_RETRY_REPAIR_LIMIT = 2
-ONLINE_PROFILE_RETRY_MAX_ROUNDS = 1
+ONLINE_PROFILE_RETRY_MAX_ROUNDS = 3
 ENABLE_LOCAL_MULTIPROCESS_PARALLEL = True
 LOCAL_PARALLEL_WORKERS = 0  # 0 = auto
 LOCAL_PARALLEL_MIN_BATCH_SIZE = 4
@@ -158,13 +233,24 @@ ENFORCE_REMOTE_SYNC_GUARD = True
 
 In online mode, Windows builds/uploads the request and later imports the
 server-generated handoff into RoboDK. SixAxisIK evaluation, candidate scoring,
-global/window Y/Z refinement, and retry/repair run in the server role under
-Slurm. Single-machine mode still uses the local evaluator and local fallback
-settings.
+global/window Y/Z refinement, active-set profile candidates, and retry/repair
+run in the server role under Slurm. Single-machine mode still uses the local
+evaluator and local fallback settings.
+
+The server role also runs a conservative quality-polish pass after a strict
+valid result by default. The pass keeps the official delivery gate intact and
+tries to lower the worst joint step toward `20.0` degrees before final handoff.
 
 Retry budgets can also be overridden by env vars:
 `WPS_ONLINE_RETRY_CANDIDATE_LIMIT`, `WPS_ONLINE_RETRY_REPAIR_LIMIT`,
 `WPS_ONLINE_RETRY_MAX_ROUNDS`.
+
+Quality polish env vars:
+
+- `WPS_ONLINE_QUALITY_POLISH=0` disables the post-valid polish pass.
+- `WPS_ONLINE_QUALITY_POLISH_TARGET_DEG` changes the target worst joint step.
+- `WPS_LOCAL_RETRY_FOCUS_SEGMENT_LIMIT` controls how many worst segments are
+  included in each active-set repair round; default is `6`.
 
 Direct coordinator CLI also supports:
 
@@ -323,19 +409,25 @@ IK_BACKEND = "six_axis_ik"  # or "robodk"
 `src/search/`
 
 - `ik_collection.py`: IK candidate collection.
-- `path_optimizer.py`: DP path selection, continuity costs, closed terminal
-  full-turn rule.
-- `local_repair.py`: local Y/Z and inserted-transition repair.
+- `path_optimizer.py`: DP path selection, continuity costs, A4/A6 periodic
+  continuity handling, lower-config preference/lock policy, and closed
+  terminal full-turn rule.
+- `local_repair.py`: local Y/Z, handover-window/corridor refinement, and
+  inserted-transition repair.
 - `global_search.py`: high-level exact profile evaluation.
 
 `src/runtime/`
 
 - `app.py`: high-level local app flow.
 - `request_builder.py`: request construction.
-- `remote_search.py`: candidate proposal for online runs.
-- `local_retry.py`: profile retry/repair orchestration.
+- `remote_search.py`: branch-policy, active-set, corridor, and basis profile
+  candidate proposal for online runs.
+- `local_retry.py`: multi-round profile retry/repair and quality-polish
+  orchestration.
 - `origin_sweep.py`: grid, adaptive, candidate, and smart-square origin search.
 - `origin_search_runner.py`: `main.py` origin-search launcher.
+- `local_profile.py`: `auto|mac|windows|linux` local coordinator/receiver
+  profile detection and Conda Python candidate paths.
 - `run_logging.py`: run logs and console tee.
 - `delivery.py`: target-reachability delivery gate helpers.
 
@@ -373,11 +465,8 @@ Canonical server checkout:
 master:/home/tzwang/program/winding_pose_solver
 ```
 
-The old path below is retired:
-
-```text
-/home/tzwang/apps/winding_pose_solver
-```
+Do not use older retired server checkouts when documenting or running sync,
+remote compile, or online compute commands.
 
 Preferred compare/sync wrapper:
 
@@ -424,7 +513,7 @@ deleting local-only or remote-only work unless explicitly requested.
 Lightweight checks:
 
 ```powershell
-python -m py_compile main.py online_roundtrip.py src/runtime/origin_sweep.py src/runtime/origin_search_runner.py scripts/sweep_target_origin_yz.py
+python -m py_compile main.py online_roundtrip.py src/runtime/origin_sweep.py src/runtime/origin_search_runner.py src/runtime/local_retry.py src/runtime/remote_search.py src/search/path_optimizer.py scripts/sweep_target_origin_yz.py
 python main.py --help
 python scripts/sweep_target_origin_yz.py --help
 ```
@@ -444,15 +533,28 @@ python scripts/sweep_target_origin_yz.py --mode smart-square --seed-origin 1126,
 Remote compile:
 
 ```powershell
-ssh master "cd /home/tzwang/program/winding_pose_solver && conda run -n winding_pose_solver python -m py_compile main.py src/runtime/origin_sweep.py src/runtime/origin_search_runner.py scripts/sweep_target_origin_yz.py"
+ssh master "cd /home/tzwang/program/winding_pose_solver && conda run -n winding_pose_solver python -m py_compile main.py src/runtime/origin_sweep.py src/runtime/origin_search_runner.py src/runtime/local_retry.py src/runtime/remote_search.py src/search/path_optimizer.py scripts/sweep_target_origin_yz.py"
 ```
 
 For heavy server sweeps or repair experiments, use Slurm on `master`.
 
-## Current Optimization Notes
+## Current Optimization Stack
 
-Recent 300x300 smart-square search around `(1126, -400, 1130)` found better
-global seeds, but did not eliminate all bridge/config warnings by origin alone.
-The next practical optimization layer is focused local repair around the
-remaining large wrist/config transitions, using the smart-square candidates as
-seed origins.
+The current motion-quality path is layered:
+
+- Global Frame-A origin search finds a better Y/Z basin before path solving.
+- DP path selection scores candidate continuity, config-family stability, joint
+  limits, singularity proximity, and A4/A6 periodic continuity.
+- Lower-config behavior can be biased or locked through
+  `PREFERRED_LOWER_CONFIG_FLAG`, `LOWER_CONFIG_PREFERENCE_WEIGHT`, and
+  `REQUIRE_LOWER_CONFIG_FLAG`.
+- Server retry uses multi-round active sets: each round includes hard failing
+  segments and the largest selected-path joint steps, then evaluates branch
+  policy, active-set window/ramp, corridor, and basis profile candidates.
+- Candidate Y/Z profiles are clamped to the allowed offset envelope, keep
+  locked endpoints fixed, enforce adjacent-step smoothness, and are deduped
+  before dispatch.
+
+Raise retry budgets only for controlled experiments. The default online budget
+is intended to improve quality without turning normal coordinator runs into
+large sweeps.

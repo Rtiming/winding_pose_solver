@@ -7,8 +7,9 @@ This repository is organized into four main layers:
   - `pose_solver.py` exposes both full CSV loading and reusable dataset-based
     pose generation for sweeps.
 - `search/`
-  - IK candidate collection, DP path search, continuity diagnostics, and local
-    repair.
+  - IK candidate collection, DP path search, continuity diagnostics, A4/A6
+    periodic transition handling, lower-config preference/lock policy, and
+    local repair.
 - `runtime/`
   - High-level local and online orchestration.
   - `main_entrypoint.py` is the canonical implementation behind root `main.py`.
@@ -17,6 +18,10 @@ This repository is organized into four main layers:
   - `runtime/external_api.py` provides the formal reusable Python API surface.
   - `delivery.py` owns the official/debug/diagnostic gate decision.
   - `origin_sweep.py` owns grid/adaptive/smart-square Frame-A origin search.
+  - `local_retry.py` and `remote_search.py` own multi-round quality polish and
+    server-side profile candidate generation.
+  - `local_profile.py` owns `auto|mac|windows|linux` local machine profile
+    resolution for coordinator/receiver command handling.
 - `robodk_runtime/`
   - Live RoboDK evaluation and final program generation.
 
@@ -33,5 +38,7 @@ Keep these boundaries stable:
 - Do not add live RoboDK dependencies to `core/` or server compute paths.
 - Do not put DP/rewrite heuristics in `runtime/`; use `search/`.
 - Do not put SSH or Slurm orchestration in `search/`; use `runtime/online/`.
+- Keep online quality polish server-side. The Windows receiver imports the
+  selected handoff path and should not rerun search to make a final program.
 - Keep root `main.py` and root `online_*.py` wrappers thin.
 

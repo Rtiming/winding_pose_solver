@@ -180,6 +180,7 @@ class ProfileEvaluationResult:
     profiling: dict[str, dict[str, float | int]]
     big_circle_step_count: int = 0
     branch_flip_ratio: float = 0.0
+    posture_stress_score: float = 0.0
     violent_branch_segments: tuple[dict[str, Any], ...] = field(default_factory=tuple)
     gate_tier: str = "diagnostic"
     block_reasons: tuple[dict[str, Any], ...] = field(default_factory=tuple)
@@ -227,6 +228,7 @@ class ProfileEvaluationResult:
             },
             big_circle_step_count=int(payload.get("big_circle_step_count", 0)),
             branch_flip_ratio=float(payload.get("branch_flip_ratio", 0.0)),
+            posture_stress_score=float(payload.get("posture_stress_score", 0.0)),
             violent_branch_segments=tuple(
                 (
                     dict(item)

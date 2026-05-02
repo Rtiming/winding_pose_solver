@@ -37,6 +37,19 @@ class _PathOptimizerSettings:
     arm_singularity_threshold: float = 0.12
     arm_singularity_penalty_weight: float = 90.0
 
+    # Load-aware posture penalty.  This is a geometry proxy for high shoulder
+    # torque and unstable near-fully-extended arm poses during contact winding.
+    posture_stress_penalty_weight: float = 260.0
+    posture_wrist_reach_soft_limit_mm: float = 1750.0
+    posture_wrist_reach_hard_limit_mm: float = 2000.0
+    posture_arm_extension_soft_ratio: float = 0.86
+    posture_arm_extension_hard_ratio: float = 0.96
+    posture_a2_upper_soft_deg: float = 100.0
+    posture_a2_upper_hard_deg: float = 115.0
+    posture_wrist_reach_component_weight: float = 1.0
+    posture_arm_extension_component_weight: float = 1.2
+    posture_a2_upper_component_weight: float = 1.5
+
     # MoveL 额外代价。
     move_l_branch_mismatch_weight: float = 0.6
     move_l_unreachable_penalty: float = math.inf
@@ -46,6 +59,12 @@ class _PathOptimizerSettings:
     max_joint_step_deg: tuple[float, ...] = (5.0, 5.0, 5.0, 45.0, 30.0, 45.0)
     ik_max_candidates_per_config_family: int = 4
     use_guided_config_path: bool = True
+    preferred_lower_config_flag: int | None = None
+    lower_config_preference_weight: float = 0.0
+    require_lower_config_flag: int | None = None
+    enable_periodic_transition_unwrap: bool = True
+    periodic_continuity_joint_indices: tuple[int, ...] = (3, 5)
+    periodic_continuity_expansion_turns: int = 1
 
     # 第一个点与机器人当前姿态的关系只作为轻量参考，避免当前站点姿态把整条路径"带歪"。
     start_transition_weight: float = 0.20

@@ -70,6 +70,22 @@ PROGRAM_NAME = "Path_From_CSV"
 ENABLE_LOCAL_MULTIPROCESS_PARALLEL = True
 LOCAL_PARALLEL_WORKERS = 0  # 0 = auto
 LOCAL_PARALLEL_MIN_BATCH_SIZE = 4
+PREFERRED_LOWER_CONFIG_FLAG: int | None = None
+LOWER_CONFIG_PREFERENCE_WEIGHT = 0.0
+REQUIRE_LOWER_CONFIG_FLAG: int | None = None
+ENABLE_PERIODIC_TRANSITION_UNWRAP = True
+PERIODIC_CONTINUITY_JOINT_INDICES = (3, 5)
+PERIODIC_CONTINUITY_EXPANSION_TURNS = 1
+POSTURE_STRESS_PENALTY_WEIGHT = 260.0
+POSTURE_WRIST_REACH_SOFT_LIMIT_MM = 1750.0
+POSTURE_WRIST_REACH_HARD_LIMIT_MM = 2000.0
+POSTURE_ARM_EXTENSION_SOFT_RATIO = 0.86
+POSTURE_ARM_EXTENSION_HARD_RATIO = 0.96
+POSTURE_A2_UPPER_SOFT_DEG = 100.0
+POSTURE_A2_UPPER_HARD_DEG = 115.0
+POSTURE_WRIST_REACH_COMPONENT_WEIGHT = 1.0
+POSTURE_ARM_EXTENSION_COMPONENT_WEIGHT = 1.2
+POSTURE_A2_UPPER_COMPONENT_WEIGHT = 1.5
 SINGLE_RUN_WINDOW_REPAIR = False
 SINGLE_RUN_INSERTED_REPAIR = False
 ENABLE_FIXED_POINT_PATH_FALLBACK = True
@@ -121,9 +137,9 @@ ONLINE_FINAL_GENERATE_PROGRAM = True
 # Server-side online continuity retry budget. This keeps heavy repair on master
 # while the local coordinator only handles transfer and the final RoboDK receiver import.
 #   WPS_ONLINE_RETRY_CANDIDATE_LIMIT / WPS_ONLINE_RETRY_REPAIR_LIMIT / WPS_ONLINE_RETRY_MAX_ROUNDS
-ONLINE_PROFILE_RETRY_CANDIDATE_LIMIT = 4
+ONLINE_PROFILE_RETRY_CANDIDATE_LIMIT = 24
 ONLINE_PROFILE_RETRY_REPAIR_LIMIT = 2
-ONLINE_PROFILE_RETRY_MAX_ROUNDS = 1
+ONLINE_PROFILE_RETRY_MAX_ROUNDS = 3
 ENFORCE_REMOTE_SYNC_GUARD = True
 REMOTE_SYNC_MODE = "guard"  # "off" | "guard" | "push"
 ALLOW_INVALID_DEBUG_OUTPUTS = False
@@ -205,6 +221,24 @@ def _build_runtime_settings(
         lock_frame_a_origin_yz_profile_endpoints=bool(
             LOCK_FRAME_A_ORIGIN_YZ_PROFILE_ENDPOINTS
         ),
+        preferred_lower_config_flag=PREFERRED_LOWER_CONFIG_FLAG,
+        lower_config_preference_weight=float(LOWER_CONFIG_PREFERENCE_WEIGHT),
+        require_lower_config_flag=REQUIRE_LOWER_CONFIG_FLAG,
+        enable_periodic_transition_unwrap=bool(ENABLE_PERIODIC_TRANSITION_UNWRAP),
+        periodic_continuity_joint_indices=tuple(
+            int(index) for index in PERIODIC_CONTINUITY_JOINT_INDICES
+        ),
+        periodic_continuity_expansion_turns=int(PERIODIC_CONTINUITY_EXPANSION_TURNS),
+        posture_stress_penalty_weight=float(POSTURE_STRESS_PENALTY_WEIGHT),
+        posture_wrist_reach_soft_limit_mm=float(POSTURE_WRIST_REACH_SOFT_LIMIT_MM),
+        posture_wrist_reach_hard_limit_mm=float(POSTURE_WRIST_REACH_HARD_LIMIT_MM),
+        posture_arm_extension_soft_ratio=float(POSTURE_ARM_EXTENSION_SOFT_RATIO),
+        posture_arm_extension_hard_ratio=float(POSTURE_ARM_EXTENSION_HARD_RATIO),
+        posture_a2_upper_soft_deg=float(POSTURE_A2_UPPER_SOFT_DEG),
+        posture_a2_upper_hard_deg=float(POSTURE_A2_UPPER_HARD_DEG),
+        posture_wrist_reach_component_weight=float(POSTURE_WRIST_REACH_COMPONENT_WEIGHT),
+        posture_arm_extension_component_weight=float(POSTURE_ARM_EXTENSION_COMPONENT_WEIGHT),
+        posture_a2_upper_component_weight=float(POSTURE_A2_UPPER_COMPONENT_WEIGHT),
     )
     return replace(runtime_settings, motion_settings=tuned_motion_settings)
 
@@ -668,6 +702,7 @@ def _build_single_archive_payload(
             ],
             "worst_joint_step_deg": float(result.worst_joint_step_deg),
             "mean_joint_step_deg": float(result.mean_joint_step_deg),
+            "posture_stress_score": float(getattr(result, "posture_stress_score", 0.0)),
             "total_cost": float(result.total_cost),
             "gate_tier": str(getattr(result, "gate_tier", "diagnostic")),
             "block_reasons": [
@@ -1283,13 +1318,14 @@ def _origin_candidate_sort_key(
         0.0 if bool(candidate.get("official_delivery_allowed", False)) else 1.0,
         float(candidate.get("invalid_row_count", 0)),
         float(candidate.get("ik_empty_row_count", 0)),
-        outside_distance_value,
         float(candidate.get("bridge_like_segments", 0)),
         float(candidate.get("big_circle_step_count", 0)),
         float(candidate.get("branch_flip_ratio", 0.0)),
+        float(candidate.get("posture_stress_score", 0.0)),
         float(candidate.get("worst_joint_step_deg", 0.0)),
         float(candidate.get("mean_joint_step_deg", 0.0)),
         float(candidate.get("config_switches", 0)),
+        outside_distance_value,
         float(candidate.get("distance_from_seed_yz_mm", 0.0)),
     )
 
@@ -1328,6 +1364,7 @@ def _collect_origin_candidates(
                 "branch_flip_ratio": float(row.get("branch_flip_ratio", 0.0)),
                 "worst_joint_step_deg": float(row.get("worst_joint_step_deg", 0.0)),
                 "mean_joint_step_deg": float(row.get("mean_joint_step_deg", 0.0)),
+                "posture_stress_score": float(row.get("posture_stress_score", 0.0)),
                 "distance_from_seed_yz_mm": float(row.get("distance_from_seed_yz_mm", 0.0)),
             }
             if row.get("outside_square_distance_mm") is not None:
@@ -1482,7 +1519,8 @@ def _run_origin_search_mode(
                 f"bridge={int(item['bridge_like_segments'])} "
                 f"big_circle={int(item['big_circle_step_count'])} "
                 f"worst={float(item['worst_joint_step_deg']):.3f} "
-                f"mean={float(item['mean_joint_step_deg']):.6f}"
+                f"mean={float(item['mean_joint_step_deg']):.6f} "
+                f"posture={float(item.get('posture_stress_score', 0.0)):.6f}"
                 f"{outside_note}"
             )
     else:

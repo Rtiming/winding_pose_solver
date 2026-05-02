@@ -25,6 +25,12 @@ class RoboDKMotionSettings:
     max_joint_step_deg: tuple[float, ...] = (5.0, 5.0, 5.0, 180.0, 100.0, 180.0)
     ik_max_candidates_per_config_family: int = 4
     use_guided_config_path: bool = True
+    preferred_lower_config_flag: int | None = None
+    lower_config_preference_weight: float = 0.0
+    require_lower_config_flag: int | None = None
+    enable_periodic_transition_unwrap: bool = True
+    periodic_continuity_joint_indices: tuple[int, ...] = (3, 5)
+    periodic_continuity_expansion_turns: int = 1
 
     bridge_trigger_joint_delta_deg: float = 20.0
     bridge_step_deg: tuple[float, ...] = (2.0, 2.0, 2.0, 20.0, 10.0, 20.0)
@@ -51,6 +57,21 @@ class RoboDKMotionSettings:
     official_worst_joint_step_deg_limit: float = 60.0
     enable_same_family_segment_repair: bool = True
     same_family_repair_max_segments: int = 8
+
+    # Load-aware posture shaping.  These are soft costs, not reachability gates.
+    # The intent is to avoid contact-winding poses with long shoulder moment arms,
+    # nearly straight shoulder-elbow-wrist geometry, or A2 pushed close to its
+    # upper working range.
+    posture_stress_penalty_weight: float = 260.0
+    posture_wrist_reach_soft_limit_mm: float = 1750.0
+    posture_wrist_reach_hard_limit_mm: float = 2000.0
+    posture_arm_extension_soft_ratio: float = 0.86
+    posture_arm_extension_hard_ratio: float = 0.96
+    posture_a2_upper_soft_deg: float = 100.0
+    posture_a2_upper_hard_deg: float = 115.0
+    posture_wrist_reach_component_weight: float = 1.0
+    posture_arm_extension_component_weight: float = 1.2
+    posture_a2_upper_component_weight: float = 1.5
 
     # Minimum meaningful joint delta for a config switch to be counted as a
     # continuity problem.  Config transitions with smaller joint steps (e.g. a
@@ -116,6 +137,20 @@ def validate_motion_settings(settings: RoboDKMotionSettings) -> RoboDKMotionSett
         raise ValueError("Each joint continuity step limit must be positive.")
     if settings.ik_max_candidates_per_config_family <= 0:
         raise ValueError("IK candidate limit per config family must be positive.")
+    if settings.preferred_lower_config_flag is not None and int(
+        settings.preferred_lower_config_flag
+    ) not in {0, 1}:
+        raise ValueError("Preferred lower config flag must be 0, 1, or None.")
+    if settings.lower_config_preference_weight < 0.0:
+        raise ValueError("Lower config preference weight must be non-negative.")
+    if settings.require_lower_config_flag is not None and int(
+        settings.require_lower_config_flag
+    ) not in {0, 1}:
+        raise ValueError("Required lower config flag must be 0, 1, or None.")
+    if any(int(index) < 0 for index in settings.periodic_continuity_joint_indices):
+        raise ValueError("Periodic continuity joint indices must be non-negative.")
+    if settings.periodic_continuity_expansion_turns < 0:
+        raise ValueError("Periodic continuity expansion turns must be non-negative.")
     if settings.bridge_trigger_joint_delta_deg <= 0.0:
         raise ValueError("Bridge trigger joint delta must be positive.")
     if not settings.bridge_step_deg:
@@ -154,6 +189,24 @@ def validate_motion_settings(settings: RoboDKMotionSettings) -> RoboDKMotionSett
         raise ValueError("Official worst-joint-step limit must be positive.")
     if settings.same_family_repair_max_segments < 0:
         raise ValueError("Same-family repair max segments must be non-negative.")
+    if settings.posture_stress_penalty_weight < 0.0:
+        raise ValueError("Posture-stress penalty weight must be non-negative.")
+    if settings.posture_wrist_reach_soft_limit_mm < 0.0:
+        raise ValueError("Posture wrist-reach soft limit must be non-negative.")
+    if settings.posture_wrist_reach_hard_limit_mm <= settings.posture_wrist_reach_soft_limit_mm:
+        raise ValueError("Posture wrist-reach hard limit must be greater than the soft limit.")
+    if not 0.0 <= settings.posture_arm_extension_soft_ratio < settings.posture_arm_extension_hard_ratio:
+        raise ValueError("Posture arm-extension soft ratio must be below the hard ratio.")
+    if settings.posture_arm_extension_hard_ratio <= 0.0:
+        raise ValueError("Posture arm-extension hard ratio must be positive.")
+    if settings.posture_a2_upper_hard_deg <= settings.posture_a2_upper_soft_deg:
+        raise ValueError("Posture A2 hard upper limit must be greater than the soft limit.")
+    if settings.posture_wrist_reach_component_weight < 0.0:
+        raise ValueError("Posture wrist-reach component weight must be non-negative.")
+    if settings.posture_arm_extension_component_weight < 0.0:
+        raise ValueError("Posture arm-extension component weight must be non-negative.")
+    if settings.posture_a2_upper_component_weight < 0.0:
+        raise ValueError("Posture A2 component weight must be non-negative.")
     if settings.config_switch_min_joint_delta_deg < 0.0:
         raise ValueError("Config-switch minimum joint delta must be non-negative.")
     if settings.rear_switch_penalty < 0.0:

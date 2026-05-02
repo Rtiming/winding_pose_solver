@@ -39,17 +39,158 @@ class _JointPairMetrics:
     passes_preferred_continuity: bool
 
 
+def _periodic_transition_indices(
+    optimizer_settings: _PathOptimizerSettings,
+) -> tuple[int, ...]:
+    if not bool(getattr(optimizer_settings, "enable_periodic_transition_unwrap", True)):
+        return ()
+    return tuple(
+        sorted(
+            {
+                int(index)
+                for index in getattr(
+                    optimizer_settings,
+                    "periodic_continuity_joint_indices",
+                    (),
+                )
+                if int(index) >= 0
+            }
+        )
+    )
+
+
+def _nearest_periodic_joint_value(
+    *,
+    previous_joint_deg: float,
+    current_joint_deg: float,
+    expansion_turns: int,
+) -> float:
+    turn_span = max(0, int(expansion_turns))
+    if turn_span <= 0:
+        return float(current_joint_deg)
+
+    best_value = float(current_joint_deg)
+    best_key = (abs(best_value - float(previous_joint_deg)), 0)
+    for turn_index in range(-turn_span, turn_span + 1):
+        candidate_value = float(current_joint_deg) + 360.0 * turn_index
+        candidate_key = (
+            abs(candidate_value - float(previous_joint_deg)),
+            abs(turn_index),
+        )
+        if candidate_key < best_key:
+            best_value = candidate_value
+            best_key = candidate_key
+    return best_value
+
+
+def _phase_adjusted_current_joints(
+    previous_joints: Sequence[float],
+    current_joints: Sequence[float],
+    optimizer_settings: _PathOptimizerSettings,
+    *,
+    protected_indices: set[int] | None = None,
+) -> tuple[float, ...]:
+    adjusted = [float(value) for value in current_joints]
+    protected = protected_indices or set()
+    expansion_turns = int(
+        getattr(optimizer_settings, "periodic_continuity_expansion_turns", 1)
+    )
+    for joint_index in _periodic_transition_indices(optimizer_settings):
+        if joint_index in protected:
+            continue
+        if joint_index >= len(previous_joints) or joint_index >= len(adjusted):
+            continue
+        adjusted[joint_index] = _nearest_periodic_joint_value(
+            previous_joint_deg=float(previous_joints[joint_index]),
+            current_joint_deg=float(adjusted[joint_index]),
+            expansion_turns=expansion_turns,
+        )
+    return tuple(adjusted)
+
+
+def _candidate_with_joints(
+    candidate: _IKCandidate,
+    joints: tuple[float, ...],
+) -> _IKCandidate:
+    if tuple(float(value) for value in candidate.joints) == joints:
+        return candidate
+    return _IKCandidate(
+        joints=joints,
+        config_flags=candidate.config_flags,
+        joint_limit_penalty=candidate.joint_limit_penalty,
+        singularity_penalty=candidate.singularity_penalty,
+        branch_id=candidate.branch_id,
+    )
+
+
+def _phase_unwrap_selected_path(
+    selected_path: Sequence[_IKCandidate],
+    optimizer_settings: _PathOptimizerSettings,
+    *,
+    protect_terminal_phase: bool = False,
+) -> list[_IKCandidate]:
+    if not selected_path:
+        return []
+    if not _periodic_transition_indices(optimizer_settings):
+        return list(selected_path)
+
+    unwrapped: list[_IKCandidate] = [selected_path[0]]
+    terminal_index = len(selected_path) - 1
+    for row_index, candidate in enumerate(selected_path[1:], start=1):
+        if protect_terminal_phase and row_index == terminal_index:
+            unwrapped.append(candidate)
+            continue
+        adjusted_joints = _phase_adjusted_current_joints(
+            unwrapped[-1].joints,
+            candidate.joints,
+            optimizer_settings,
+        )
+        unwrapped.append(_candidate_with_joints(candidate, adjusted_joints))
+    return unwrapped
+
+
+def _candidate_satisfies_required_config(
+    candidate: _IKCandidate,
+    optimizer_settings: _PathOptimizerSettings,
+) -> bool:
+    required_lower = getattr(optimizer_settings, "require_lower_config_flag", None)
+    if required_lower is None:
+        return True
+    if len(candidate.config_flags) < 2:
+        return False
+    return int(candidate.config_flags[1]) == int(required_lower)
+
+
+def _config_family_preference_cost(
+    config_flags: Sequence[int],
+    optimizer_settings: _PathOptimizerSettings,
+) -> float:
+    preferred_lower = getattr(optimizer_settings, "preferred_lower_config_flag", None)
+    if preferred_lower is None or len(config_flags) < 2:
+        return 0.0
+    if int(config_flags[1]) == int(preferred_lower):
+        return 0.0
+    return float(getattr(optimizer_settings, "lower_config_preference_weight", 0.0))
+
+
 @lru_cache(maxsize=131072)
 def _joint_pair_metrics(
     previous_joints: tuple[float, ...],
     current_joints: tuple[float, ...],
     optimizer_settings: _PathOptimizerSettings,
+    protected_current_indices: tuple[int, ...] = (),
 ) -> _JointPairMetrics:
     """Cache the shared per-pair joint math used by DP and guidance checks."""
 
+    adjusted_current_joints = _phase_adjusted_current_joints(
+        previous_joints,
+        current_joints,
+        optimizer_settings,
+        protected_indices=set(protected_current_indices),
+    )
     deltas = tuple(
         current - previous
-        for previous, current in zip(previous_joints, current_joints)
+        for previous, current in zip(previous_joints, adjusted_current_joints)
     )
     abs_deltas = tuple(abs(delta) for delta in deltas)
 
@@ -92,7 +233,7 @@ def _joint_pair_metrics(
 
     joint6_delta_deg = 0.0
     if len(previous_joints) >= 6 and len(current_joints) >= 6:
-        joint6_delta_deg = abs(current_joints[5] - previous_joints[5])
+        joint6_delta_deg = abs(adjusted_current_joints[5] - previous_joints[5])
 
     min_abs_joint5_deg = math.inf
     if len(previous_joints) >= 5 and len(current_joints) >= 5:
@@ -181,8 +322,65 @@ def _build_optimizer_settings(
         use_guided_config_path=bool(
             getattr(motion_settings, "use_guided_config_path", True)
         ),
+        preferred_lower_config_flag=getattr(
+            motion_settings,
+            "preferred_lower_config_flag",
+            None,
+        ),
+        lower_config_preference_weight=float(
+            getattr(motion_settings, "lower_config_preference_weight", 0.0)
+        ),
+        require_lower_config_flag=getattr(
+            motion_settings,
+            "require_lower_config_flag",
+            None,
+        ),
+        enable_periodic_transition_unwrap=bool(
+            getattr(motion_settings, "enable_periodic_transition_unwrap", True)
+        ),
+        periodic_continuity_joint_indices=tuple(
+            int(index)
+            for index in getattr(
+                motion_settings,
+                "periodic_continuity_joint_indices",
+                (3, 5),
+            )
+        ),
+        periodic_continuity_expansion_turns=int(
+            getattr(motion_settings, "periodic_continuity_expansion_turns", 1)
+        ),
         preferred_joint_step_deg=preferred_step_limits,
         wrist_phase_lock_threshold_deg=motion_settings.wrist_phase_lock_threshold_deg,
+        posture_stress_penalty_weight=float(
+            getattr(motion_settings, "posture_stress_penalty_weight", 260.0)
+        ),
+        posture_wrist_reach_soft_limit_mm=float(
+            getattr(motion_settings, "posture_wrist_reach_soft_limit_mm", 1750.0)
+        ),
+        posture_wrist_reach_hard_limit_mm=float(
+            getattr(motion_settings, "posture_wrist_reach_hard_limit_mm", 2000.0)
+        ),
+        posture_arm_extension_soft_ratio=float(
+            getattr(motion_settings, "posture_arm_extension_soft_ratio", 0.86)
+        ),
+        posture_arm_extension_hard_ratio=float(
+            getattr(motion_settings, "posture_arm_extension_hard_ratio", 0.96)
+        ),
+        posture_a2_upper_soft_deg=float(
+            getattr(motion_settings, "posture_a2_upper_soft_deg", 100.0)
+        ),
+        posture_a2_upper_hard_deg=float(
+            getattr(motion_settings, "posture_a2_upper_hard_deg", 115.0)
+        ),
+        posture_wrist_reach_component_weight=float(
+            getattr(motion_settings, "posture_wrist_reach_component_weight", 1.0)
+        ),
+        posture_arm_extension_component_weight=float(
+            getattr(motion_settings, "posture_arm_extension_component_weight", 1.2)
+        ),
+        posture_a2_upper_component_weight=float(
+            getattr(motion_settings, "posture_a2_upper_component_weight", 1.5)
+        ),
         rear_switch_penalty=float(getattr(motion_settings, "rear_switch_penalty", 2000.0)),
         lower_switch_penalty=float(getattr(motion_settings, "lower_switch_penalty", 2000.0)),
         flip_switch_penalty=float(getattr(motion_settings, "flip_switch_penalty", 2000.0)),
@@ -340,6 +538,7 @@ def _optimize_joint_path(
     optimizer_settings: _PathOptimizerSettings,
     require_terminal_match_start: bool = False,
     selection_bridge_trigger_joint_delta_deg: float | None = None,
+    protect_terminal_phase: bool = False,
 ) -> tuple[list[_IKCandidate], float]:
     """?????????????????????????????????????????????"""
 
@@ -375,20 +574,24 @@ def _optimize_joint_path(
         guided_config_path = None
 
     # ??0 ?????? = ???????????????????????????? + ??????????????????
-    previous_costs = []
+    previous_costs: list[float] = []
     for candidate_index, candidate in enumerate(ik_layers[0].candidates):
+        if not _candidate_satisfies_required_config(candidate, optimizer_settings):
+            previous_costs.append(math.inf)
+            continue
         if guided_config_path is not None and candidate.config_flags != guided_config_path[0]:
             previous_costs.append(math.inf)
             continue
-        previous_costs.append(
-            _candidate_node_cost(
-                candidate,
-                corridor_score=corridor_scores[0][candidate_index],
-                optimizer_settings=optimizer_settings,
-            )
-            + optimizer_settings.start_transition_weight
+        node_cost = _candidate_node_cost(
+            candidate,
+            corridor_score=corridor_scores[0][candidate_index],
+            optimizer_settings=optimizer_settings,
+        )
+        start_transition_cost = (
+            optimizer_settings.start_transition_weight
             * _joint_transition_penalty(start_joints, candidate.joints, optimizer_settings)
         )
+        previous_costs.append(node_cost + start_transition_cost)
     backpointers: list[list[int]] = []
 
     previous_layer = ik_layers[0]
@@ -404,6 +607,7 @@ def _optimize_joint_path(
             (previous_index, previous_candidate, previous_costs[previous_index])
             for previous_index, previous_candidate in enumerate(previous_layer.candidates)
             if math.isfinite(previous_costs[previous_index])
+            and _candidate_satisfies_required_config(previous_candidate, optimizer_settings)
             and (
                 previous_guided_flags is None
                 or previous_candidate.config_flags == previous_guided_flags
@@ -429,6 +633,11 @@ def _optimize_joint_path(
         current_backpointers = [-1] * len(current_layer.candidates)
 
         for current_index, current_candidate in enumerate(current_layer.candidates):
+            if not _candidate_satisfies_required_config(
+                current_candidate,
+                optimizer_settings,
+            ):
+                continue
             if (
                 current_guided_flags is not None
                 and current_candidate.config_flags != current_guided_flags
@@ -441,12 +650,19 @@ def _optimize_joint_path(
             )
             best_cost = math.inf
             best_previous_index = -1
+            protected_current_indices = _protected_phase_indices_for_current_layer(
+                layer_index=layer_index,
+                layer_count=len(ik_layers),
+                optimizer_settings=optimizer_settings,
+                protect_terminal_phase=protect_terminal_phase,
+            )
 
             for previous_index, previous_candidate, previous_cost in active_previous_candidates:
                 pair_metrics = _joint_pair_metrics(
                     previous_candidate.joints,
                     current_candidate.joints,
                     optimizer_settings,
+                    protected_current_indices,
                 )
                 if not pair_metrics.passes_joint_continuity:
                     continue
@@ -505,10 +721,29 @@ def _optimize_joint_path(
         previous_costs=previous_costs,
         backpointers=backpointers,
         selection_bridge_trigger_joint_delta_deg=selection_bridge_trigger_joint_delta_deg,
+        optimizer_settings=optimizer_settings,
+        protect_terminal_phase=protect_terminal_phase,
     )
     total_cost = previous_costs[end_index]
     selected_path = _reconstruct_selected_path(ik_layers, backpointers, end_index)
+    selected_path = _phase_unwrap_selected_path(
+        selected_path,
+        optimizer_settings,
+        protect_terminal_phase=protect_terminal_phase,
+    )
     return selected_path, total_cost
+
+
+def _protected_phase_indices_for_current_layer(
+    *,
+    layer_index: int,
+    layer_count: int,
+    optimizer_settings: _PathOptimizerSettings,
+    protect_terminal_phase: bool,
+) -> tuple[int, ...]:
+    if not protect_terminal_phase or int(layer_index) != int(layer_count) - 1:
+        return ()
+    return _periodic_transition_indices(optimizer_settings)
 
 
 def _choose_best_end_index(
@@ -517,6 +752,8 @@ def _choose_best_end_index(
     previous_costs: Sequence[float],
     backpointers: Sequence[Sequence[int]],
     selection_bridge_trigger_joint_delta_deg: float | None,
+    optimizer_settings: _PathOptimizerSettings,
+    protect_terminal_phase: bool,
 ) -> int:
     if selection_bridge_trigger_joint_delta_deg is None:
         return min(range(len(previous_costs)), key=previous_costs.__getitem__)
@@ -530,6 +767,11 @@ def _choose_best_end_index(
             ik_layers,
             backpointers,
             candidate_index,
+        )
+        candidate_path = _phase_unwrap_selected_path(
+            candidate_path,
+            optimizer_settings,
+            protect_terminal_phase=protect_terminal_phase,
         )
         quality_key = _selected_path_quality_key(
             candidate_path,
@@ -571,6 +813,8 @@ def _optimize_closed_joint_path(
     best_quality_key: tuple[float, ...] | None = None
     joint6_turn_direction_cache: dict[tuple[float, ...], int] = {}
     for start_candidate in ik_layers[0].candidates:
+        if not _candidate_satisfies_required_config(start_candidate, optimizer_settings):
+            continue
         start_joints_key = tuple(float(value) for value in start_candidate.joints)
         joint6_turn_direction = joint6_turn_direction_cache.get(start_joints_key)
         if joint6_turn_direction is None:
@@ -593,40 +837,47 @@ def _optimize_closed_joint_path(
         if not terminal_candidates:
             continue
 
-        constrained_layers = _build_closed_winding_layers(
-            ik_layers,
-            start_candidate=start_candidate,
-            terminal_candidates=terminal_candidates,
-            single_config=optimizer_settings.closed_path_single_config,
-            optimizer_settings=optimizer_settings,
-        )
-        if constrained_layers is None:
-            continue
-        try:
-            candidate_path, candidate_cost = _optimize_joint_path(
-                constrained_layers,
-                robot=robot,
-                move_type=move_type,
-                start_joints=start_joints,
+        for terminal_candidate in terminal_candidates:
+            constrained_layers = _build_closed_winding_layers(
+                ik_layers,
+                start_candidate=start_candidate,
+                terminal_candidates=(terminal_candidate,),
+                single_config=optimizer_settings.closed_path_single_config,
                 optimizer_settings=optimizer_settings,
-                require_terminal_match_start=False,
-                selection_bridge_trigger_joint_delta_deg=selection_bridge_trigger_joint_delta_deg,
             )
-        except RuntimeError:
-            continue
+            if constrained_layers is None:
+                continue
+            try:
+                candidate_path, candidate_cost = _optimize_joint_path(
+                    constrained_layers,
+                    robot=robot,
+                    move_type=move_type,
+                    start_joints=start_joints,
+                    optimizer_settings=optimizer_settings,
+                    require_terminal_match_start=False,
+                    selection_bridge_trigger_joint_delta_deg=selection_bridge_trigger_joint_delta_deg,
+                    protect_terminal_phase=False,
+                )
+            except RuntimeError:
+                continue
 
-        if selection_bridge_trigger_joint_delta_deg is None:
-            candidate_quality_key = (float(candidate_cost),)
-        else:
-            candidate_quality_key = _selected_path_quality_key(
+            candidate_path = _phase_optimize_closed_joint6_path(
                 candidate_path,
-                total_cost=float(candidate_cost),
-                bridge_trigger_joint_delta_deg=float(selection_bridge_trigger_joint_delta_deg),
+                terminal_joint6_deg=float(terminal_candidate.joints[5]),
+                optimizer_settings=optimizer_settings,
             )
-        if best_quality_key is None or candidate_quality_key < best_quality_key:
-            best_path = candidate_path
-            best_cost = candidate_cost
-            best_quality_key = candidate_quality_key
+            if selection_bridge_trigger_joint_delta_deg is None:
+                candidate_quality_key = (float(candidate_cost),)
+            else:
+                candidate_quality_key = _selected_path_quality_key(
+                    candidate_path,
+                    total_cost=float(candidate_cost),
+                    bridge_trigger_joint_delta_deg=float(selection_bridge_trigger_joint_delta_deg),
+                )
+            if best_quality_key is None or candidate_quality_key < best_quality_key:
+                best_path = candidate_path
+                best_cost = candidate_cost
+                best_quality_key = candidate_quality_key
 
     if best_path is None:
         raise RuntimeError(
@@ -635,6 +886,118 @@ def _optimize_closed_joint_path(
             "configured closed-path config constraints."
         )
     return best_path, best_cost
+
+
+def _phase_optimize_closed_joint6_path(
+    selected_path: Sequence[_IKCandidate],
+    *,
+    terminal_joint6_deg: float,
+    optimizer_settings: _PathOptimizerSettings,
+) -> list[_IKCandidate]:
+    if len(selected_path) <= 1:
+        return list(selected_path)
+    if len(selected_path[0].joints) < 6 or len(selected_path[-1].joints) < 6:
+        return list(selected_path)
+
+    start_joint6 = float(selected_path[0].joints[5])
+    terminal_joint6 = float(terminal_joint6_deg)
+    if abs(terminal_joint6 - start_joint6) < 1e-9:
+        return list(selected_path)
+
+    fixed_path = list(selected_path)
+    fixed_path[0] = _candidate_with_joint6(fixed_path[0], start_joint6)
+    fixed_path[-1] = _candidate_with_joint6(fixed_path[-1], terminal_joint6)
+    if len(fixed_path) <= 2:
+        return fixed_path
+
+    max_turns = max(
+        1,
+        abs(int(getattr(optimizer_settings, "closed_path_joint6_turns", 1))) + 1,
+    )
+    previous_states: dict[float, tuple[float, float | None]] = {start_joint6: (0.0, None)}
+    backpointers: list[dict[float, float]] = []
+    interior_count = len(fixed_path) - 2
+
+    for interior_offset, candidate in enumerate(fixed_path[1:-1], start=1):
+        raw_joint6 = float(candidate.joints[5])
+        progress = interior_offset / (interior_count + 1)
+        target_joint6 = start_joint6 + (terminal_joint6 - start_joint6) * progress
+        current_values = _joint6_phase_values_near_target(
+            raw_joint6,
+            target_joint6=target_joint6,
+            max_turns=max_turns,
+        )
+        current_states: dict[float, tuple[float, float | None]] = {}
+        current_backpointers: dict[float, float] = {}
+        for current_joint6 in current_values:
+            best_key: tuple[float, float, float] | None = None
+            best_previous_joint6: float | None = None
+            for previous_joint6, (previous_cost, _backpointer) in previous_states.items():
+                delta = abs(current_joint6 - previous_joint6)
+                guide_error = abs(current_joint6 - target_joint6)
+                cost = previous_cost + delta * delta + 0.02 * guide_error * guide_error
+                key = (cost, delta, guide_error)
+                if best_key is None or key < best_key:
+                    best_key = key
+                    best_previous_joint6 = previous_joint6
+            if best_key is None or best_previous_joint6 is None:
+                continue
+            current_states[current_joint6] = (best_key[0], best_previous_joint6)
+            current_backpointers[current_joint6] = best_previous_joint6
+        if not current_states:
+            return fixed_path
+        previous_states = current_states
+        backpointers.append(current_backpointers)
+
+    best_terminal_key: tuple[float, float] | None = None
+    best_previous_joint6: float | None = None
+    for previous_joint6, (previous_cost, _backpointer) in previous_states.items():
+        terminal_delta = abs(terminal_joint6 - previous_joint6)
+        key = (previous_cost + terminal_delta * terminal_delta, terminal_delta)
+        if best_terminal_key is None or key < best_terminal_key:
+            best_terminal_key = key
+            best_previous_joint6 = previous_joint6
+    if best_previous_joint6 is None:
+        return fixed_path
+
+    interior_joint6_values = [0.0] * interior_count
+    current_joint6 = best_previous_joint6
+    for index in range(interior_count - 1, -1, -1):
+        interior_joint6_values[index] = current_joint6
+        current_joint6 = backpointers[index][current_joint6]
+
+    for path_index, joint6_value in enumerate(interior_joint6_values, start=1):
+        fixed_path[path_index] = _candidate_with_joint6(fixed_path[path_index], joint6_value)
+    return fixed_path
+
+
+def _joint6_phase_values_near_target(
+    joint6_deg: float,
+    *,
+    target_joint6: float,
+    max_turns: int,
+) -> tuple[float, ...]:
+    values = [
+        float(joint6_deg) + 360.0 * turn_index
+        for turn_index in range(-max_turns, max_turns + 1)
+    ]
+    values.sort(key=lambda value: (abs(value - float(target_joint6)), abs(value - float(joint6_deg))))
+    selected = values[: min(len(values), 5)]
+    return tuple(sorted(set(round(value, 12) for value in selected)))
+
+
+def _candidate_with_joint6(
+    candidate: _IKCandidate,
+    joint6_deg: float,
+) -> _IKCandidate:
+    if len(candidate.joints) < 6:
+        return candidate
+    joints = (
+        *tuple(float(value) for value in candidate.joints[:5]),
+        float(joint6_deg),
+        *tuple(float(value) for value in candidate.joints[6:]),
+    )
+    return _candidate_with_joints(candidate, joints)
 
 
 def _build_closed_winding_terminal_candidates(
@@ -914,9 +1277,17 @@ def _build_guided_config_path(
         return ()
 
     candidate_groups_by_layer = [
-        _group_candidates_by_config(layer.candidates)
+        _group_candidates_by_config(
+            tuple(
+                candidate
+                for candidate in layer.candidates
+                if _candidate_satisfies_required_config(candidate, optimizer_settings)
+            )
+        )
         for layer in ik_layers
     ]
+    if any(not groups for groups in candidate_groups_by_layer):
+        return None
 
     previous_costs: dict[tuple[int, ...], float] = {}
     for config_flags, candidates in candidate_groups_by_layer[0].items():
@@ -924,7 +1295,7 @@ def _build_guided_config_path(
             optimizer_settings.start_transition_weight
             * _joint_transition_penalty(start_joints, candidate.joints, optimizer_settings)
             for candidate in candidates
-        )
+        ) + _config_family_preference_cost(config_flags, optimizer_settings)
 
     backpointers: list[dict[tuple[int, ...], tuple[int, ...]]] = []
     for layer_index in range(1, len(candidate_groups_by_layer)):
@@ -948,7 +1319,14 @@ def _build_guided_config_path(
                 if not math.isfinite(transition_cost):
                     continue
 
-                total_cost = previous_costs[previous_flags] + transition_cost
+                total_cost = (
+                    previous_costs[previous_flags]
+                    + transition_cost
+                    + _config_family_preference_cost(
+                        current_flags,
+                        optimizer_settings,
+                    )
+                )
                 if previous_flags != current_flags:
                     total_cost += optimizer_settings.family_switch_penalty
                 else:
@@ -1039,6 +1417,7 @@ def _guided_config_path_is_feasible(
         index
         for index, candidate in enumerate(ik_layers[0].candidates)
         if candidate.config_flags == guided_config_path[0]
+        and _candidate_satisfies_required_config(candidate, optimizer_settings)
     ]
     if not reachable_indices:
         return False
@@ -1046,6 +1425,11 @@ def _guided_config_path_is_feasible(
     for layer_index in range(1, len(ik_layers)):
         current_reachable: list[int] = []
         for current_index, current_candidate in enumerate(ik_layers[layer_index].candidates):
+            if not _candidate_satisfies_required_config(
+                current_candidate,
+                optimizer_settings,
+            ):
+                continue
             if current_candidate.config_flags != guided_config_path[layer_index]:
                 continue
             for previous_index in reachable_indices:
@@ -1203,7 +1587,11 @@ def _candidate_node_cost(
     corridor_bonus = min(optimizer_settings.corridor_bonus_cap, corridor_score) * (
         optimizer_settings.corridor_bonus_per_step
     )
-    return optimizer_settings.node_penalty_scale * raw_penalty - corridor_bonus
+    return (
+        optimizer_settings.node_penalty_scale * raw_penalty
+        + _config_family_preference_cost(candidate.config_flags, optimizer_settings)
+        - corridor_bonus
+    )
 
 
 def _compute_candidate_corridor_scores(
@@ -1387,10 +1775,179 @@ def _singularity_penalty(
         ) / optimizer_settings.arm_singularity_threshold
         penalty += optimizer_settings.arm_singularity_penalty_weight * normalized * normalized
 
+    penalty += _posture_stress_penalty(robot, joints, optimizer_settings)
+
     if len(_ROBOT_SINGULARITY_PENALTY_CACHE) >= _ROBOT_SINGULARITY_PENALTY_CACHE_MAX_ENTRIES:
         _ROBOT_SINGULARITY_PENALTY_CACHE.clear()
     _ROBOT_SINGULARITY_PENALTY_CACHE[cache_key] = penalty
     return penalty
+
+
+def _vector_norm(values: Sequence[float]) -> float:
+    return math.sqrt(sum(float(value) * float(value) for value in values))
+
+
+def _soft_excess_ratio(value: float, soft_limit: float, hard_limit: float) -> float:
+    if hard_limit <= soft_limit or value <= soft_limit:
+        return 0.0
+    return max(0.0, min(1.5, (value - soft_limit) / (hard_limit - soft_limit)))
+
+
+def _joint_pose_translations(robot, joints: Sequence[float]) -> tuple[tuple[float, float, float], ...]:
+    from src.core.geometry import _translation_from_pose
+
+    try:
+        raw_poses = robot.JointPoses(list(joints))
+    except Exception:
+        return ()
+
+    translations: list[tuple[float, float, float]] = []
+    for pose in raw_poses:
+        if pose is None:
+            continue
+        try:
+            translations.append(_translation_from_pose(pose))
+        except Exception:
+            continue
+    return tuple(translations)
+
+
+def _posture_stress_components(
+    robot,
+    joints: Sequence[float],
+    optimizer_settings: _PathOptimizerSettings,
+) -> dict[str, float]:
+    """Return load-aware geometry components for a contact-winding posture."""
+
+    from src.core.geometry import _subtract_vectors
+
+    components: dict[str, float] = {
+        "score": 0.0,
+        "penalty": 0.0,
+        "wrist_reach_mm": 0.0,
+        "arm_extension_ratio": 0.0,
+        "a2_deg": float(joints[1]) if len(joints) >= 2 else 0.0,
+    }
+    weighted_score = 0.0
+
+    translations = _joint_pose_translations(robot, joints)
+    if len(translations) >= 3:
+        shoulder = translations[0]
+        elbow = translations[1]
+        wrist = translations[2]
+        upper_arm_mm = _vector_norm(_subtract_vectors(elbow, shoulder))
+        forearm_mm = _vector_norm(_subtract_vectors(wrist, elbow))
+        arm_span_mm = upper_arm_mm + forearm_mm
+        wrist_reach_mm = _vector_norm(wrist)
+        components["wrist_reach_mm"] = float(wrist_reach_mm)
+
+        reach_excess = _soft_excess_ratio(
+            wrist_reach_mm,
+            float(optimizer_settings.posture_wrist_reach_soft_limit_mm),
+            float(optimizer_settings.posture_wrist_reach_hard_limit_mm),
+        )
+        weighted_score += (
+            float(optimizer_settings.posture_wrist_reach_component_weight)
+            * reach_excess
+            * reach_excess
+        )
+
+        if arm_span_mm > 1e-9:
+            arm_extension_ratio = _vector_norm(_subtract_vectors(wrist, shoulder)) / arm_span_mm
+            components["arm_extension_ratio"] = float(arm_extension_ratio)
+            extension_excess = _soft_excess_ratio(
+                arm_extension_ratio,
+                float(optimizer_settings.posture_arm_extension_soft_ratio),
+                float(optimizer_settings.posture_arm_extension_hard_ratio),
+            )
+            weighted_score += (
+                float(optimizer_settings.posture_arm_extension_component_weight)
+                * extension_excess
+                * extension_excess
+            )
+
+    if len(joints) >= 2:
+        a2_excess = _soft_excess_ratio(
+            float(joints[1]),
+            float(optimizer_settings.posture_a2_upper_soft_deg),
+            float(optimizer_settings.posture_a2_upper_hard_deg),
+        )
+        weighted_score += (
+            float(optimizer_settings.posture_a2_upper_component_weight)
+            * a2_excess
+            * a2_excess
+        )
+
+    components["score"] = float(weighted_score)
+    components["penalty"] = float(
+        optimizer_settings.posture_stress_penalty_weight * weighted_score
+    )
+    return components
+
+
+def _posture_stress_penalty(
+    robot,
+    joints: Sequence[float],
+    optimizer_settings: _PathOptimizerSettings,
+) -> float:
+    if float(optimizer_settings.posture_stress_penalty_weight) <= 0.0:
+        return 0.0
+    return float(_posture_stress_components(robot, joints, optimizer_settings)["penalty"])
+
+
+def summarize_path_posture_stress(
+    robot,
+    selected_path: Sequence[object],
+    optimizer_settings: _PathOptimizerSettings,
+    *,
+    row_labels: Sequence[object] = (),
+) -> dict[str, object]:
+    if not selected_path:
+        return {
+            "mean_score": 0.0,
+            "max_score": 0.0,
+            "max_score_label": None,
+            "max_wrist_reach_mm": 0.0,
+            "max_arm_extension_ratio": 0.0,
+            "max_a2_deg": 0.0,
+        }
+
+    scores: list[float] = []
+    max_payload: dict[str, object] = {}
+    max_score = -1.0
+    max_wrist_reach_mm = 0.0
+    max_arm_extension_ratio = 0.0
+    max_a2_deg = -math.inf
+    for index, entry in enumerate(selected_path):
+        joints = tuple(float(value) for value in getattr(entry, "joints", entry))
+        components = _posture_stress_components(robot, joints, optimizer_settings)
+        score = float(components.get("score", 0.0))
+        scores.append(score)
+        max_wrist_reach_mm = max(
+            max_wrist_reach_mm,
+            float(components.get("wrist_reach_mm", 0.0)),
+        )
+        max_arm_extension_ratio = max(
+            max_arm_extension_ratio,
+            float(components.get("arm_extension_ratio", 0.0)),
+        )
+        max_a2_deg = max(max_a2_deg, float(components.get("a2_deg", 0.0)))
+        if score > max_score:
+            label = row_labels[index] if index < len(row_labels) else index
+            max_score = score
+            max_payload = {
+                "max_score_label": str(label),
+                "max_score_components": dict(components),
+            }
+
+    return {
+        "mean_score": float(sum(scores) / len(scores)),
+        "max_score": float(max_score),
+        "max_wrist_reach_mm": float(max_wrist_reach_mm),
+        "max_arm_extension_ratio": float(max_arm_extension_ratio),
+        "max_a2_deg": float(max_a2_deg if math.isfinite(max_a2_deg) else 0.0),
+        **max_payload,
+    }
 
 
 def _passes_step_limit(

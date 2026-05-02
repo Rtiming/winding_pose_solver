@@ -17,8 +17,8 @@ project-specific contract:
   explicitly says the Linux server is source of truth.
 - Never overwrite, revert, delete, or clean local/remote changes that the agent
   did not create. Work with dirty files and keep edits scoped.
-- Do not use the retired server path `/home/tzwang/apps/winding_pose_solver`.
-  The canonical server path is `/home/tzwang/program/winding_pose_solver`.
+- Do not use the retired `apps` checkout on the server. The canonical server
+  path is `/home/tzwang/program/winding_pose_solver`.
 - Do not turn `main.py` back into a large implementation file. It is a thin
   user control panel; reusable logic belongs in `src/`.
 - Do not put substantial implementation in root `online_*.py` files. They are
@@ -70,18 +70,20 @@ Known motion-quality failure mode:
 - A path can be target-reachable but still practically bad if a segment such as
   `59->60`, `372->373`, or another wrist/config transition causes a fast
   configuration jump or a physical detour.
-- Prefer local Y/Z repair, candidate scoring, A6 periodic handling, or
-  insertion strategy to reduce those transitions. Do not hide the problem by
-  deleting diagnostics.
+- Prefer local Y/Z repair, candidate scoring, A4/A6 periodic continuity
+  handling, lower-config policy, or insertion strategy to reduce those
+  transitions. Do not hide the problem by deleting diagnostics.
 
 ## Machines And Paths
 
 - Windows checkout: current local workspace.
 - Canonical Linux server checkout:
   `/home/tzwang/program/winding_pose_solver`
-- The retired server path `/home/tzwang/apps/winding_pose_solver` must not be
-  used.
+- Retired server checkouts under `apps` must not be used.
 - Windows coordinates online orchestration and RoboDK finalization.
+- Mac coordinator/receiver runs are supported through `LOCAL_MACHINE_PROFILE`
+  / `WPS_LOCAL_MACHINE_PROFILE`; keep platform-specific command/path handling
+  there instead of branching solver logic.
 - The server runs pure compute with the `six_axis_ik` backend; it must not need
   RoboDK.
 - Live RoboDK behavior stays on Windows and should attach to the already-open
@@ -94,8 +96,10 @@ Known motion-quality failure mode:
 - `app_settings.py`: shared solver/runtime tuning defaults.
 - `src/runtime/online/roundtrip.py`: SSH transport, server setup, server role,
   receiver role, and coordinator flow.
-- `online_roundtrip.py`, `online_requester.py`, `online_worker.py`:
-  root-level compatibility wrappers only.
+- `online_roundtrip.py`: root-level compatibility wrapper for the online
+  roundtrip CLI. Requester/worker entrypoints live under `src/runtime/online/`
+  and should be invoked with `python -m src.runtime.online.requester` or
+  `python -m src.runtime.online.worker`.
 - `scripts/`: thin diagnostics and operational wrappers.
 - `src/core/`: math, geometry, schemas, CSV handling, pose solving, and
   backend-neutral helpers.
@@ -103,11 +107,51 @@ Known motion-quality failure mode:
   local repair, and inserted-transition logic.
 - `src/runtime/`: orchestration, request building, run logging, origin search,
   local retry, and remote-search helpers.
+- `src/runtime/local_profile.py`: local `auto|mac|windows|linux` profile
+  resolution and local Conda Python candidate paths.
 - `src/runtime/online/`: modular online coordinator/server/receiver entrypoints
   and sync preflight logic.
 - `src/robodk_runtime/`: live RoboDK station import/program generation and
   RoboDK-backed evaluation.
 - `src/six_axis_ik/`: embedded IK/FK model and backend-specific kinematics.
+
+## External Runtime API Boundary
+
+The formal external call surface is `src/runtime/http_service.py` plus the
+Python facade in `src/runtime/external_api.py`.
+
+Stable runtime endpoints:
+
+- `GET /api/health`
+- `GET /api/capabilities`
+- `POST /api/configure`
+- `POST /api/fk`
+- `POST /api/ik`
+- `POST /api/path/solve`
+- `POST /api/path/solve-batch`
+- `POST /api/collision/check`
+- `GET/POST /api/winding/*`
+
+Rules for adapter integration:
+
+- External packages such as `winding-motion-module` must call these endpoints
+  rather than importing internal modules or reimplementing solver behavior.
+- Full path continuity, candidate selection, and repair must go through
+  `/api/path/solve` or `/api/path/solve-batch`; do not tell adapters to loop
+  over `/api/ik` for path-level behavior.
+- Collision validity is solver-owned and exposed through
+  `/api/collision/check`. Keep link/tool/static coverage, kinematics-hash
+  checks, and narrowphase/broadphase policy here.
+- `/api/winding/*` returns envelope payloads with
+  `{ ok, code, message, data, request_id, ts }` and owns workbench run
+  lifecycle, artifacts, summary/results/handoff lookup, and dry-run checks.
+- `/api/simulation/control`, `/api/program/plan`, and
+  `/api/program/export` are reserved RoboDK/KUKA-parity contracts. They may
+  return `501`; do not move fallback program execution/export into adapters.
+
+Runtime API dependencies belong in `requirements.shared.txt`. Keep `httpx`
+available for FastAPI TestClient smoke tests and `trimesh` available for
+collision checks.
 
 Recent modular split:
 
@@ -169,6 +213,9 @@ general advice:
 ## Operational Defaults
 
 - Default `TARGET_FRAME_A_ORIGIN_IN_FRAME2_MM` is configured in `main.py`.
+- Default `LOCAL_MACHINE_PROFILE=auto` resolves the coordinator/receiver
+  platform. Override with `mac`, `windows`, or `linux`, or with
+  `WPS_LOCAL_MACHINE_PROFILE`, when auto-detection is not the intended mode.
 - Default backend is expected to remain `six_axis_ik` for server-safe compute.
 - Default online final program generation remains local on Windows, but
   online SixAxisIK evaluation and retry/repair run in the server role.
@@ -176,6 +223,20 @@ general advice:
 - Default online retry/repair should stay conservative and server-side;
   tune `ONLINE_PROFILE_RETRY_*` or `WPS_ONLINE_RETRY_*` rather than moving
   continuity repair back into the Windows receiver.
+- Current online retry defaults are `ONLINE_PROFILE_RETRY_CANDIDATE_LIMIT=24`,
+  `ONLINE_PROFILE_RETRY_REPAIR_LIMIT=2`, and
+  `ONLINE_PROFILE_RETRY_MAX_ROUNDS=3`.
+- Online server quality polish is enabled by default after a strict-valid
+  result. Tune with `WPS_ONLINE_QUALITY_POLISH` and
+  `WPS_ONLINE_QUALITY_POLISH_TARGET_DEG` instead of weakening the official
+  delivery gate.
+- Local retry active sets should include both delivery blockers and the largest
+  selected-path joint steps. The default focus size is controlled by
+  `WPS_LOCAL_RETRY_FOCUS_SEGMENT_LIMIT` and falls back to `6`.
+- `src/runtime/remote_search.py` owns branch-policy, active-set window/ramp,
+  corridor, and basis profile candidates. Keep its candidate finalization
+  rules centralized: profile length check, max-offset clamp, endpoint lock,
+  adjacent-step smoothness filter, and deduplication.
 - Smart origin search is available through `main.py --mode origin_search` or
   `python scripts/sweep_target_origin_yz.py --mode smart-square ...`.
 - Origin sweep case-result caching is enabled by default and stored under
@@ -256,10 +317,32 @@ Assume the worktree can contain user changes.
 Use the smallest validation that proves the change:
 
 ```powershell
-python -m py_compile main.py online_roundtrip.py src/runtime/origin_sweep.py scripts/sweep_target_origin_yz.py
+python -m py_compile main.py online_roundtrip.py src/runtime/origin_sweep.py src/runtime/local_retry.py src/runtime/remote_search.py src/search/path_optimizer.py scripts/sweep_target_origin_yz.py
 python main.py --help
 python scripts/sweep_target_origin_yz.py --help
 ```
+
+For runtime API changes:
+
+```powershell
+python -m compileall -q src scripts/smoke_winding_runtime_api.py
+python scripts/smoke_winding_runtime_api.py --skip-live-run
+python -m src.runtime.http_service --host 127.0.0.1 --port 8898
+curl http://127.0.0.1:8898/api/health
+curl http://127.0.0.1:8898/api/winding/capabilities
+```
+
+For model/collision API changes, also run or reproduce a flow that covers:
+
+- strict `POST /api/configure` with the active robot metadata and matching
+  `kinematics_hash`;
+- `POST /api/fk` returning the expected joint-frame count;
+- `POST /api/ik` against a solver FK target with near-zero residual;
+- `POST /api/collision/check` in preload, pose, and path modes;
+- `POST /api/path/solve` and `/api/path/solve-batch` returning a complete
+  `selected_path`;
+- `POST /api/winding/runs` with `options.dry_run=true` returning
+  `status=succeeded`.
 
 For online compute smoke:
 

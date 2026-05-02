@@ -662,9 +662,9 @@ def _build_plan(payload: dict[str, Any]) -> RunPlan:
                 command.extend(["--program-name", program_name])
             optimized_csv_path = run_dir / "tool_poses_frame2.csv"
             command.extend(["--optimized-csv-path", str(optimized_csv_path)])
-            retry_candidate_limit = _as_int(options.get("retry_candidate_limit"), default=4, minimum=0)
+            retry_candidate_limit = _as_int(options.get("retry_candidate_limit"), default=24, minimum=0)
             retry_repair_limit = _as_int(options.get("retry_repair_limit"), default=2, minimum=0)
-            retry_max_rounds = _as_int(options.get("retry_max_rounds"), default=1, minimum=0)
+            retry_max_rounds = _as_int(options.get("retry_max_rounds"), default=3, minimum=0)
             command.extend(["--retry-candidate-limit", str(retry_candidate_limit)])
             command.extend(["--retry-repair-limit", str(retry_repair_limit)])
             command.extend(["--retry-max-rounds", str(retry_max_rounds)])

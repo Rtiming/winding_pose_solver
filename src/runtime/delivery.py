@@ -357,6 +357,7 @@ def result_quality_summary(result: ProfileEvaluationResult) -> dict[str, object]
         "invalid_row_count": int(result.invalid_row_count),
         "worst_joint_step_deg": float(result.worst_joint_step_deg),
         "mean_joint_step_deg": float(result.mean_joint_step_deg),
+        "posture_stress_score": float(getattr(result, "posture_stress_score", 0.0)),
         "total_cost": float(result.total_cost),
         "objective_reachable": bool(gate["objective_reachable"]),
         "official_delivery_allowed": bool(gate["official_delivery_allowed"]),
@@ -370,6 +371,7 @@ def result_quality_summary(result: ProfileEvaluationResult) -> dict[str, object]
             "big_circle_step_count": int(result.big_circle_step_count),
             "worst_joint_step_deg": float(result.worst_joint_step_deg),
             "branch_flip_ratio": float(result.branch_flip_ratio),
+            "posture_stress_score": float(getattr(result, "posture_stress_score", 0.0)),
         },
     }
     return summary

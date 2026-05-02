@@ -21,11 +21,11 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.core.geometry import _build_pose
-from src.ik_collection import _build_seed_joint_strategies, _collect_ik_candidates
 from src.core.motion_settings import RoboDKMotionSettings
-from src.path_optimizer import _build_optimizer_settings
 from src.core.pose_csv import load_pose_rows
 from src.core.robot_interface import RoboDKRobotInterface, SixAxisIKRobotInterface
+from src.search.ik_collection import _build_seed_joint_strategies, _collect_ik_candidates
+from src.search.path_optimizer import _build_optimizer_settings
 from src.six_axis_ik.config import get_configured_frame_pose
 
 
